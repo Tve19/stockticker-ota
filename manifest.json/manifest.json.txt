@@ -1,12 +1,12 @@
 {
   "stable": {
     "version": "1.1.1",
-    "app_url": "https://stockticker-ota.adanteholliman5.workers.dev/",
+    "app_url": "https://stockticker-ota.pages.dev/",
     "notes": "Stable ticker release."
   },
   "beta": {
     "version": "1.1.1-beta",
-    "app_url": "https://stockticker-ota.adanteholliman5.workers.dev/",
+    "app_url": "https://stockticker-ota.pages.dev/",
     "notes": "Beta testing channel."
   }
 }
