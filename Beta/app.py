@@ -27,6 +27,7 @@ CONFIG_FILE = "/config.json"
 SYMBOLS_FILE = "/symbols.txt"
 WIFI_FILE = "/wifi_config.json"
 HOLIDAYS_FILE = "/market_holidays.json"
+DEVICE_FILE = "/device.json"
 
 DEFAULT_CONFIG = {
     "brightness": 0.30,
@@ -190,8 +191,29 @@ def bool_from_form(value):
     value = str(value).lower()
     return value in ("1", "true", "yes", "on")
 
+def generate_device_id():
+    uid = microcontroller.cpu.uid
+    short_id = ""
 
+    for b in uid[-3:]:
+        short_id += "{:02X}".format(b)
+
+    return "ST-" + short_id
+
+
+def load_device_info():
+    info = load_json_file(DEVICE_FILE, {})
+
+    if "device_id" not in info:
+        info["device_id"] = generate_device_id()
+        info["created_version"] = APP_VERSION
+        save_json_file(DEVICE_FILE, info)
+
+    return info
+    
 config = load_config()
+device_info = load_device_info()
+DEVICE_ID = device_info["device_id"]
 holidays = load_holidays()
 SYMBOLS = read_symbols_file() or DEFAULT_SYMBOLS
 
@@ -476,6 +498,7 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <body>
 <h1>Stock Ticker Control Panel</h1>
 <p>Version: {version}</p>
+<p>Device ID: {device_id}</p>
 <p>IP: {ip}</p>
 <p>Last Quote Update: {last_update}</p>
 <p class="good">Status: {last_web_message}</p>
@@ -649,6 +672,7 @@ def index(request: Request):
         request,
         HTML.format(
             version=APP_VERSION,
+            device_id=DEVICE_ID,
             ip=ip,
             symbols="\n".join(SYMBOLS),
             brightness=config["brightness"],
