@@ -41,7 +41,7 @@ DEFAULT_CONFIG = {
     "scroll_delay": 0.02,
     "admin_pin": "1234",
     "update_channel": "stable",
-    "update_manifest_url": "https://yourdomain.com/stockticker/manifest.json",
+    "update_manifest_url": "https://stockticker-ota.pages.dev/manifest.json",
     "night_mode_enabled": True,
     "night_brightness": 0.08,
     "night_start_hour": 16,
