@@ -1,11 +1,11 @@
 {
   "stable": {
-    "version": "1.1.1",
+    "version": "1.1.2",
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable ticker release."
   },
   "beta": {
-    "version": "1.1.1-beta",
+    "version": "1.1.2-beta",
     "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
     "notes": "Beta testing channel."
   }
