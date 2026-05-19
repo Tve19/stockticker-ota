@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 import time
 import ssl
@@ -27,6 +27,7 @@ CONFIG_FILE = "/config.json"
 SYMBOLS_FILE = "/symbols.txt"
 WIFI_FILE = "/wifi_config.json"
 HOLIDAYS_FILE = "/market_holidays.json"
+DEVICE_FILE = "/device.json"
 
 DEFAULT_CONFIG = {
     "brightness": 0.30,
@@ -40,7 +41,7 @@ DEFAULT_CONFIG = {
     "scroll_delay": 0.02,
     "admin_pin": "1234",
     "update_channel": "stable",
-    "update_manifest_url": "https://yourdomain.com/stockticker/manifest.json",
+    "update_manifest_url": "https://stockticker-ota.pages.dev/manifest.json",
     "night_mode_enabled": True,
     "night_brightness": 0.08,
     "night_start_hour": 16,
@@ -94,6 +95,27 @@ def save_json_file(path, data):
         json.dump(data, f)
 
 
+def generate_device_id():
+    uid = microcontroller.cpu.uid
+    short_id = ""
+
+    for b in uid[-3:]:
+        short_id += "{:02X}".format(b)
+
+    return "ST-" + short_id
+
+
+def load_device_info():
+    info = load_json_file(DEVICE_FILE, {})
+
+    if "device_id" not in info:
+        info["device_id"] = generate_device_id()
+        info["created_version"] = APP_VERSION
+        save_json_file(DEVICE_FILE, info)
+
+    return info
+
+
 def load_config():
     cfg = load_json_file(CONFIG_FILE, {})
 
@@ -109,19 +131,19 @@ def save_config(cfg):
 
 
 def load_holidays():
-    holidays = load_json_file(HOLIDAYS_FILE, DEFAULT_HOLIDAYS)
+    h = load_json_file(HOLIDAYS_FILE, DEFAULT_HOLIDAYS)
 
-    if "closed" not in holidays:
-        holidays["closed"] = DEFAULT_HOLIDAYS["closed"]
+    if "closed" not in h:
+        h["closed"] = DEFAULT_HOLIDAYS["closed"]
 
-    if "early_close" not in holidays:
-        holidays["early_close"] = DEFAULT_HOLIDAYS["early_close"]
+    if "early_close" not in h:
+        h["early_close"] = DEFAULT_HOLIDAYS["early_close"]
 
-    return holidays
+    return h
 
 
-def save_holidays(holidays):
-    save_json_file(HOLIDAYS_FILE, holidays)
+def save_holidays(h):
+    save_json_file(HOLIDAYS_FILE, h)
 
 
 def read_symbols_file():
@@ -192,6 +214,9 @@ def bool_from_form(value):
 
 
 config = load_config()
+device_info = load_device_info()
+DEVICE_ID = device_info["device_id"]
+
 holidays = load_holidays()
 SYMBOLS = read_symbols_file() or DEFAULT_SYMBOLS
 
@@ -200,8 +225,6 @@ BRIGHTNESS_RAMP_STEP = 0.01
 SCROLL_SPEED_OPEN = float(config["scroll_speed_open"])
 SCROLL_SPEED_CLOSED = float(config["scroll_speed_closed"])
 FETCH_INTERVAL_OPEN = int(config["fetch_interval_open"])
-FETCH_INTERVAL_PRE_AFTER = int(config["fetch_interval_pre_after"])
-FETCH_INTERVAL_CLOSED = int(config["fetch_interval_closed"])
 ALERT_PERCENT_MOVE = float(config["alert_percent_move"])
 BLOCK_GAP = int(config["block_gap"])
 SCROLL_DELAY = float(config["scroll_delay"])
@@ -216,6 +239,18 @@ ota_message = "No update checked yet."
 last_web_message = "System ready."
 last_error_message = "None yet."
 test_quote_message = "No quote tested yet."
+
+
+def set_web_message(message):
+    global last_web_message
+    last_web_message = message
+    print("WEB STATUS:", message)
+
+
+def set_error_message(message):
+    global last_error_message
+    last_error_message = message
+    print("WEB ERROR:", message)
 
 
 def start_setup_mode(reason):
@@ -476,6 +511,7 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <body>
 <h1>Stock Ticker Control Panel</h1>
 <p>Version: {version}</p>
+<p>Device ID: {device_id}</p>
 <p>IP: {ip}</p>
 <p>Last Quote Update: {last_update}</p>
 <p class="good">Status: {last_web_message}</p>
@@ -489,7 +525,6 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <button type="submit">Test Quote</button>
 </form>
 <p>{test_quote_message}</p>
-
 <form method="POST" action="/validate-symbols">
 <button class="green" type="submit">Validate All Saved Symbols</button>
 </form>
@@ -546,6 +581,8 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <option value="stable">Stable</option>
 <option value="beta">Beta</option>
 </select>
+<label>Manifest URL</label>
+<input name="update_manifest_url" value="{update_manifest_url}">
 <button class="green" type="submit">Save Config</button>
 </form>
 </div>
@@ -613,34 +650,12 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 
 def clean_page(title, message):
     return (
-        "<html>"
-        "<head>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<meta http-equiv='refresh' content='1; url=/'>"
-        "<style>"
-        "body{{background:#101018;color:white;font-family:Arial;padding:20px;}}"
-        "a{{color:#5aaaff;}}"
-        "</style>"
-        "</head>"
-        "<body>"
-        "<h1>{}</h1>"
-        "<p>{}</p>"
-        "<p>Returning to control panel...</p>"
-        "<p><a href='/'>Back now</a></p>"
-        "</body>"
-        "</html>"
+        "<style>body{{background:#101018;color:white;font-family:Arial;padding:20px;}}a{{color:#5aaaff;}}</style>"
+        "</head><body><h1>{}</h1><p>{}</p><p>Returning to control panel...</p>"
+        "<p><a href='/'>Back now</a></p></body></html>"
     ).format(title, message)
-
-
-def set_web_message(message):
-    global last_web_message
-    last_web_message = message
-
-
-def set_error_message(message):
-    global last_error_message
-    last_error_message = message
-    print("WEB ERROR:", message)
 
 
 @server.route("/")
@@ -649,6 +664,7 @@ def index(request: Request):
         request,
         HTML.format(
             version=APP_VERSION,
+            device_id=DEVICE_ID,
             ip=ip,
             symbols="\n".join(SYMBOLS),
             brightness=config["brightness"],
@@ -665,6 +681,7 @@ def index(request: Request):
             night_brightness=config["night_brightness"],
             night_start_hour=config["night_start_hour"],
             night_end_hour=config["night_end_hour"],
+            update_manifest_url=config["update_manifest_url"],
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
         ),
@@ -744,11 +761,7 @@ def validate_symbols_route(request: Request):
         test_quote_message = "All symbols valid: " + ", ".join(valid)
         set_web_message("All saved symbols validated successfully.")
 
-    return Response(
-        request,
-        clean_page("Symbol Validation Complete", test_quote_message),
-        content_type="text/html"
-    )
+    return Response(request, clean_page("Symbol Validation Complete", test_quote_message), content_type="text/html")
 
 
 @server.route("/save-symbols", methods=["POST"])
@@ -830,6 +843,7 @@ def save_cfg(request: Request):
         config["night_start_hour"] = int(float(url_decode(str(form.get("night_start_hour", config["night_start_hour"])))))
         config["night_end_hour"] = int(float(url_decode(str(form.get("night_end_hour", config["night_end_hour"])))))
         config["update_channel"] = url_decode(str(form.get("update_channel", config["update_channel"])))
+        config["update_manifest_url"] = url_decode(str(form.get("update_manifest_url", config["update_manifest_url"]))).strip()
 
         if config["brightness"] < 0:
             config["brightness"] = 0
@@ -908,10 +922,30 @@ def refresh_now(request: Request):
 
 def fetch_update_manifest():
     try:
-        r = requests.get(config["update_manifest_url"])
-        manifest = r.json()
+        url = config["update_manifest_url"]
+        print("Checking manifest:", url)
+
+        r = requests.get(url)
+        text = r.text
         r.close()
+
+        preview = text[:80]
+        print("Manifest preview:", preview)
+
+        stripped = text.strip()
+
+        if not stripped.startswith("{"):
+            set_error_message("Manifest URL returned HTML/text, not JSON. Check URL: " + url)
+            return None
+
+        manifest = json.loads(stripped)
+
+        if "stable" not in manifest and "beta" not in manifest:
+            set_error_message("Manifest JSON loaded but missing stable/beta keys.")
+            return None
+
         return manifest
+
     except Exception as e:
         set_error_message("Manifest fetch failed: " + repr(e))
         return None
@@ -933,7 +967,7 @@ def check_update(request: Request):
     manifest = fetch_update_manifest()
 
     if manifest is None:
-        ota_message = "Could not check for updates."
+        ota_message = "Could not check for updates. Confirm manifest URL opens raw JSON."
     else:
         info = get_channel_info(manifest)
         latest = str(info.get("version", "unknown"))
