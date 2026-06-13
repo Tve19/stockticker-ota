@@ -595,8 +595,8 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <input name="night_end_hour" value="{night_end_hour}">
 <label>Update Channel</label>
 <select name="update_channel">
-<option value="stable">Stable</option>
-<option value="beta">Beta</option>
+<option value="stable" {stable_selected}>Stable</option>
+<option value="beta" {beta_selected}>Beta</option>
 </select>
 <label>Manifest URL</label>
 <input name="update_manifest_url" value="{update_manifest_url}">
@@ -685,6 +685,13 @@ def clean_page(title, message):
 
 @server.route("/")
 def index(request: Request):
+    stable_selected = ""
+    beta_selected = ""
+
+    if config["update_channel"] == "beta":
+        beta_selected = "selected"
+    else:
+        stable_selected = "selected"
     return Response(
         request,
         HTML.format(
@@ -708,6 +715,8 @@ def index(request: Request):
             night_start_hour=config["night_start_hour"],
             night_end_hour=config["night_end_hour"],
             update_manifest_url=config["update_manifest_url"],
+            stable_selected=stable_selected,
+beta_selected=beta_selected,
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
         ),
