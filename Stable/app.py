@@ -111,7 +111,13 @@ def load_device_info():
     if "device_id" not in info:
         info["device_id"] = generate_device_id()
         info["created_version"] = APP_VERSION
-        save_json_file(DEVICE_FILE, info)
+
+        try:
+            save_json_file(DEVICE_FILE, info)
+        except OSError as e:
+            print("Could not save device.json:", repr(e))
+        except Exception as e:
+            print("Device file save failed:", repr(e))
 
     return info
 
@@ -212,10 +218,16 @@ def bool_from_form(value):
     value = str(value).lower()
     return value in ("1", "true", "yes", "on")
 
-
 config = load_config()
-device_info = load_device_info()
-DEVICE_ID = device_info["device_id"]
+
+# DEV SAFE DEVICE ID
+# This avoids OSError(30) when CIRCUITPY is mounted on your laptop.
+try:
+    device_info = load_device_info()
+    DEVICE_ID = device_info["device_id"]
+except Exception as e:
+    print("Device ID disabled:", repr(e))
+    DEVICE_ID = "DEV-MODE"
 
 holidays = load_holidays()
 SYMBOLS = read_symbols_file() or DEFAULT_SYMBOLS
