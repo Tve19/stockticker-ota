@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION =
+APP_VERSION =jx
 
 import time
 import ssl
