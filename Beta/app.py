@@ -251,7 +251,8 @@ ota_message = "No update checked yet."
 last_web_message = "System ready."
 last_error_message = "None yet."
 test_quote_message = "No quote tested yet."
-
+cloud_status_message = "Cloud status not checked yet."
+time_sync_ok = False
 
 def set_web_message(message):
     global last_web_message
@@ -377,11 +378,15 @@ requests = adafruit_requests.Session(pool, ssl.create_default_context())
 
 
 def sync_time():
+    global time_sync_ok
+
     try:
         ntp = adafruit_ntp.NTP(pool, server="pool.ntp.org", tz_offset=0)
         rtc.RTC().datetime = ntp.datetime
+        time_sync_ok = True
         print("Time synced")
     except Exception as e:
+        time_sync_ok = False
         print("NTP failed:", e)
 
 
@@ -619,6 +624,14 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 </div>
 
 <div class="card">
+<h2>Cloud Status</h2>
+<p>{cloud_status_message}</p>
+<form method="POST" action="/check-cloud-status">
+<button type="submit">Check Cloud Status</button>
+</form>
+</div>
+
+<div class="card">
 <h2>Software Update</h2>
 <p>{ota_message}</p>
 <form method="POST" action="/check-update">
@@ -690,6 +703,7 @@ def index(request: Request):
             last_web_message=last_web_message,
             last_error_message=last_error_message,
             test_quote_message=test_quote_message,
+            cloud_status_message=cloud_status_message,
             night_brightness=config["night_brightness"],
             night_start_hour=config["night_start_hour"],
             night_end_hour=config["night_end_hour"],
@@ -971,7 +985,68 @@ def get_channel_info(manifest):
 
     return manifest[channel]
 
+@server.route("/check-cloud-status", methods=["POST"])
+def check_cloud_status(request: Request):
+    global cloud_status_message
 
+    ota_ok = False
+    quote_ok = False
+    calendar_ok = False
+    wifi_ok = False
+
+    try:
+        wifi_ok = wifi.radio.connected
+    except Exception:
+        wifi_ok = False
+
+    try:
+        r = requests.get(config["update_manifest_url"])
+        text = r.text
+        r.close()
+
+        if text.strip().startswith("{"):
+            ota_ok = True
+    except Exception as e:
+        set_error_message("OTA status check failed: " + repr(e))
+
+    try:
+        url = FINNHUB_URL.format("AAPL", secrets["finnhub_api_key"])
+        r = requests.get(url)
+        data = r.json()
+        r.close()
+
+        if data.get("c", 0):
+            quote_ok = True
+    except Exception as e:
+        set_error_message("Quote API status check failed: " + repr(e))
+
+    try:
+        if "closed" in holidays and "early_close" in holidays:
+            calendar_ok = True
+    except Exception:
+        calendar_ok = False
+
+    cloud_status_message = (
+        "WiFi: {}<br>"
+        "OTA Server: {}<br>"
+        "Quote API: {}<br>"
+        "Time Sync: {}<br>"
+        "Market Calendar: {}"
+    ).format(
+        "OK" if wifi_ok else "ERROR",
+        "OK" if ota_ok else "ERROR",
+        "OK" if quote_ok else "ERROR",
+        "OK" if time_sync_ok else "ERROR",
+        "OK" if calendar_ok else "ERROR"
+    )
+
+    set_web_message("Cloud status checked.")
+
+    return Response(
+        request,
+        clean_page("Cloud Status Checked", "Cloud status updated."),
+        content_type="text/html"
+    )
 @server.route("/check-update", methods=["POST"])
 def check_update(request: Request):
     global ota_message
