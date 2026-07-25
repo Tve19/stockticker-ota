@@ -1,7 +1,7 @@
 print("APP.PY STARTED")
 
 APP_NAME = "StockTicker"
-APP_VERSION = "1.1.3-beta"
+APP_VERSION = "1.1.3"
 
 import time
 import ssl
