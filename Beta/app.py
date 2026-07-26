@@ -526,7 +526,7 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 </style>
 </head>
 <body>
-<h1>Stock Ticker Control Panel</h1>
+<h1>Stock Ticker Control Panel - OTA Beta Test</h1>
 <p>Version: {version}</p>
 <p>Device ID: {device_id}</p>
 <p>IP: {ip}</p>
