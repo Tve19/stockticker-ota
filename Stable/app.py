@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.7-"
 
 import time
 import ssl
@@ -218,6 +218,47 @@ def bool_from_form(value):
     value = str(value).lower()
     return value in ("1", "true", "yes", "on")
 
+
+APP_PATH = "/app.py"
+BACKUP_APP_PATH = "/app_backup.py"
+
+
+def file_exists(path):
+    try:
+        with open(path, "rb") as f:
+            f.read(1)
+        return True
+    except Exception:
+        return False
+
+
+def copy_file_safe(src, dst):
+    try:
+        with open(src, "rb") as source:
+            data = source.read()
+
+        if not data:
+            return False, "{} was empty.".format(src)
+
+        with open(dst, "wb") as target:
+            target.write(data)
+
+        return True, "Copied {} to {}".format(src, dst)
+
+    except Exception as e:
+        return False, "Copy failed: {}".format(repr(e))
+
+
+def backup_current_app():
+    return copy_file_safe(APP_PATH, BACKUP_APP_PATH)
+
+
+def rollback_to_backup():
+    if not file_exists(BACKUP_APP_PATH):
+        return False, "No app_backup.py found."
+
+    return copy_file_safe(BACKUP_APP_PATH, APP_PATH)
+
 config = load_config()
 
 # DEV SAFE DEVICE ID
@@ -303,7 +344,6 @@ button {{ padding:12px; }}
 </body>
 </html>
 """
-
     @setup_server.route("/")
     def setup_index(request: Request):
         return Response(request, setup_html, content_type="text/html")
@@ -526,7 +566,7 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 </style>
 </head>
 <body>
-<h1>Stock Ticker Control Panel</h1>
+<h1>Stock Ticker Control Panel </h1>
 <p>Version: {version}</p>
 <p>Device ID: {device_id}</p>
 <p>IP: {ip}</p>
@@ -642,6 +682,12 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <label>Admin PIN</label>
 <input name="admin_pin" type="password" placeholder="Enter PIN">
 <button class="green" type="submit">Install Update</button>
+</form>
+<br>
+<form method="POST" action="/rollback" onsubmit="return confirm('Rollback to previous app_backup.py and restart?');">
+<label>Admin PIN</label>
+<input name="admin_pin" type="password" placeholder="Enter PIN">
+<button class="red" type="submit">Rollback to Previous Version</button>
 </form>
 </div>
 
@@ -1118,16 +1164,16 @@ def install_update(request: Request):
             set_error_message(ota_message)
             return Response(request, clean_page("Update Failed", ota_message), content_type="text/html")
 
-        try:
-            with open("/app.py", "r") as old_file:
-                old_code = old_file.read()
+        backup_ok, backup_msg = backup_current_app()
 
-            with open("/app_backup.py", "w") as backup_file:
-                backup_file.write(old_code)
-        except Exception as e:
-            print("Backup failed:", repr(e))
+        if not backup_ok:
+            ota_message = "OTA stopped. Backup failed."
+            set_error_message("OTA stopped. " + backup_msg)
+            return Response(request, clean_page("Update Failed", last_error_message), content_type="text/html")
 
-        with open("/app.py", "w") as app_file:
+        print(backup_msg)
+
+        with open(APP_PATH, "w") as app_file:
             app_file.write(new_code)
 
         ota_message = "Installed version {}. Restarting...".format(latest)
@@ -1142,6 +1188,35 @@ def install_update(request: Request):
         set_error_message("OTA install error: " + repr(e))
 
         return Response(request, clean_page("Update Failed", last_error_message), content_type="text/html")
+
+
+
+@server.route("/rollback", methods=["POST"])
+def rollback_route(request: Request):
+    global restart_requested, restart_time, ota_message
+
+    form = request.form_data
+    entered_pin = url_decode(str(form.get("admin_pin", "")))
+
+    if entered_pin != str(config["admin_pin"]):
+        ota_message = "Rollback blocked: wrong admin PIN."
+        set_error_message(ota_message)
+        return Response(request, clean_page("Rollback Blocked", ota_message), content_type="text/html")
+
+    ok, msg = rollback_to_backup()
+
+    if not ok:
+        ota_message = "Rollback failed."
+        set_error_message(msg)
+        return Response(request, clean_page("Rollback Failed", msg), content_type="text/html")
+
+    ota_message = "Rollback complete. Restarting..."
+    set_web_message(msg)
+
+    restart_requested = True
+    restart_time = time.monotonic() + 2.0
+
+    return Response(request, clean_page("Rollback Complete", ota_message), content_type="text/html")
 
 
 @server.route("/factory-reset", methods=["POST"])
