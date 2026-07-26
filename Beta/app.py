@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.11-beta"
+APP_VERSION = "1.1.12-beta"
 
 import time
 import ssl
@@ -64,6 +64,7 @@ DEFAULT_CONFIG = {
     "smooth_quote_refresh": True,
     "show_logos": True,
     "finnhub_api_key": "",
+    "require_customer_api_key": True,
     "device_name": "StockTicker",
     "customer_mode": "basic"
 }
@@ -282,13 +283,24 @@ def mask_secret(value):
     return value[:3] + "..." + value[-3:]
 
 
-def get_finnhub_api_key():
+def customer_api_required():
+    return bool_from_form(config.get("require_customer_api_key", True))
+
+
+def get_saved_customer_api_key():
     try:
-        key = str(config.get("finnhub_api_key", "")).strip()
-        if key:
-            return key
+        return str(config.get("finnhub_api_key", "")).strip()
     except Exception:
-        pass
+        return ""
+
+
+def get_finnhub_api_key():
+    key = get_saved_customer_api_key()
+    if key:
+        return key
+
+    if customer_api_required():
+        return ""
 
     try:
         return str(secrets.get("finnhub_api_key", "")).strip()
@@ -297,14 +309,20 @@ def get_finnhub_api_key():
 
 
 def get_api_key_status():
-    key = get_finnhub_api_key()
-    if key:
-        try:
-            if str(config.get("finnhub_api_key", "")).strip():
-                return "Saved in device settings: " + mask_secret(key)
-        except Exception:
-            pass
-        return "Loaded from secrets.py: " + mask_secret(key)
+    saved_key = get_saved_customer_api_key()
+    if saved_key:
+        return "Saved in device settings: " + mask_secret(saved_key)
+
+    if customer_api_required():
+        return "Required mode ON - missing customer API key. Quotes will not load until setup is completed."
+
+    try:
+        fallback_key = str(secrets.get("finnhub_api_key", "")).strip()
+        if fallback_key:
+            return "Fallback mode: loaded from secrets.py " + mask_secret(fallback_key)
+    except Exception:
+        pass
+
     return "Missing - enter a Finnhub API key in Customer Setup."
 
 
@@ -666,8 +684,14 @@ a {{ color:#79c7ff; }}
 <label>Stock Symbols</label>
 <textarea name="symbols" rows="6">{symbols}</textarea>
 <label>Finnhub API Key</label>
-<input name="finnhub_api_key" value="{api_key}" placeholder="Paste customer Finnhub API key here">
+<input name="finnhub_api_key" type="password" value="" placeholder="{api_key_placeholder}">
 <p class="small">API Key Status: {api_key_status}</p>
+<p class="small">For security, the saved API key is hidden. Leave this blank to keep the saved key. Paste a new key only when changing it.</p>
+<label>Require Customer API Key</label>
+<select name="require_customer_api_key">
+<option value="true" {require_key_true_selected}>True - customer must enter their own key</option>
+<option value="false" {require_key_false_selected}>False - allow secrets.py fallback</option>
+</select>
 <label>Admin PIN</label>
 <input name="admin_pin" value="{admin_pin}" placeholder="Example: 1234">
 <label>Brightness 0.00-1.00</label>
@@ -693,8 +717,10 @@ a {{ color:#79c7ff; }}
         message=message,
         device_name=safe_html(config.get("device_name", "StockTicker")),
         symbols=safe_html("\n".join(SYMBOLS)),
-        api_key=safe_html(config.get("finnhub_api_key", "")),
+        api_key_placeholder="Saved key hidden. Leave blank to keep it." if get_saved_customer_api_key() else "Paste customer Finnhub API key here",
         api_key_status=safe_html(get_api_key_status()),
+        require_key_true_selected=selected("true", str(config.get("require_customer_api_key", True)).lower()),
+        require_key_false_selected=selected("false", str(config.get("require_customer_api_key", True)).lower()),
         admin_pin=safe_html(config.get("admin_pin", "1234")),
         brightness=safe_html(config.get("brightness", DEFAULT_CONFIG["brightness"])),
         stable_selected=selected("stable", config.get("update_channel", "stable")),
@@ -725,7 +751,8 @@ mark_app_boot_success()
 def start_setup_mode(reason):
     print("SETUP MODE:", reason)
 
-    setup_ssid = "StockTicker-Setup"
+    setup_suffix = str(DEVICE_ID).replace("ST-", "")[-6:]
+    setup_ssid = "StockTicker-" + setup_suffix
     setup_password = "12345678"
 
     wifi.radio.start_ap(setup_ssid, setup_password)
@@ -751,7 +778,7 @@ button {{ padding:12px 16px; border:0; border-radius:10px; background:#22aa66; c
 <body>
 <div class="card">
 <h1>StockTicker First-Time Setup</h1>
-<p class="small">Connect this device to WiFi and enter customer basics. You can edit these later from the dashboard.</p>
+<p class="small">Connect this device to WiFi and enter customer basics. This setup WiFi uses the device ID so customers can identify the correct unit. You can edit these later from the dashboard.</p>
 <form method="POST" action="/save-wifi">
 <label>Home WiFi Name</label>
 <input name="ssid">
@@ -766,7 +793,8 @@ PLTR
 AMZN
 SPY</textarea>
 <label>Finnhub API Key</label>
-<input name="finnhub_api_key" placeholder="Customer API key">
+<input name="finnhub_api_key" type="password" placeholder="Customer API key">
+<p class="small">Required for stock quotes. The key is saved on this device and hidden after setup.</p>
 <label>Admin PIN</label>
 <input name="admin_pin" value="1234">
 <label>Brightness 0.00-1.00</label>
@@ -799,6 +827,7 @@ SPY</textarea>
 
         setup_cfg = load_config()
         setup_cfg["finnhub_api_key"] = url_decode(str(form.get("finnhub_api_key", setup_cfg.get("finnhub_api_key", "")))).strip()
+        setup_cfg["require_customer_api_key"] = True
         setup_cfg["admin_pin"] = url_decode(str(form.get("admin_pin", setup_cfg.get("admin_pin", "1234")))).strip() or "1234"
         setup_cfg["brightness"] = clamp_float(form.get("brightness", setup_cfg.get("brightness", 0.30)), 0.0, 1.0, 0.30)
 
@@ -1240,6 +1269,11 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <option value="true" {logos_true_selected}>True</option>
 <option value="false" {logos_false_selected}>False</option>
 </select>
+<label>Customer API Key Required</label>
+<select name="require_customer_api_key">
+<option value="true" {require_key_true_selected}>True</option>
+<option value="false" {require_key_false_selected}>False / allow secrets.py fallback</option>
+</select>
 <label>Update Channel</label>
 <select name="update_channel">
 <option value="stable" {stable_selected}>Stable</option>
@@ -1362,7 +1396,12 @@ def save_customer_setup(request: Request):
         form = request.form_data
 
         config["device_name"] = url_decode(str(form.get("device_name", config.get("device_name", "StockTicker")))).strip() or "StockTicker"
-        config["finnhub_api_key"] = url_decode(str(form.get("finnhub_api_key", config.get("finnhub_api_key", "")))).strip()
+
+        new_api_key = url_decode(str(form.get("finnhub_api_key", ""))).strip()
+        if new_api_key:
+            config["finnhub_api_key"] = new_api_key
+
+        config["require_customer_api_key"] = bool_from_form(form.get("require_customer_api_key", config.get("require_customer_api_key", True)))
         config["admin_pin"] = url_decode(str(form.get("admin_pin", config.get("admin_pin", "1234")))).strip() or "1234"
         config["brightness"] = clamp_float(form.get("brightness", config.get("brightness", 0.30)), 0.0, 1.0, DEFAULT_CONFIG["brightness"])
         config["show_logos"] = bool_from_form(form.get("show_logos", config.get("show_logos", True)))
@@ -1452,6 +1491,8 @@ def index(request: Request):
             percent_false_selected=selected("false", str(config.get("show_percent_change", True)).lower()),
             logos_true_selected=selected("true", str(config.get("show_logos", True)).lower()),
             logos_false_selected=selected("false", str(config.get("show_logos", True)).lower()),
+            require_key_true_selected=selected("true", str(config.get("require_customer_api_key", True)).lower()),
+            require_key_false_selected=selected("false", str(config.get("require_customer_api_key", True)).lower()),
             stable_selected=selected("stable", config.get("update_channel", "stable")),
             beta_selected=selected("beta", config.get("update_channel", "stable")),
             after_purple_selected=selected("purple", config.get("after_hours_color", "purple")),
@@ -1476,7 +1517,7 @@ def test_quote_route(request: Request):
     try:
         api_key = get_finnhub_api_key()
         if not api_key:
-            test_quote_message = "Missing Finnhub API key. Open Setup Wizard and save an API key."
+            test_quote_message = "Customer API key required. Open Setup Wizard and save a Finnhub API key."
             set_error_message(test_quote_message)
             return Response(request, clean_page("Test Failed", test_quote_message), content_type="text/html")
 
@@ -1643,6 +1684,7 @@ def save_cfg(request: Request):
         config["show_dollar_change"] = bool_from_form(form.get("show_dollar_change", config.get("show_dollar_change", True)))
         config["show_percent_change"] = bool_from_form(form.get("show_percent_change", config.get("show_percent_change", True)))
         config["show_logos"] = bool_from_form(form.get("show_logos", config.get("show_logos", True)))
+        config["require_customer_api_key"] = bool_from_form(form.get("require_customer_api_key", config.get("require_customer_api_key", True)))
         config["show_stale_marker"] = bool_from_form(form.get("show_stale_marker", config.get("show_stale_marker", True)))
         config["smooth_quote_refresh"] = bool_from_form(form.get("smooth_quote_refresh", config.get("smooth_quote_refresh", True)))
 
@@ -2322,7 +2364,7 @@ def fetch_quote(sym):
     api_key = get_finnhub_api_key()
 
     if not api_key:
-        set_error_message("Missing Finnhub API key. Open Setup Wizard and save an API key.")
+        set_error_message("Customer API key required. Open Setup Wizard and save a Finnhub API key.")
         return cached_or_error_quote(sym, "missing API key")
 
     try:
