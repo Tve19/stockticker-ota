@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.12-beta"
+APP_VERSION = "1.1.13-beta"
 
 import time
 import ssl
@@ -65,6 +65,7 @@ DEFAULT_CONFIG = {
     "show_logos": True,
     "finnhub_api_key": "",
     "require_customer_api_key": True,
+    "demo_mode": False,
     "device_name": "StockTicker",
     "customer_mode": "basic"
 }
@@ -616,9 +617,10 @@ def build_logo_status_html():
             found += 1
         else:
             missing += 1
+            state = "Text fallback"
         lines.append("{}: {}".format(sym, state))
 
-    summary = "{} found / {} missing".format(found, missing)
+    summary = "{} found / {} text fallback".format(found, missing)
     return summary + "<br>" + "<br>".join(lines)
 
 
@@ -655,6 +657,249 @@ def build_release_notes_html(manifest=None):
     return "<br><br>".join(lines)
 
 
+
+def friendly_error_text(message):
+    raw = str(message)
+
+    if "Customer API key required" in raw or "missing API key" in raw:
+        return "Stock quotes are paused until a Finnhub API key is saved. Open Setup Wizard and enter the key."
+    if "OSError(30" in raw or "read-only" in raw:
+        return "Settings could not save because the device storage is read-only. Restart in normal app-write mode and try again."
+    if "Manifest" in raw or "manifest" in raw:
+        return "Software update server could not be reached or returned invalid data. Check WiFi and the manifest URL."
+    if "Fetch error" in raw or "returned no valid price" in raw or "Quote" in raw:
+        return "Stock quotes could not load. Check WiFi, ticker symbols, and the Finnhub API key."
+    if "Wrong admin PIN" in raw or "wrong admin PIN" in raw:
+        return "Action blocked because the admin PIN was incorrect."
+    if "OTA install" in raw or "Update failed" in raw:
+        return "Software update did not install. Check OTA Status and try again."
+    return raw
+
+
+def is_demo_mode():
+    return bool_from_form(config.get("demo_mode", False))
+
+
+def api_ready_for_quotes():
+    if is_demo_mode():
+        return True
+    return bool(get_finnhub_api_key())
+
+
+def count_missing_logos():
+    missing = 0
+    found = 0
+
+    if not config.get("show_logos", True):
+        return 0, 0
+
+    for sym in SYMBOLS:
+        if file_exists("/logos/{}.bmp".format(sym)):
+            found += 1
+        else:
+            missing += 1
+
+    return found, missing
+
+
+def logo_summary_text():
+    if not config.get("show_logos", True):
+        return "Text-only mode"
+
+    found, missing = count_missing_logos()
+
+    if missing == 0:
+        return "All logos found"
+
+    return "{} text fallback".format(missing)
+
+
+def setup_completion_counts():
+    checks = []
+    checks.append((True, "Device booted"))
+    checks.append((wifi.radio.connected, "WiFi connected"))
+    checks.append((api_ready_for_quotes(), "API key or demo mode ready"))
+    checks.append((len(SYMBOLS) > 0, "Symbols saved"))
+    checks.append((str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed"))
+    checks.append((file_exists(BACKUP_APP_PATH), "OTA backup available"))
+    return checks
+
+
+def setup_progress_text():
+    checks = setup_completion_counts()
+    done = 0
+
+    for ok, label in checks:
+        if ok:
+            done += 1
+
+    return "{}/{} complete".format(done, len(checks))
+
+
+def setup_checklist_item(ok, label, hint=""):
+    if ok:
+        return "<div class='check ok'>OK - {}</div>".format(safe_html(label))
+    if hint:
+        return "<div class='check todo'>ACTION - {}<br><span>{}</span></div>".format(safe_html(label), safe_html(hint))
+    return "<div class='check todo'>ACTION - {}</div>".format(safe_html(label))
+
+
+def build_setup_checklist_html():
+    items = []
+    items.append(setup_checklist_item(wifi.radio.connected, "WiFi connected", "Use first-time setup mode or reset WiFi."))
+
+    if is_demo_mode():
+        items.append(setup_checklist_item(True, "Demo mode enabled", "Device is using sample prices."))
+    else:
+        items.append(setup_checklist_item(bool(get_saved_customer_api_key()), "Finnhub API key saved", "Open Setup Wizard and paste a Finnhub API key."))
+
+    items.append(setup_checklist_item(len(SYMBOLS) > 0, "Stock symbols saved", "Add symbols in the Tickers section."))
+    items.append(setup_checklist_item(str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed", "For sold units, change the default 1234 PIN."))
+    items.append(setup_checklist_item(file_exists(BACKUP_APP_PATH), "Rollback backup available", "Install an OTA update once to create app_backup.py."))
+    items.append(setup_checklist_item(launcher_status_text() == "Installed", "Auto-recovery launcher installed", "Install it from Software Update."))
+
+    found, missing = count_missing_logos()
+    if config.get("show_logos", True):
+        if missing:
+            items.append(setup_checklist_item(True, "Logo fallback active", "{} missing logo(s) will use text fallback.".format(missing)))
+        else:
+            items.append(setup_checklist_item(True, "Logo status checked", "All saved symbol logos found."))
+    else:
+        items.append(setup_checklist_item(True, "Text-only logo mode", "Logo display is turned off."))
+
+    return "<p class='small'><b>Setup:</b> {}</p>".format(setup_progress_text()) + "".join(items)
+
+
+def system_health_state():
+    if not wifi.radio.connected:
+        return "ERROR", "WiFi Offline", "badbadge"
+    if not api_ready_for_quotes():
+        return "SETUP", "Setup Needed", "warnbadge"
+    if is_demo_mode():
+        return "DEMO", "Demo Mode", "warnbadge"
+
+    stale_count = 0
+    for sym in SYMBOLS:
+        if sym in last_good and quote_is_stale(last_good[sym]):
+            stale_count += 1
+
+    if stale_count:
+        return "WARNING", "Stale Quotes", "warnbadge"
+    if str(config.get("admin_pin", "1234")) == "1234":
+        return "WARNING", "Default PIN", "warnbadge"
+    if not file_exists(BACKUP_APP_PATH):
+        return "WARNING", "No Backup", "warnbadge"
+    return "OK", "System OK", "goodbadge"
+
+
+def build_system_health_badge_html():
+    code, label_text, class_name = system_health_state()
+    return "<span class='badge {}'>{}</span>".format(class_name, safe_html(label_text))
+
+
+def last_error_panel_html():
+    msg = str(last_error_message)
+    if not msg or msg.lower() in ("none", "none yet.", "none yet"):
+        return "<div class='quiet-ok'>No active error message.</div>"
+    return (
+        "<div class='errorbox'><b>Last Error:</b> {}"
+        "<form method='POST' action='/clear-last-error'>"
+        "<button class='smallbtn' type='submit'>Clear Error</button>"
+        "</form></div>"
+    ).format(safe_html(msg))
+
+
+def quote_status_short():
+    if is_demo_mode():
+        return "Demo Data"
+    if not get_finnhub_api_key():
+        return "API Key Needed"
+
+    stale_count = 0
+    no_data = 0
+    for sym in SYMBOLS:
+        if sym not in last_good:
+            no_data += 1
+        elif quote_is_stale(last_good[sym]):
+            stale_count += 1
+
+    if no_data == len(SYMBOLS):
+        return "Waiting"
+    if stale_count:
+        return "{} Stale".format(stale_count)
+    return "OK"
+
+
+def demo_quote(sym):
+    now_text = format_12h(eastern_time_now())
+    now_mono = time.monotonic()
+    seed = 0
+    for ch in str(sym):
+        seed += ord(ch)
+
+    base = 10 + (seed % 90)
+    wiggle = int(time.monotonic() / 15) % 10
+    price = base + (wiggle / 10.0)
+    pct = ((seed % 11) - 5) / 2.0
+    dollar_change = price * pct / 100.0
+    sign = "+" if dollar_change >= 0 else "-"
+    color = 0x00FF00 if dollar_change >= 0 else 0xFF0000
+    change_parts = []
+
+    if config.get("show_dollar_change", True):
+        change_parts.append("{}${:.2f}".format(sign, abs(dollar_change)))
+    if config.get("show_percent_change", True):
+        change_parts.append("({:+.2f}% DEMO)".format(pct))
+    if not change_parts:
+        change_parts.append("DEMO")
+
+    return {
+        "symbol": sym,
+        "price_line": "${} ${:.2f}".format(sym, price),
+        "change_line": " ".join(change_parts),
+        "color": color,
+        "pct": pct,
+        "updated_text": now_text,
+        "updated_mono": now_mono,
+        "stale": False,
+        "used_cached": False,
+        "error_reason": "demo mode"
+    }
+
+
+def help_page():
+    return """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>StockTicker Help</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
+.wrap { max-width:820px; margin:0 auto; }
+.card { background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }
+a { color:#79c7ff; }
+.small { color:#a9bddb; font-size:13px; line-height:1.5; }
+h1 { margin-top:0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="card"><h1>StockTicker Help</h1><p class="small">Quick customer guide.</p></div>
+<div class="card"><h2>First-time setup</h2><p>Connect to the setup WiFi, enter home WiFi, stock symbols, Finnhub API key, and admin PIN. After saving, the device restarts and joins the home network.</p></div>
+<div class="card"><h2>Adding stocks</h2><p>Use the Tickers section. Enter one symbol per line, such as SOFI, RKLB, HIMS, SPY, or AAPL.</p></div>
+<div class="card"><h2>API key</h2><p>Stock quotes require a Finnhub API key unless Demo Mode is enabled. The saved key is hidden for security.</p></div>
+<div class="card"><h2>Demo Mode</h2><p>Demo Mode shows sample prices for display/testing. It is not real market data and should be turned off for normal use.</p></div>
+<div class="card"><h2>Colors and labels</h2><p>Green means up, red means down, purple can indicate pre-market/after-hours. OLD means cached or stale data.</p></div>
+<div class="card"><h2>Software updates</h2><p>Read Release Notes, then use Check for Update and Install Update. Rollback restores the previous app if an update has problems.</p></div>
+<div class="card"><h2>Logos</h2><p>BMP logos go in /logos/SYMBOL.bmp. Missing logos are harmless; the ticker automatically uses a clean text fallback.</p></div>
+<p><a href="/">Back to Dashboard</a></p>
+</div>
+</body>
+</html>
+"""
+
+
 def setup_wizard_page(message=""):
     return """\
 <!DOCTYPE html>
@@ -663,13 +908,13 @@ def setup_wizard_page(message=""):
 <title>StockTicker Setup Wizard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
 .wrap {{ max-width:760px; margin:0 auto; }}
 .card {{ background:#101b2e; border:1px solid #243657; padding:16px; border-radius:18px; margin-bottom:14px; }}
 textarea, input, select {{ width:100%; box-sizing:border-box; margin:6px 0 12px; padding:10px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
 button {{ padding:12px 16px; border:0; border-radius:10px; background:#22aa66; color:white; font-weight:bold; }}
 .small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
-a {{ color:#79c7ff; }}
+a { color:#79c7ff; }
 </style>
 </head>
 <body>
@@ -692,6 +937,12 @@ a {{ color:#79c7ff; }}
 <option value="true" {require_key_true_selected}>True - customer must enter their own key</option>
 <option value="false" {require_key_false_selected}>False - allow secrets.py fallback</option>
 </select>
+<label>Demo Mode</label>
+<select name="demo_mode">
+<option value="false" {demo_false_selected}>False - use live market data</option>
+<option value="true" {demo_true_selected}>True - show sample demo prices</option>
+</select>
+<p class="small">Demo Mode is useful for product demos before an API key is entered. It is clearly marked as demo data.</p>
 <label>Admin PIN</label>
 <input name="admin_pin" value="{admin_pin}" placeholder="Example: 1234">
 <label>Brightness 0.00-1.00</label>
@@ -721,6 +972,8 @@ a {{ color:#79c7ff; }}
         api_key_status=safe_html(get_api_key_status()),
         require_key_true_selected=selected("true", str(config.get("require_customer_api_key", True)).lower()),
         require_key_false_selected=selected("false", str(config.get("require_customer_api_key", True)).lower()),
+        demo_true_selected=selected("true", str(config.get("demo_mode", False)).lower()),
+        demo_false_selected=selected("false", str(config.get("demo_mode", False)).lower()),
         admin_pin=safe_html(config.get("admin_pin", "1234")),
         brightness=safe_html(config.get("brightness", DEFAULT_CONFIG["brightness"])),
         stable_selected=selected("stable", config.get("update_channel", "stable")),
@@ -739,8 +992,9 @@ def set_web_message(message):
 
 def set_error_message(message):
     global last_error_message
-    last_error_message = message
-    add_event("ERROR: " + str(message))
+    friendly = friendly_error_text(message)
+    last_error_message = friendly
+    add_event("ERROR: " + str(friendly))
     print("WEB ERROR:", message)
 
 
@@ -768,7 +1022,7 @@ def start_setup_mode(reason):
 <title>StockTicker First-Time Setup</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
 .card {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; }}
 textarea, input, select {{ width:100%; box-sizing:border-box; padding:10px; margin:8px 0 14px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
 button {{ padding:12px 16px; border:0; border-radius:10px; background:#22aa66; color:white; font-weight:bold; }}
@@ -794,7 +1048,13 @@ AMZN
 SPY</textarea>
 <label>Finnhub API Key</label>
 <input name="finnhub_api_key" type="password" placeholder="Customer API key">
-<p class="small">Required for stock quotes. The key is saved on this device and hidden after setup.</p>
+<p class="small">Required for live stock quotes. The key is saved on this device and hidden after setup.</p>
+<label>Demo Mode</label>
+<select name="demo_mode">
+<option value="false">False - use live market data</option>
+<option value="true">True - show sample demo prices</option>
+</select>
+<p class="small">Use Demo Mode only for testing or showing the display before entering an API key.</p>
 <label>Admin PIN</label>
 <input name="admin_pin" value="1234">
 <label>Brightness 0.00-1.00</label>
@@ -828,6 +1088,7 @@ SPY</textarea>
         setup_cfg = load_config()
         setup_cfg["finnhub_api_key"] = url_decode(str(form.get("finnhub_api_key", setup_cfg.get("finnhub_api_key", "")))).strip()
         setup_cfg["require_customer_api_key"] = True
+        setup_cfg["demo_mode"] = bool_from_form(form.get("demo_mode", setup_cfg.get("demo_mode", False)))
         setup_cfg["admin_pin"] = url_decode(str(form.get("admin_pin", setup_cfg.get("admin_pin", "1234")))).strip() or "1234"
         setup_cfg["brightness"] = clamp_float(form.get("brightness", setup_cfg.get("brightness", 0.30)), 0.0, 1.0, 0.30)
 
@@ -1051,7 +1312,7 @@ HTML = """\
 <title>StockTicker Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
 .wrap {{ max-width:980px; margin:0 auto; }}
 .hero {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }}
 .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }}
@@ -1067,7 +1328,19 @@ button {{ padding:10px 14px; border:0; border-radius:10px; background:#1f8cff; c
 .good {{ color:#55ff88; }}
 .bad {{ color:#ff7777; }}
 .warning {{ color:#ffd166; }}
-h1 {{ margin:0 0 10px; }}
+.topline {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap; }}
+.badge {{ display:inline-block; padding:8px 12px; border-radius:999px; font-weight:bold; font-size:13px; }}
+.goodbadge {{ background:#123820; color:#74ff9e; border:1px solid #226d3d; }}
+.warnbadge {{ background:#3a2c10; color:#ffd166; border:1px solid #7a5b17; }}
+.badbadge {{ background:#3a1515; color:#ff8b8b; border:1px solid #733333; }}
+.errorbox {{ background:#2b171b; border:1px solid #803d46; border-radius:12px; padding:10px; margin-top:10px; color:#ffd9df; }}
+.quiet-ok {{ background:#102a1c; border:1px solid #226d3d; border-radius:12px; padding:10px; margin-top:10px; color:#92ffad; }}
+.smallbtn {{ padding:6px 9px; font-size:12px; margin-top:8px; }}
+.check {{ border:1px solid #273955; border-radius:10px; padding:8px; margin:7px 0; }}
+.check.ok {{ background:#102316; color:#91ffaa; }}
+.check.todo {{ background:#2c2312; color:#ffd166; }}
+.check span {{ color:#d5c8a7; font-size:12px; }}
+h1 {{ margin:0 0 6px; }}
 h2 {{ margin-top:0; }}
 summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </style>
@@ -1075,26 +1348,42 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <body>
 <div class="wrap">
 <div class="hero">
+<div class="topline">
+<div>
 <h1>{device_name}</h1>
+<p class="small">Professional LED market display · {device_id}</p>
+</div>
+<div>{system_health_badge}</div>
+</div>
 <div class="grid">
 <div class="stat"><b>Version</b><br>{version}</div>
-<div class="stat"><b>Device ID</b><br>{device_id}</div>
-<div class="stat"><b>IP</b><br>{ip}</div>
 <div class="stat"><b>Market</b><br>{market_status}</div>
-<div class="stat"><b>Last Quote Update</b><br>{last_update}</div>
-<div class="stat"><b>Update Channel</b><br>{update_channel}</div>
+<div class="stat"><b>Quotes</b><br>{quote_status_short}</div>
+<div class="stat"><b>Setup</b><br>{setup_progress}</div>
+<div class="stat"><b>Logos</b><br>{logo_summary_short}</div>
+<div class="stat"><b>IP</b><br>{ip}</div>
 </div>
 <p class="good">Status: {last_web_message}</p>
-<p class="bad">Last Error: {last_error_message}</p>
+{last_error_panel}
 </div>
 
+<div class="grid">
 <div class="card">
-<h2>Customer Setup / Basic Settings</h2>
-<p class="small">Use this section for normal customer changes. Advanced settings are lower on the page.</p>
+<h2>Customer Setup</h2>
+<p class="small">Normal customer changes live here. Advanced controls are lower on the page.</p>
 <form method="GET" action="/setup-wizard">
 <button type="submit">Open Setup Wizard</button>
 </form>
+<form method="GET" action="/help">
+<button type="submit">Help / Quick Guide</button>
+</form>
 <p class="small">API Key Status: {api_key_status}</p>
+</div>
+
+<div class="card">
+<h2>Setup Checklist</h2>
+{setup_checklist_message}
+</div>
 </div>
 
 <div class="grid">
@@ -1274,6 +1563,11 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <option value="true" {require_key_true_selected}>True</option>
 <option value="false" {require_key_false_selected}>False / allow secrets.py fallback</option>
 </select>
+<label>Demo Mode</label>
+<select name="demo_mode">
+<option value="false" {demo_false_selected}>False</option>
+<option value="true" {demo_true_selected}>True</option>
+</select>
 <label>Update Channel</label>
 <select name="update_channel">
 <option value="stable" {stable_selected}>Stable</option>
@@ -1383,6 +1677,19 @@ def clean_page(title, message):
     ).format(title, message)
 
 
+@server.route("/help")
+def help_route(request: Request):
+    return Response(request, help_page(), content_type="text/html")
+
+
+@server.route("/clear-last-error", methods=["POST"])
+def clear_last_error_route(request: Request):
+    global last_error_message
+    last_error_message = "None"
+    set_web_message("Last error cleared.")
+    return Response(request, clean_page("Error Cleared", "Last error message cleared."), content_type="text/html")
+
+
 @server.route("/setup-wizard")
 def setup_wizard_route(request: Request):
     return Response(request, setup_wizard_page(), content_type="text/html")
@@ -1402,6 +1709,7 @@ def save_customer_setup(request: Request):
             config["finnhub_api_key"] = new_api_key
 
         config["require_customer_api_key"] = bool_from_form(form.get("require_customer_api_key", config.get("require_customer_api_key", True)))
+        config["demo_mode"] = bool_from_form(form.get("demo_mode", config.get("demo_mode", False)))
         config["admin_pin"] = url_decode(str(form.get("admin_pin", config.get("admin_pin", "1234")))).strip() or "1234"
         config["brightness"] = clamp_float(form.get("brightness", config.get("brightness", 0.30)), 0.0, 1.0, DEFAULT_CONFIG["brightness"])
         config["show_logos"] = bool_from_form(form.get("show_logos", config.get("show_logos", True)))
@@ -1447,6 +1755,12 @@ def index(request: Request):
             ip=ip,
             market_status=current_market_status,
             update_channel=config["update_channel"],
+            system_health_badge=build_system_health_badge_html(),
+            setup_progress=setup_progress_text(),
+            setup_checklist_message=build_setup_checklist_html(),
+            quote_status_short=quote_status_short(),
+            logo_summary_short=logo_summary_text(),
+            last_error_panel=last_error_panel_html(),
             symbols="\n".join(SYMBOLS),
             brightness=config["brightness"],
             alert_percent_move=config["alert_percent_move"],
@@ -1493,6 +1807,8 @@ def index(request: Request):
             logos_false_selected=selected("false", str(config.get("show_logos", True)).lower()),
             require_key_true_selected=selected("true", str(config.get("require_customer_api_key", True)).lower()),
             require_key_false_selected=selected("false", str(config.get("require_customer_api_key", True)).lower()),
+            demo_true_selected=selected("true", str(config.get("demo_mode", False)).lower()),
+            demo_false_selected=selected("false", str(config.get("demo_mode", False)).lower()),
             stable_selected=selected("stable", config.get("update_channel", "stable")),
             beta_selected=selected("beta", config.get("update_channel", "stable")),
             after_purple_selected=selected("purple", config.get("after_hours_color", "purple")),
@@ -1515,11 +1831,17 @@ def test_quote_route(request: Request):
         return Response(request, clean_page("Test Failed", test_quote_message), content_type="text/html")
 
     try:
+        if is_demo_mode():
+            e = demo_quote(sym)
+            test_quote_message = "{} demo works: {} {}".format(sym, e.get("price_line", ""), e.get("change_line", ""))
+            set_web_message("Demo quote tested for {}.".format(sym))
+            return Response(request, clean_page("Demo Quote Complete", test_quote_message), content_type="text/html")
+
         api_key = get_finnhub_api_key()
         if not api_key:
             test_quote_message = "Customer API key required. Open Setup Wizard and save a Finnhub API key."
             set_error_message(test_quote_message)
-            return Response(request, clean_page("Test Failed", test_quote_message), content_type="text/html")
+            return Response(request, clean_page("Test Failed", friendly_error_text(test_quote_message)), content_type="text/html")
 
         url = FINNHUB_URL.format(sym, api_key)
         r = requests.get(url)
@@ -1558,6 +1880,10 @@ def validate_symbols_route(request: Request):
             pass
 
         try:
+            if is_demo_mode():
+                valid.append("{} DEMO".format(sym))
+                continue
+
             api_key = get_finnhub_api_key()
             if not api_key:
                 invalid.append(sym)
@@ -1685,6 +2011,7 @@ def save_cfg(request: Request):
         config["show_percent_change"] = bool_from_form(form.get("show_percent_change", config.get("show_percent_change", True)))
         config["show_logos"] = bool_from_form(form.get("show_logos", config.get("show_logos", True)))
         config["require_customer_api_key"] = bool_from_form(form.get("require_customer_api_key", config.get("require_customer_api_key", True)))
+        config["demo_mode"] = bool_from_form(form.get("demo_mode", config.get("demo_mode", False)))
         config["show_stale_marker"] = bool_from_form(form.get("show_stale_marker", config.get("show_stale_marker", True)))
         config["smooth_quote_refresh"] = bool_from_form(form.get("smooth_quote_refresh", config.get("smooth_quote_refresh", True)))
 
@@ -2361,6 +2688,10 @@ def update_header():
 def fetch_quote(sym):
     now_text = format_12h(eastern_time_now())
     now_mono = time.monotonic()
+
+    if is_demo_mode():
+        return demo_quote(sym)
+
     api_key = get_finnhub_api_key()
 
     if not api_key:
