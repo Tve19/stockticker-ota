@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.14-beta"
+APP_VERSION = "1.1.15-beta"
 
 import time
 import ssl
@@ -778,6 +778,8 @@ def system_health_state():
         return "SETUP", "Setup Needed", "warnbadge"
     if is_demo_mode():
         return "DEMO", "Demo Mode", "warnbadge"
+    if bool_from_form(config.get("panel_sleep", False)):
+        return "SLEEP", "Display Sleeping", "infobadge"
 
     stale_count = 0
     for sym in SYMBOLS:
@@ -951,8 +953,9 @@ a {{ color:#79c7ff; }}
 <option value="true" {demo_true_selected}>True - show sample demo prices</option>
 </select>
 <p class="small">Demo Mode is useful for product demos before an API key is entered. It is clearly marked as demo data.</p>
-<label>Admin PIN</label>
-<input name="admin_pin" value="{admin_pin}" placeholder="Example: 1234">
+<label>New Admin PIN</label>
+<input name="admin_pin" type="password" value="" placeholder="Leave blank to keep current PIN">
+<p class="small">For sold units, change the default 1234 PIN. The saved PIN is hidden.</p>
 <label>Brightness 0.00-1.00</label>
 <input name="brightness" value="{brightness}">
 <label>Update Channel</label>
@@ -1323,9 +1326,10 @@ HTML = """\
 body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
 .wrap {{ max-width:980px; margin:0 auto; }}
 .hero {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }}
-.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }}
 .card {{ background:#101b2e; border:1px solid #243657; padding:16px; border-radius:18px; margin-bottom:14px; }}
 .stat {{ background:#07111f; border:1px solid #243657; border-radius:12px; padding:10px; margin:6px 0; }}
+.stat b {{ color:#a9bddb; font-size:13px; }}
 label {{ color:#a9bddb; font-size:13px; font-weight:bold; }}
 textarea, input, select {{ width:100%; box-sizing:border-box; margin:6px 0 12px; padding:10px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
 button {{ padding:10px 14px; border:0; border-radius:10px; background:#1f8cff; color:white; font-weight:bold; margin-top:6px; cursor:pointer; }}
@@ -1341,6 +1345,7 @@ button {{ padding:10px 14px; border:0; border-radius:10px; background:#1f8cff; c
 .goodbadge {{ background:#123820; color:#74ff9e; border:1px solid #226d3d; }}
 .warnbadge {{ background:#3a2c10; color:#ffd166; border:1px solid #7a5b17; }}
 .badbadge {{ background:#3a1515; color:#ff8b8b; border:1px solid #733333; }}
+.infobadge {{ background:#102c3a; color:#8edbff; border:1px solid #2a6683; }}
 .errorbox {{ background:#2b171b; border:1px solid #803d46; border-radius:12px; padding:10px; margin-top:10px; color:#ffd9df; }}
 .quiet-ok {{ background:#102a1c; border:1px solid #226d3d; border-radius:12px; padding:10px; margin-top:10px; color:#92ffad; }}
 .smallbtn {{ padding:6px 9px; font-size:12px; margin-top:8px; }}
@@ -1353,6 +1358,7 @@ h2 {{ margin-top:0; }}
 summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 .button-row {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
 .button-row form {{ margin:0; }}
+.slim {{ margin-bottom:10px; }}
 </style>
 </head>
 <body>
@@ -1369,8 +1375,8 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <div class="stat"><b>Version</b><br>{version}</div>
 <div class="stat"><b>Market</b><br>{market_status}</div>
 <div class="stat"><b>Quotes</b><br>{quote_status_short}</div>
+<div class="stat"><b>Panel</b><br>{panel_state}</div>
 <div class="stat"><b>Setup</b><br>{setup_progress}</div>
-<div class="stat"><b>Logos</b><br>{logo_summary_short}</div>
 <div class="stat"><b>IP</b><br>{ip}</div>
 </div>
 <p class="good">Status: {last_web_message}</p>
@@ -1380,132 +1386,75 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <div class="grid">
 <div class="card">
 <h2>Customer Setup</h2>
-<p class="small">Normal customer changes live here. Advanced controls are lower on the page.</p>
-<form method="GET" action="/setup-wizard">
-<button type="submit">Open Setup Wizard</button>
-</form>
-<form method="GET" action="/help">
-<button type="submit">Help / Quick Guide</button>
-</form>
+<p class="small">Use this for normal customer setup: device name, symbols, API key, demo mode, PIN, brightness, update channel, and logos.</p>
+<div class="button-row">
+<form method="GET" action="/setup-wizard"><button type="submit">Open Setup Wizard</button></form>
+<form method="GET" action="/help"><button type="submit">Help / Quick Guide</button></form>
+</div>
 <p class="small">API Key Status: {api_key_status}</p>
+<details class="slim"><summary>Setup Checklist</summary>{setup_checklist_message}</details>
 </div>
 
 <div class="card">
-<h2>Setup Checklist</h2>
-{setup_checklist_message}
-</div>
-</div>
-
-<div class="grid">
-<div class="card">
-<h2>Quick Actions</h2>
+<h2>Quick Controls</h2>
 <p class="small"><b>Panel Display:</b> {panel_state}</p>
 <div class="button-row">
-<form method="POST" action="/panel-sleep">
-<button class="orange" type="submit">Sleep Display</button>
-</form>
-<form method="POST" action="/panel-wake">
-<button class="green" type="submit">Wake Display</button>
-</form>
+<form method="POST" action="/panel-sleep"><button class="orange" type="submit">Sleep Display</button></form>
+<form method="POST" action="/panel-wake"><button class="green" type="submit">Wake Display</button></form>
 </div>
-<form method="POST" action="/refresh-now">
-<button type="submit">Refresh Quotes Now</button>
-</form>
-<form method="POST" action="/check-cloud-status">
-<button type="submit">Check Cloud Status</button>
-</form>
-<form method="POST" action="/check-ota-status">
-<button type="submit">Check OTA Status</button>
-</form>
-<form method="POST" action="/restart">
-<button class="red" type="submit">Restart Device</button>
-</form>
+<div class="button-row">
+<form method="POST" action="/refresh-now"><button type="submit">Refresh Quotes</button></form>
+<form method="POST" action="/restart"><button class="red" type="submit">Restart Device</button></form>
 </div>
-
-<div class="card">
-<h2>Price Alerts</h2>
-<p>{alert_message}</p>
-<p class="small">Alert triggers when a saved ticker moves more than your threshold from previous close.</p>
-<form method="POST" action="/clear-alerts">
-<button class="orange" type="submit">Clear Alert Message</button>
-</form>
+<p class="small">Sleep turns the LED panels black but keeps WiFi, dashboard, settings, and updates running.</p>
 </div>
 </div>
 
+<details class="card">
+<summary>Display & Ticker Settings</summary>
+<p class="small">Common customer-facing controls. Changes save to the device and update the board after the current scroll cycle.</p>
 <div class="grid">
-<div class="card">
-<h2>Quote Freshness</h2>
-<p>{quote_freshness_message}</p>
-<p class="small">STALE means the panel is using old/cached data instead of a fresh quote.</p>
-</div>
-
-<div class="card">
-<h2>Memory / Disk Health</h2>
-<p>{system_health_message}</p>
-<form method="POST" action="/check-system-health">
-<button type="submit">Check System Health</button>
-</form>
-</div>
-</div>
-
-<div class="card">
-<h2>Event Log</h2>
-<p>{event_log_message}</p>
-<form method="POST" action="/clear-event-log">
-<button class="orange" type="submit">Clear Event Log</button>
-</form>
-<p class="small">This log is stored in memory and clears after a hard power cycle.</p>
-</div>
-
-<div class="card">
+<div>
 <h2>Tickers</h2>
 <form method="POST" action="/save-symbols">
 <textarea name="symbols" rows="8">{symbols}</textarea>
 <button class="green" type="submit">Save Symbols</button>
 </form>
 </div>
-
-<div class="grid">
-<div class="card">
-<h2>Test Quote</h2>
-<p class="small">Check if a ticker works before saving it.</p>
-<form method="POST" action="/test-quote">
-<input name="test_symbol" placeholder="Example: ARM">
-<button type="submit">Test Quote</button>
-</form>
-<p>{test_quote_message}</p>
-<form method="POST" action="/validate-symbols">
-<button class="green" type="submit">Validate All Saved Symbols</button>
-</form>
-</div>
-
-<div class="card">
-<h2>Watchlist Presets</h2>
-<form method="POST" action="/apply-watchlist">
-<select name="watchlist">
-<option value="growth">Growth</option>
-<option value="indexes">Indexes</option>
-<option value="mega">Mega Cap</option>
-</select>
-<button type="submit">Apply Watchlist</button>
-</form>
-</div>
-
-<div class="card">
-<h2>Logo Manager</h2>
-<p>{logo_status_message}</p>
-<p class="small">Upload BMP logos to the device in /logos/SYMBOL.bmp. Missing logos are harmless; the ticker will use text only.</p>
-</div>
-</div>
-
-<details class="card">
-<summary>Advanced Settings</summary>
-<h2>Display Settings</h2>
-<form method="POST" action="/save-config">
-<div class="grid">
 <div>
+<h2>Display</h2>
+<form method="POST" action="/save-config">
 <label>Brightness 0.00-1.00</label>
 <input name="brightness" value="{brightness}">
+<label>Scroll Speed When Market Open</label>
+<input name="scroll_speed_open" value="{scroll_speed_open}">
+<label>Scroll Speed When Market Closed</label>
+<input name="scroll_speed_closed" value="{scroll_speed_closed}">
+<label>Scroll Smoothness Delay</label>
+<input name="scroll_delay" value="{scroll_delay}">
+<label>Space Between Ticker Blocks</label>
+<input name="block_gap" value="{block_gap}">
+<label>Show Logos</label>
+<select name="show_logos">
+<option value="true" {logos_true_selected}>True</option>
+<option value="false" {logos_false_selected}>False</option>
+</select>
+<label>Show Dollar Change</label>
+<select name="show_dollar_change">
+<option value="true" {dollar_true_selected}>True</option>
+<option value="false" {dollar_false_selected}>False</option>
+</select>
+<label>Show Percent Change</label>
+<select name="show_percent_change">
+<option value="true" {percent_true_selected}>True</option>
+<option value="false" {percent_false_selected}>False</option>
+</select>
+<button class="green" type="submit">Save Display Settings</button>
+</form>
+</div>
+<div>
+<h2>Night / Demo</h2>
+<form method="POST" action="/save-config">
 <label>Night Mode Enabled</label>
 <select name="night_mode_enabled">
 <option value="true" {night_true_selected}>True</option>
@@ -1517,22 +1466,90 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <input name="night_start_hour" value="{night_start_hour}">
 <label>Night End Hour ET</label>
 <input name="night_end_hour" value="{night_end_hour}">
-</div>
-<div>
-<label>Scroll Speed Open</label>
-<input name="scroll_speed_open" value="{scroll_speed_open}">
-<label>Scroll Speed Closed</label>
-<input name="scroll_speed_closed" value="{scroll_speed_closed}">
-<label>Scroll Delay</label>
-<input name="scroll_delay" value="{scroll_delay}">
-<label>Block Gap</label>
-<input name="block_gap" value="{block_gap}">
-<label>After-Hours Color</label>
-<select name="after_hours_color">
-<option value="purple" {after_purple_selected}>Purple</option>
-<option value="normal" {after_normal_selected}>Normal red/green</option>
+<label>Demo Mode</label>
+<select name="demo_mode">
+<option value="false" {demo_false_selected}>False</option>
+<option value="true" {demo_true_selected}>True</option>
 </select>
+<p class="small">Demo Mode uses sample prices and clearly marks them as demo data.</p>
+<button class="green" type="submit">Save Night / Demo Settings</button>
+</form>
 </div>
+</div>
+</details>
+
+<details class="card">
+<summary>Status Details</summary>
+<div class="grid">
+<div class="card">
+<h2>Price Alerts</h2>
+<p>{alert_message}</p>
+<form method="POST" action="/clear-alerts"><button class="orange" type="submit">Clear Alert Message</button></form>
+</div>
+<div class="card">
+<h2>Quote Freshness</h2>
+<p>{quote_freshness_message}</p>
+<p class="small">STALE means the panel is using cached or older data.</p>
+</div>
+<div class="card">
+<h2>Logo Status</h2>
+<p>{logo_status_message}</p>
+<p class="small">Missing logos are harmless; the ticker uses text fallback.</p>
+</div>
+</div>
+</details>
+
+<details class="card">
+<summary>Diagnostics & Maintenance</summary>
+<div class="grid">
+<div class="card">
+<h2>Test Quote</h2>
+<form method="POST" action="/test-quote">
+<input name="test_symbol" placeholder="Example: ARM">
+<button type="submit">Test Quote</button>
+</form>
+<p>{test_quote_message}</p>
+<form method="POST" action="/validate-symbols"><button class="green" type="submit">Validate All Saved Symbols</button></form>
+</div>
+<div class="card">
+<h2>Watchlist Presets</h2>
+<form method="POST" action="/apply-watchlist">
+<select name="watchlist">
+<option value="growth">Growth</option>
+<option value="indexes">Indexes</option>
+<option value="mega">Mega Cap</option>
+</select>
+<button type="submit">Apply Watchlist</button>
+</form>
+</div>
+<div class="card">
+<h2>Cloud Status</h2>
+<p>{cloud_status_message}</p>
+<form method="POST" action="/check-cloud-status"><button type="submit">Check Cloud Status</button></form>
+</div>
+<div class="card">
+<h2>Memory / Disk Health</h2>
+<p>{system_health_message}</p>
+<form method="POST" action="/check-system-health"><button type="submit">Check System Health</button></form>
+</div>
+<div class="card">
+<h2>OTA Status</h2>
+<p>{ota_status_message}</p>
+<form method="POST" action="/check-ota-status"><button type="submit">Check OTA Status</button></form>
+</div>
+<div class="card">
+<h2>Event Log</h2>
+<p>{event_log_message}</p>
+<form method="POST" action="/clear-event-log"><button class="orange" type="submit">Clear Event Log</button></form>
+</div>
+</div>
+</details>
+
+<details class="card">
+<summary>Advanced Admin Settings</summary>
+<p class="small">These are owner/admin controls. Most end users should not need this section.</p>
+<form method="POST" action="/save-config">
+<div class="grid">
 <div>
 <label>Open Refresh Seconds</label>
 <input name="fetch_interval_open" value="{fetch_interval_open}">
@@ -1545,7 +1562,13 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <option value="true" {smooth_true_selected}>True</option>
 <option value="false" {smooth_false_selected}>False</option>
 </select>
-<p class="small">True = fetches one symbol at a time and updates text when a block is off-screen.</p>
+<label>After-Hours Color</label>
+<select name="after_hours_color">
+<option value="purple" {after_purple_selected}>Purple</option>
+<option value="normal" {after_normal_selected}>Normal red/green</option>
+</select>
+</div>
+<div>
 <label>Price Alerts Enabled</label>
 <select name="alert_enabled">
 <option value="true" {alert_true_selected}>True</option>
@@ -1562,30 +1585,10 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </select>
 </div>
 <div>
-<label>Show Dollar Change</label>
-<select name="show_dollar_change">
-<option value="true" {dollar_true_selected}>True</option>
-<option value="false" {dollar_false_selected}>False</option>
-</select>
-<label>Show Percent Change</label>
-<select name="show_percent_change">
-<option value="true" {percent_true_selected}>True</option>
-<option value="false" {percent_false_selected}>False</option>
-</select>
-<label>Show Logos</label>
-<select name="show_logos">
-<option value="true" {logos_true_selected}>True</option>
-<option value="false" {logos_false_selected}>False</option>
-</select>
 <label>Customer API Key Required</label>
 <select name="require_customer_api_key">
 <option value="true" {require_key_true_selected}>True</option>
 <option value="false" {require_key_false_selected}>False / allow secrets.py fallback</option>
-</select>
-<label>Demo Mode</label>
-<select name="demo_mode">
-<option value="false" {demo_false_selected}>False</option>
-<option value="true" {demo_true_selected}>True</option>
 </select>
 <label>Update Channel</label>
 <select name="update_channel">
@@ -1596,42 +1599,22 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <input name="update_manifest_url" value="{update_manifest_url}">
 </div>
 </div>
-<button class="green" type="submit">Save Config</button>
+<button class="green" type="submit">Save Advanced Settings</button>
 </form>
 </details>
 
+<details class="card">
+<summary>Software Update & Recovery</summary>
 <div class="grid">
-<div class="card">
-<h2>Cloud Status</h2>
-<p>{cloud_status_message}</p>
-<form method="POST" action="/check-cloud-status">
-<button type="submit">Check Cloud Status</button>
-</form>
-</div>
-
-<div class="card">
-<h2>OTA Status / Health Check</h2>
-<p>{ota_status_message}</p>
-<form method="POST" action="/check-ota-status">
-<button type="submit">Check OTA Status</button>
-</form>
-</div>
-</div>
-
 <div class="card">
 <h2>Release Notes</h2>
 <p>{release_notes_message}</p>
-<form method="POST" action="/check-release-notes">
-<button type="submit">Check Release Notes</button>
-</form>
+<form method="POST" action="/check-release-notes"><button type="submit">Check Release Notes</button></form>
 </div>
-
 <div class="card">
 <h2>Software Update</h2>
 <p>{ota_message}</p>
-<form method="POST" action="/check-update">
-<button type="submit">Check for Update</button>
-</form>
+<form method="POST" action="/check-update"><button type="submit">Check for Update</button></form>
 <br>
 <form method="POST" action="/install-update">
 <label>Admin PIN</label>
@@ -1652,7 +1635,12 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <button class="orange" type="submit">Install Auto-Recovery Launcher</button>
 </form>
 </div>
+</div>
+</details>
 
+<details class="card">
+<summary>Market Calendar & Factory Reset</summary>
+<div class="grid">
 <div class="card">
 <h2>Market Holidays</h2>
 <p class="small">One date per line. Format: YYYY-MM-DD</p>
@@ -1664,7 +1652,6 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <button class="green" type="submit">Save Holidays</button>
 </form>
 </div>
-
 <div class="card">
 <h2>Factory Reset</h2>
 <p class="small">Use only for testing setup mode or clearing saved settings.</p>
@@ -1681,10 +1668,11 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </form>
 </div>
 </div>
+</details>
+</div>
 </body>
 </html>
 """
-
 
 def clean_page(title, message):
     return (
@@ -1729,7 +1717,11 @@ def save_customer_setup(request: Request):
 
         config["require_customer_api_key"] = bool_from_form(form.get("require_customer_api_key", config.get("require_customer_api_key", True)))
         config["demo_mode"] = bool_from_form(form.get("demo_mode", config.get("demo_mode", False)))
-        config["admin_pin"] = url_decode(str(form.get("admin_pin", config.get("admin_pin", "1234")))).strip() or "1234"
+
+        new_admin_pin = url_decode(str(form.get("admin_pin", ""))).strip()
+        if new_admin_pin:
+            config["admin_pin"] = new_admin_pin
+
         config["brightness"] = clamp_float(form.get("brightness", config.get("brightness", 0.30)), 0.0, 1.0, DEFAULT_CONFIG["brightness"])
         config["show_logos"] = bool_from_form(form.get("show_logos", config.get("show_logos", True)))
 
@@ -2626,6 +2618,11 @@ def panel_sleep_route(request: Request):
     try:
         config["panel_sleep"] = True
         save_config(config)
+        try:
+            display.root_group = sleep_root
+            matrix.brightness = 0.0
+        except Exception:
+            pass
         set_web_message("Panel display is sleeping. Dashboard and updates still work.")
         return Response(request, clean_page("Display Sleeping", "The LED panels are now blanked. Use Wake Display to turn them back on."), content_type="text/html")
 
@@ -2641,6 +2638,10 @@ def panel_wake_route(request: Request):
     try:
         config["panel_sleep"] = False
         save_config(config)
+        try:
+            display.root_group = root
+        except Exception:
+            pass
         set_web_message("Panel display is awake.")
         return Response(request, clean_page("Display Awake", "The LED panels are waking up."), content_type="text/html")
 
@@ -2686,7 +2687,9 @@ display = framebufferio.FramebufferDisplay(matrix, auto_refresh=True)
 matrix.brightness = 0.0
 
 root = displayio.Group()
+sleep_root = displayio.Group()
 display.root_group = root
+panel_sleep_applied = False
 
 status_label = label.Label(terminalio.FONT, text="", color=0x00FF00, scale=1)
 status_label.y = 4
@@ -3120,17 +3123,32 @@ while True:
         blocks = build_blocks(entries, after_hours)
         last_quote_fetch = now
 
-    if bool_from_form(config.get("panel_sleep", False)):
-        target_brightness = 0.0
+    panel_sleeping_now = bool_from_form(config.get("panel_sleep", False))
+
+    if panel_sleeping_now:
+        if not panel_sleep_applied:
+            try:
+                display.root_group = sleep_root
+            except Exception:
+                pass
+            panel_sleep_applied = True
+        matrix.brightness = 0.0
     else:
+        if panel_sleep_applied:
+            try:
+                display.root_group = root
+            except Exception:
+                pass
+            panel_sleep_applied = False
+
         target_brightness = BRIGHTNESS_TARGET
 
         if night_mode_active(status):
             target_brightness = float(config["night_brightness"])
 
-    if matrix.brightness < target_brightness:
-        matrix.brightness = min(matrix.brightness + BRIGHTNESS_RAMP_STEP, target_brightness)
-    elif matrix.brightness > target_brightness:
-        matrix.brightness = max(matrix.brightness - BRIGHTNESS_RAMP_STEP, target_brightness)
+        if matrix.brightness < target_brightness:
+            matrix.brightness = min(matrix.brightness + BRIGHTNESS_RAMP_STEP, target_brightness)
+        elif matrix.brightness > target_brightness:
+            matrix.brightness = max(matrix.brightness - BRIGHTNESS_RAMP_STEP, target_brightness)
 
     time.sleep(SCROLL_DELAY)
