@@ -5,8 +5,8 @@
     "notes": "Stable ticker release."
   },
   "beta": {
-    "version": "1.1.15-beta",
+    "version": "1.1.16-beta",
     "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
-    "notes": "Added cleaner customer dashboard sections, improved display settings, true Sleep Display blanking, and safer PIN handling."
+    "notes": "Added safe backup/export config pages and a clean customer onboarding message for incomplete setup."
   }
 }
