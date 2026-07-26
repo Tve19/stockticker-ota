@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.1.16"
 
 import time
 import ssl
@@ -17,9 +17,17 @@ import terminalio
 import gc
 import json
 import microcontroller
+import os
 
 from adafruit_display_text import label
-from secrets import secrets
+try:
+    from secrets import secrets
+except Exception:
+    secrets = {
+        "ssid": "",
+        "password": "",
+        "finnhub_api_key": ""
+    }
 from adafruit_httpserver import Server, Request, Response
 
 
@@ -28,6 +36,7 @@ SYMBOLS_FILE = "/symbols.txt"
 WIFI_FILE = "/wifi_config.json"
 HOLIDAYS_FILE = "/market_holidays.json"
 DEVICE_FILE = "/device.json"
+CRASH_FILE = "/crash_count.json"
 
 DEFAULT_CONFIG = {
     "brightness": 0.30,
@@ -45,7 +54,21 @@ DEFAULT_CONFIG = {
     "night_mode_enabled": True,
     "night_brightness": 0.08,
     "night_start_hour": 16,
-    "night_end_hour": 7
+    "night_end_hour": 7,
+    "alert_enabled": True,
+    "show_dollar_change": True,
+    "show_percent_change": True,
+    "after_hours_color": "purple",
+    "stale_quote_minutes": 15,
+    "show_stale_marker": True,
+    "smooth_quote_refresh": True,
+    "show_logos": True,
+    "finnhub_api_key": "",
+    "require_customer_api_key": True,
+    "demo_mode": False,
+    "device_name": "StockTicker",
+    "customer_mode": "basic",
+    "panel_sleep": False
 }
 
 DEFAULT_SYMBOLS = [
@@ -219,6 +242,99 @@ def bool_from_form(value):
     return value in ("1", "true", "yes", "on")
 
 
+def clamp_float(value, low, high, default):
+    try:
+        n = float(url_decode(str(value)))
+    except Exception:
+        n = default
+
+    if n < low:
+        n = low
+    if n > high:
+        n = high
+
+    return n
+
+
+def clamp_int(value, low, high, default):
+    try:
+        n = int(float(url_decode(str(value))))
+    except Exception:
+        n = default
+
+    if n < low:
+        n = low
+    if n > high:
+        n = high
+
+    return n
+
+
+def selected(value, current):
+    if str(value) == str(current):
+        return "selected"
+    return ""
+
+
+def mask_secret(value):
+    value = str(value or "")
+    if not value:
+        return ""
+    if len(value) <= 6:
+        return "******"
+    return value[:3] + "..." + value[-3:]
+
+
+def customer_api_required():
+    return bool_from_form(config.get("require_customer_api_key", True))
+
+
+def get_saved_customer_api_key():
+    try:
+        return str(config.get("finnhub_api_key", "")).strip()
+    except Exception:
+        return ""
+
+
+def get_finnhub_api_key():
+    key = get_saved_customer_api_key()
+    if key:
+        return key
+
+    if customer_api_required():
+        return ""
+
+    try:
+        return str(secrets.get("finnhub_api_key", "")).strip()
+    except Exception:
+        return ""
+
+
+def get_api_key_status():
+    saved_key = get_saved_customer_api_key()
+    if saved_key:
+        return "Saved in device settings: " + mask_secret(saved_key)
+
+    if customer_api_required():
+        return "Required mode ON - missing customer API key. Quotes will not load until setup is completed."
+
+    try:
+        fallback_key = str(secrets.get("finnhub_api_key", "")).strip()
+        if fallback_key:
+            return "Fallback mode: loaded from secrets.py " + mask_secret(fallback_key)
+    except Exception:
+        pass
+
+    return "Missing - enter a Finnhub API key in Customer Setup."
+
+
+def mark_app_boot_success():
+    try:
+        save_json_file(CRASH_FILE, {"count": 0, "last_good_version": APP_VERSION})
+    except Exception as e:
+        print("Could not reset crash counter:", repr(e))
+
+
 APP_PATH = "/app.py"
 BACKUP_APP_PATH = "/app_backup.py"
 
@@ -278,9 +394,13 @@ BRIGHTNESS_RAMP_STEP = 0.01
 SCROLL_SPEED_OPEN = float(config["scroll_speed_open"])
 SCROLL_SPEED_CLOSED = float(config["scroll_speed_closed"])
 FETCH_INTERVAL_OPEN = int(config["fetch_interval_open"])
+FETCH_INTERVAL_PRE_AFTER = int(config["fetch_interval_pre_after"])
+FETCH_INTERVAL_CLOSED = int(config["fetch_interval_closed"])
 ALERT_PERCENT_MOVE = float(config["alert_percent_move"])
+ALERT_ENABLED = bool_from_form(config.get("alert_enabled", True))
 BLOCK_GAP = int(config["block_gap"])
 SCROLL_DELAY = float(config["scroll_delay"])
+SMOOTH_QUOTE_REFRESH = bool_from_form(config.get("smooth_quote_refresh", True))
 
 need_reload = False
 refresh_requested = False
@@ -289,28 +409,806 @@ restart_time = 0
 last_good = {}
 last_update_text = "--:--"
 ota_message = "No update checked yet."
+ota_status_message = "Press Check OTA Status to verify manifest, channel, and backup."
 last_web_message = "System ready."
 last_error_message = "None yet."
 test_quote_message = "No quote tested yet."
 cloud_status_message = "Cloud status not checked yet."
+alert_message = "No price alerts yet."
+quote_freshness_message = "No quote freshness checked yet."
+system_health_message = "Press Check System Health to refresh memory and disk stats."
+release_notes_message = "Press Check Release Notes to load stable/beta notes from your OTA manifest."
+auto_recovery_message = "Auto-recovery launcher not checked yet."
 time_sync_ok = False
+boot_time = time.monotonic()
+event_log = []
+MAX_EVENT_LOG = 20
+
+def safe_html(text):
+    text = str(text)
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
+
+def add_event(message):
+    try:
+        stamp = format_12h(eastern_time_now())
+    except Exception:
+        stamp = str(int(time.monotonic())) + "s"
+
+    entry = "{} - {}".format(stamp, str(message))
+    event_log.append(entry[:160])
+
+    while len(event_log) > MAX_EVENT_LOG:
+        del event_log[0]
+
+
+def build_event_log_html():
+    if not event_log:
+        return "No events yet."
+
+    lines = []
+
+    for item in reversed(event_log):
+        lines.append(safe_html(item))
+
+    return "<br>".join(lines)
+
+
+def file_size_text(path):
+    try:
+        st = os.stat(path)
+        return str(st[6]) + " bytes"
+    except Exception:
+        return "missing"
+
+
+def build_system_health_html():
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+    try:
+        free_mem = gc.mem_free()
+    except Exception:
+        free_mem = "n/a"
+
+    try:
+        used_mem = gc.mem_alloc()
+    except Exception:
+        used_mem = "n/a"
+
+    try:
+        stat = os.statvfs("/")
+        block_size = stat[0]
+        total_disk = block_size * stat[2]
+        free_disk = block_size * stat[3]
+        disk_text = "{} free / {} total bytes".format(free_disk, total_disk)
+    except Exception as e:
+        disk_text = "unavailable: " + repr(e)
+
+    uptime = int(time.monotonic() - boot_time)
+    hours = uptime // 3600
+    minutes = (uptime % 3600) // 60
+    seconds = uptime % 60
+
+    return (
+        "Uptime: {}h {}m {}s<br>"
+        "Free Memory: {} bytes<br>"
+        "Used Memory: {} bytes<br>"
+        "Disk: {}<br>"
+        "app.py Size: {}<br>"
+        "Backup Size: {}<br>"
+        "Auto-Recovery Launcher: {}"
+    ).format(
+        hours,
+        minutes,
+        seconds,
+        free_mem,
+        used_mem,
+        disk_text,
+        file_size_text(APP_PATH),
+        file_size_text(BACKUP_APP_PATH),
+        launcher_status_text()
+    )
+
+
+def age_minutes(entry):
+    try:
+        updated = float(entry.get("updated_mono", 0))
+        if updated <= 0:
+            return 9999
+        return int((time.monotonic() - updated) / 60)
+    except Exception:
+        return 9999
+
+
+def quote_is_stale(entry):
+    try:
+        limit_minutes = int(config.get("stale_quote_minutes", 15))
+    except Exception:
+        limit_minutes = 15
+
+    return bool(entry.get("stale", False)) or age_minutes(entry) >= limit_minutes
+
+
+def cached_or_error_quote(sym, reason):
+    if sym in last_good:
+        old = last_good[sym]
+        e = {}
+
+        for key in old:
+            e[key] = old[key]
+
+        e["stale"] = True
+        e["used_cached"] = True
+        e["error_reason"] = reason
+
+        if config.get("show_stale_marker", True):
+            cl = str(e.get("change_line", ""))
+            if "OLD" not in cl:
+                if cl:
+                    e["change_line"] = cl + " OLD"
+                else:
+                    e["change_line"] = "OLD"
+
+        add_event("Using cached quote for {}: {}".format(sym, reason))
+        return e
+
+    add_event("No quote data for {}: {}".format(sym, reason))
+
+    return {
+        "symbol": sym,
+        "price_line": "${} ERROR".format(sym),
+        "change_line": "NO DATA",
+        "color": 0xFF0000,
+        "pct": 0,
+        "updated_text": "never",
+        "updated_mono": 0,
+        "stale": True,
+        "used_cached": False,
+        "error_reason": reason
+    }
+
+
+def build_quote_freshness_html():
+    if not SYMBOLS:
+        return "No symbols saved."
+
+    lines = []
+
+    for sym in SYMBOLS:
+        if sym not in last_good:
+            lines.append("{}: No data yet".format(sym))
+        else:
+            e = last_good[sym]
+            mins = age_minutes(e)
+            state = "STALE" if quote_is_stale(e) else "OK"
+            cached = " cached" if e.get("used_cached", False) else ""
+            updated = e.get("updated_text", "unknown")
+            lines.append("{}: {} - {} min old{} - {}".format(sym, state, mins, cached, updated))
+
+    return "<br>".join(lines)
+
+
+def logo_status_for_symbol(sym):
+    path = "/logos/{}.bmp".format(sym)
+    if file_exists(path):
+        return "Found"
+    return "Missing"
+
+
+def build_logo_status_html():
+    if not config.get("show_logos", True):
+        return "Logos are currently disabled. The ticker is running in text-only mode."
+
+    if not SYMBOLS:
+        return "No symbols saved."
+
+    lines = []
+    found = 0
+    missing = 0
+
+    for sym in SYMBOLS:
+        state = logo_status_for_symbol(sym)
+        if state == "Found":
+            found += 1
+        else:
+            missing += 1
+            state = "Text fallback"
+        lines.append("{}: {}".format(sym, state))
+
+    summary = "{} found / {} text fallback".format(found, missing)
+    return summary + "<br>" + "<br>".join(lines)
+
+
+def launcher_status_text():
+    try:
+        with open("/code.py", "r") as f:
+            text = f.read()
+        if "AUTO_RECOVERY_LAUNCHER_V1" in text:
+            return "Installed"
+        return "Not installed or older launcher"
+    except Exception:
+        return "Unable to read code.py"
+
+
+def build_release_notes_html(manifest=None):
+    if manifest is None:
+        manifest = fetch_update_manifest()
+
+    if manifest is None:
+        return "Could not load release notes. Check the manifest URL."
+
+    lines = []
+    for ch in ("stable", "beta"):
+        if ch in manifest:
+            info = manifest[ch]
+            lines.append("<b>{}</b>: {}<br>{}".format(
+                ch.upper(),
+                safe_html(info.get("version", "unknown")),
+                safe_html(info.get("notes", "No notes."))
+            ))
+        else:
+            lines.append("<b>{}</b>: missing from manifest".format(ch.upper()))
+
+    return "<br><br>".join(lines)
+
+
+
+def friendly_error_text(message):
+    raw = str(message)
+
+    if "Customer API key required" in raw or "missing API key" in raw:
+        return "Stock quotes are paused until a Finnhub API key is saved. Open Setup Wizard and enter the key."
+    if "OSError(30" in raw or "read-only" in raw:
+        return "Settings could not save because the device storage is read-only. Restart in normal app-write mode and try again."
+    if "Manifest" in raw or "manifest" in raw:
+        return "Software update server could not be reached or returned invalid data. Check WiFi and the manifest URL."
+    if "Fetch error" in raw or "returned no valid price" in raw or "Quote" in raw:
+        return "Stock quotes could not load. Check WiFi, ticker symbols, and the Finnhub API key."
+    if "Wrong admin PIN" in raw or "wrong admin PIN" in raw:
+        return "Action blocked because the admin PIN was incorrect."
+    if "OTA install" in raw or "Update failed" in raw:
+        return "Software update did not install. Check OTA Status and try again."
+    return raw
+
+
+def is_demo_mode():
+    return bool_from_form(config.get("demo_mode", False))
+
+
+def api_ready_for_quotes():
+    if is_demo_mode():
+        return True
+    return bool(get_finnhub_api_key())
+
+
+def count_missing_logos():
+    missing = 0
+    found = 0
+
+    if not config.get("show_logos", True):
+        return 0, 0
+
+    for sym in SYMBOLS:
+        if file_exists("/logos/{}.bmp".format(sym)):
+            found += 1
+        else:
+            missing += 1
+
+    return found, missing
+
+
+def logo_summary_text():
+    if not config.get("show_logos", True):
+        return "Text-only mode"
+
+    found, missing = count_missing_logos()
+
+    if missing == 0:
+        return "All logos found"
+
+    return "{} text fallback".format(missing)
+
+
+def setup_completion_counts():
+    checks = []
+    checks.append((True, "Device booted"))
+    checks.append((wifi.radio.connected, "WiFi connected"))
+    checks.append((api_ready_for_quotes(), "API key or demo mode ready"))
+    checks.append((len(SYMBOLS) > 0, "Symbols saved"))
+    checks.append((str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed"))
+    checks.append((file_exists(BACKUP_APP_PATH), "OTA backup available"))
+    return checks
+
+
+def setup_progress_text():
+    checks = setup_completion_counts()
+    done = 0
+
+    for ok, label in checks:
+        if ok:
+            done += 1
+
+    return "{}/{} complete".format(done, len(checks))
+
+
+def setup_checklist_item(ok, label, hint=""):
+    if ok:
+        return "<div class='check ok'>OK - {}</div>".format(safe_html(label))
+    if hint:
+        return "<div class='check todo'>ACTION - {}<br><span>{}</span></div>".format(safe_html(label), safe_html(hint))
+    return "<div class='check todo'>ACTION - {}</div>".format(safe_html(label))
+
+
+def build_setup_checklist_html():
+    items = []
+    items.append(setup_checklist_item(wifi.radio.connected, "WiFi connected", "Use first-time setup mode or reset WiFi."))
+
+    if is_demo_mode():
+        items.append(setup_checklist_item(True, "Demo mode enabled", "Device is using sample prices."))
+    else:
+        items.append(setup_checklist_item(bool(get_saved_customer_api_key()), "Finnhub API key saved", "Open Setup Wizard and paste a Finnhub API key."))
+
+    items.append(setup_checklist_item(len(SYMBOLS) > 0, "Stock symbols saved", "Add symbols in the Tickers section."))
+    items.append(setup_checklist_item(str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed", "For sold units, change the default 1234 PIN."))
+    items.append(setup_checklist_item(file_exists(BACKUP_APP_PATH), "Rollback backup available", "Install an OTA update once to create app_backup.py."))
+    items.append(setup_checklist_item(launcher_status_text() == "Installed", "Auto-recovery launcher installed", "Install it from Software Update."))
+
+    found, missing = count_missing_logos()
+    if config.get("show_logos", True):
+        if missing:
+            items.append(setup_checklist_item(True, "Logo fallback active", "{} missing logo(s) will use text fallback.".format(missing)))
+        else:
+            items.append(setup_checklist_item(True, "Logo status checked", "All saved symbol logos found."))
+    else:
+        items.append(setup_checklist_item(True, "Text-only logo mode", "Logo display is turned off."))
+
+    return "<p class='small'><b>Setup:</b> {}</p>".format(setup_progress_text()) + "".join(items)
+
+
+def system_health_state():
+    if not wifi.radio.connected:
+        return "ERROR", "WiFi Offline", "badbadge"
+    if not api_ready_for_quotes():
+        return "SETUP", "Setup Needed", "warnbadge"
+    if is_demo_mode():
+        return "DEMO", "Demo Mode", "warnbadge"
+    if bool_from_form(config.get("panel_sleep", False)):
+        return "SLEEP", "Display Sleeping", "infobadge"
+
+    stale_count = 0
+    for sym in SYMBOLS:
+        if sym in last_good and quote_is_stale(last_good[sym]):
+            stale_count += 1
+
+    if stale_count:
+        return "WARNING", "Stale Quotes", "warnbadge"
+    if str(config.get("admin_pin", "1234")) == "1234":
+        return "WARNING", "Default PIN", "warnbadge"
+    if not file_exists(BACKUP_APP_PATH):
+        return "WARNING", "No Backup", "warnbadge"
+    return "OK", "System OK", "goodbadge"
+
+
+def build_system_health_badge_html():
+    code, label_text, class_name = system_health_state()
+    return "<span class='badge {}'>{}</span>".format(class_name, safe_html(label_text))
+
+
+def last_error_panel_html():
+    msg = str(last_error_message)
+    if not msg or msg.lower() in ("none", "none yet.", "none yet"):
+        return "<div class='quiet-ok'>No active error message.</div>"
+    return (
+        "<div class='errorbox'><b>Last Error:</b> {}"
+        "<form method='POST' action='/clear-last-error'>"
+        "<button class='smallbtn' type='submit'>Clear Error</button>"
+        "</form></div>"
+    ).format(safe_html(msg))
+
+
+def quote_status_short():
+    if is_demo_mode():
+        return "Demo Data"
+    if not get_finnhub_api_key():
+        return "API Key Needed"
+
+    stale_count = 0
+    no_data = 0
+    for sym in SYMBOLS:
+        if sym not in last_good:
+            no_data += 1
+        elif quote_is_stale(last_good[sym]):
+            stale_count += 1
+
+    if no_data == len(SYMBOLS):
+        return "Waiting"
+    if stale_count:
+        return "{} Stale".format(stale_count)
+    return "OK"
+
+
+def panel_state_text():
+    if bool_from_form(config.get("panel_sleep", False)):
+        return "Sleeping"
+    return "Awake"
+
+
+def yes_no(value):
+    return "Yes" if value else "No"
+
+
+def setup_blocking_issues():
+    issues = []
+
+    try:
+        if not wifi.radio.connected:
+            issues.append("Connect the device to WiFi.")
+    except Exception:
+        issues.append("Connect the device to WiFi.")
+
+    if not is_demo_mode() and not get_saved_customer_api_key():
+        issues.append("Save a Finnhub API key or turn on Demo Mode.")
+
+    if len(SYMBOLS) <= 0:
+        issues.append("Add at least one stock symbol.")
+
+    return issues
+
+
+def setup_recommendations():
+    items = []
+
+    if str(config.get("admin_pin", "1234")) == "1234":
+        items.append("Change the default admin PIN before selling or gifting this device.")
+
+    if not file_exists(BACKUP_APP_PATH):
+        items.append("Create an OTA backup by installing one known-good update before final use.")
+
+    return items
+
+
+def build_onboarding_message_html():
+    blocking = setup_blocking_issues()
+
+    if blocking:
+        lis = ""
+        for item in blocking:
+            lis += "<li>{}</li>".format(safe_html(item))
+        return (
+            "<div class='onboard warn'><b>Setup Needed</b>"
+            "<div class='small'>Finish these items before using live stock quotes:</div>"
+            "<ul>{}</ul>"
+            "<form method='GET' action='/setup-wizard'><button type='submit'>Open Setup Wizard</button></form>"
+            "</div>"
+        ).format(lis)
+
+    recs = setup_recommendations()
+
+    if recs:
+        lis = ""
+        for item in recs[:2]:
+            lis += "<li>{}</li>".format(safe_html(item))
+        return (
+            "<div class='onboard'><b>Recommended Before Final Use</b>"
+            "<ul>{}</ul>"
+            "</div>"
+        ).format(lis)
+
+    return ""
+
+
+def safe_config_export_dict():
+    export_config = {}
+
+    keys = []
+    for key in DEFAULT_CONFIG:
+        keys.append(key)
+
+    for key in config:
+        if key not in keys:
+            keys.append(key)
+
+    for key in keys:
+        if key not in config:
+            continue
+
+        if key == "finnhub_api_key":
+            if get_saved_customer_api_key():
+                export_config[key] = "__SAVED_KEY_HIDDEN__"
+            else:
+                export_config[key] = ""
+        else:
+            export_config[key] = config[key]
+
+    return {
+        "backup_type": "StockTicker safe config backup",
+        "app_version": APP_VERSION,
+        "device_id": DEVICE_ID,
+        "ip": ip,
+        "api_key_saved": bool(get_saved_customer_api_key()),
+        "wifi_password_included": False,
+        "symbols": SYMBOLS,
+        "config": export_config
+    }
+
+
+def build_safe_config_backup_text():
+    try:
+        return json.dumps(safe_config_export_dict())
+    except Exception as e:
+        return "Config export failed: " + repr(e)
+
+
+def build_symbols_backup_text():
+    if not SYMBOLS:
+        return "No symbols saved."
+
+    return "\n".join(SYMBOLS) + "\n"
+
+
+def build_support_report_text():
+    found, missing = count_missing_logos()
+    lines = []
+
+    lines.append("StockTicker Support Report")
+    lines.append("==========================")
+    lines.append("Device Name: " + str(config.get("device_name", "StockTicker")))
+    lines.append("Device ID: " + str(DEVICE_ID))
+    lines.append("App Version: " + str(APP_VERSION))
+    lines.append("IP Address: " + str(ip))
+    lines.append("System Health: " + system_health_state()[1])
+    lines.append("Panel Display: " + panel_state_text())
+    lines.append("Market Status: " + get_market_status(eastern_time_now()))
+    lines.append("Quote Status: " + quote_status_short())
+    lines.append("WiFi Connected: " + yes_no(wifi.radio.connected))
+    lines.append("Time Sync OK: " + yes_no(time_sync_ok))
+    lines.append("Demo Mode: " + yes_no(is_demo_mode()))
+    lines.append("Customer API Key Required: " + yes_no(customer_api_required()))
+    lines.append("API Key Saved: " + yes_no(bool(get_saved_customer_api_key())))
+    lines.append("Admin PIN Changed: " + yes_no(str(config.get("admin_pin", "1234")) != "1234"))
+    lines.append("Update Channel: " + str(config.get("update_channel", "stable")))
+    lines.append("Manifest URL: " + str(config.get("update_manifest_url", "")))
+    lines.append("Backup App Found: " + yes_no(file_exists(BACKUP_APP_PATH)))
+    lines.append("Auto-Recovery Launcher: " + launcher_status_text())
+    lines.append("Logos: {} found / {} text fallback".format(found, missing))
+    lines.append("Brightness: " + str(config.get("brightness", "")))
+    lines.append("Scroll Speed Open: " + str(config.get("scroll_speed_open", "")))
+    lines.append("Scroll Speed Closed: " + str(config.get("scroll_speed_closed", "")))
+    lines.append("Scroll Delay: " + str(config.get("scroll_delay", "")))
+    lines.append("Block Gap: " + str(config.get("block_gap", "")))
+    lines.append("Last Error: " + str(last_error_message))
+    lines.append("")
+    lines.append("Symbols")
+    lines.append("-------")
+    for sym in SYMBOLS:
+        lines.append(sym + " - Logo: " + logo_status_for_symbol(sym))
+    lines.append("")
+    lines.append("Setup Progress")
+    lines.append("--------------")
+    for ok, label in setup_completion_counts():
+        lines.append(("OK - " if ok else "ACTION - ") + label)
+    lines.append("")
+    lines.append("Event Log")
+    lines.append("---------")
+    if event_log:
+        for item in event_log:
+            lines.append(str(item))
+    else:
+        lines.append("No events yet.")
+
+    return "\n".join(lines)
+
+
+def export_page(title, body):
+    return """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>{}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+.wrap {{ max-width:920px; margin:0 auto; }}
+.card {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }}
+pre {{ white-space:pre-wrap; word-break:break-word; background:#07111f; border:1px solid #243657; border-radius:12px; padding:12px; }}
+a {{ color:#79c7ff; }}
+.small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="card"><h1>{}</h1><p class="small">This page is safe to screenshot or copy. API keys and WiFi passwords are not shown.</p><pre>{}</pre><p><a href="/">Back to Dashboard</a></p></div>
+</div>
+</body>
+</html>
+""".format(safe_html(title), safe_html(title), safe_html(body))
+
+
+def demo_quote(sym):
+    now_text = format_12h(eastern_time_now())
+    now_mono = time.monotonic()
+    seed = 0
+    for ch in str(sym):
+        seed += ord(ch)
+
+    base = 10 + (seed % 90)
+    wiggle = int(time.monotonic() / 15) % 10
+    price = base + (wiggle / 10.0)
+    pct = ((seed % 11) - 5) / 2.0
+    dollar_change = price * pct / 100.0
+    sign = "+" if dollar_change >= 0 else "-"
+    color = 0x00FF00 if dollar_change >= 0 else 0xFF0000
+    change_parts = []
+
+    if config.get("show_dollar_change", True):
+        change_parts.append("{}${:.2f}".format(sign, abs(dollar_change)))
+    if config.get("show_percent_change", True):
+        change_parts.append("({:+.2f}% DEMO)".format(pct))
+    if not change_parts:
+        change_parts.append("DEMO")
+
+    return {
+        "symbol": sym,
+        "price_line": "${} ${:.2f}".format(sym, price),
+        "change_line": " ".join(change_parts),
+        "color": color,
+        "pct": pct,
+        "updated_text": now_text,
+        "updated_mono": now_mono,
+        "stale": False,
+        "used_cached": False,
+        "error_reason": "demo mode"
+    }
+
+
+def help_page():
+    return """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>StockTicker Help</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
+.wrap { max-width:820px; margin:0 auto; }
+.card { background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }
+a { color:#79c7ff; }
+.small { color:#a9bddb; font-size:13px; line-height:1.5; }
+h1 { margin-top:0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="card"><h1>StockTicker Help</h1><p class="small">Quick customer guide.</p></div>
+<div class="card"><h2>First-time setup</h2><p>Connect to the setup WiFi, enter home WiFi, stock symbols, Finnhub API key, and admin PIN. After saving, the device restarts and joins the home network.</p></div>
+<div class="card"><h2>Adding stocks</h2><p>Use the Tickers section. Enter one symbol per line, such as SOFI, RKLB, HIMS, SPY, or AAPL.</p></div>
+<div class="card"><h2>API key</h2><p>Stock quotes require a Finnhub API key unless Demo Mode is enabled. The saved key is hidden for security.</p></div>
+<div class="card"><h2>Demo Mode</h2><p>Demo Mode shows sample prices for display/testing. It is not real market data and should be turned off for normal use.</p></div>
+<div class="card"><h2>Colors and labels</h2><p>Green means up, red means down, purple can indicate pre-market/after-hours. OLD means cached or stale data.</p></div>
+<div class="card"><h2>Software updates</h2><p>Read Release Notes, then use Check for Update and Install Update. Rollback restores the previous app if an update has problems.</p></div>
+<div class="card"><h2>Sleep Display</h2><p>Sleep Display blanks the LED panels without unplugging the device. The dashboard, WiFi, OTA, and settings continue to work.</p></div>
+<div class="card"><h2>Logos</h2><p>BMP logos go in /logos/SYMBOL.bmp. Missing logos are harmless; the ticker automatically uses a clean text fallback.</p></div>
+<p><a href="/">Back to Dashboard</a></p>
+</div>
+</body>
+</html>
+"""
+
+
+def setup_wizard_page(message=""):
+    return """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>StockTicker Setup Wizard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+.wrap {{ max-width:760px; margin:0 auto; }}
+.card {{ background:#101b2e; border:1px solid #243657; padding:16px; border-radius:18px; margin-bottom:14px; }}
+textarea, input, select {{ width:100%; box-sizing:border-box; margin:6px 0 12px; padding:10px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
+button {{ padding:12px 16px; border:0; border-radius:10px; background:#22aa66; color:white; font-weight:bold; }}
+.small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
+a {{ color:#79c7ff; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="card">
+<h1>StockTicker Setup Wizard</h1>
+<p class="small">Use this page for first-time customer setup or to reconfigure the device.</p>
+<p>{message}</p>
+<form method="POST" action="/save-customer-setup">
+<label>Device Name</label>
+<input name="device_name" value="{device_name}">
+<label>Stock Symbols</label>
+<textarea name="symbols" rows="6">{symbols}</textarea>
+<label>Finnhub API Key</label>
+<input name="finnhub_api_key" type="password" value="" placeholder="{api_key_placeholder}">
+<p class="small">API Key Status: {api_key_status}</p>
+<p class="small">For security, the saved API key is hidden. Leave this blank to keep the saved key. Paste a new key only when changing it.</p>
+<label>Require Customer API Key</label>
+<select name="require_customer_api_key">
+<option value="true" {require_key_true_selected}>True - customer must enter their own key</option>
+<option value="false" {require_key_false_selected}>False - allow secrets.py fallback</option>
+</select>
+<label>Demo Mode</label>
+<select name="demo_mode">
+<option value="false" {demo_false_selected}>False - use live market data</option>
+<option value="true" {demo_true_selected}>True - show sample demo prices</option>
+</select>
+<p class="small">Demo Mode is useful for product demos before an API key is entered. It is clearly marked as demo data.</p>
+<label>New Admin PIN</label>
+<input name="admin_pin" type="password" value="" placeholder="Leave blank to keep current PIN">
+<p class="small">For sold units, change the default 1234 PIN. The saved PIN is hidden.</p>
+<label>Brightness 0.00-1.00</label>
+<input name="brightness" value="{brightness}">
+<label>Update Channel</label>
+<select name="update_channel">
+<option value="stable" {stable_selected}>Stable</option>
+<option value="beta" {beta_selected}>Beta</option>
+</select>
+<label>Show Logos</label>
+<select name="show_logos">
+<option value="true" {logos_true_selected}>True</option>
+<option value="false" {logos_false_selected}>False</option>
+</select>
+<button type="submit">Save Setup</button>
+</form>
+<p><a href="/">Back to Dashboard</a></p>
+</div>
+</div>
+</body>
+</html>
+""".format(
+        message=message,
+        device_name=safe_html(config.get("device_name", "StockTicker")),
+        symbols=safe_html("\n".join(SYMBOLS)),
+        api_key_placeholder="Saved key hidden. Leave blank to keep it." if get_saved_customer_api_key() else "Paste customer Finnhub API key here",
+        api_key_status=safe_html(get_api_key_status()),
+        require_key_true_selected=selected("true", str(config.get("require_customer_api_key", True)).lower()),
+        require_key_false_selected=selected("false", str(config.get("require_customer_api_key", True)).lower()),
+        demo_true_selected=selected("true", str(config.get("demo_mode", False)).lower()),
+        demo_false_selected=selected("false", str(config.get("demo_mode", False)).lower()),
+        admin_pin=safe_html(config.get("admin_pin", "1234")),
+        brightness=safe_html(config.get("brightness", DEFAULT_CONFIG["brightness"])),
+        stable_selected=selected("stable", config.get("update_channel", "stable")),
+        beta_selected=selected("beta", config.get("update_channel", "stable")),
+        logos_true_selected=selected("true", str(config.get("show_logos", True)).lower()),
+        logos_false_selected=selected("false", str(config.get("show_logos", True)).lower())
+    )
+
 
 def set_web_message(message):
     global last_web_message
     last_web_message = message
+    add_event(message)
     print("WEB STATUS:", message)
 
 
 def set_error_message(message):
     global last_error_message
-    last_error_message = message
+    friendly = friendly_error_text(message)
+    last_error_message = friendly
+    add_event("ERROR: " + str(friendly))
     print("WEB ERROR:", message)
+
+
+add_event("Booted " + APP_VERSION)
+mark_app_boot_success()
 
 
 def start_setup_mode(reason):
     print("SETUP MODE:", reason)
 
-    setup_ssid = "StockTicker-Setup"
+    setup_suffix = str(DEVICE_ID).replace("ST-", "")[-6:]
+    setup_ssid = "StockTicker-" + setup_suffix
     setup_password = "12345678"
 
     wifi.radio.start_ap(setup_ssid, setup_password)
@@ -323,24 +1221,54 @@ def start_setup_mode(reason):
 <!DOCTYPE html>
 <html>
 <head>
-<title>StockTicker Setup</title>
+<title>StockTicker First-Time Setup</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body {{ background:#101018; color:white; font-family:Arial; padding:20px; }}
-input {{ width:100%; box-sizing:border-box; padding:10px; margin:8px 0 14px; }}
-button {{ padding:12px; }}
+body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
+.card {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; }}
+textarea, input, select {{ width:100%; box-sizing:border-box; padding:10px; margin:8px 0 14px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
+button {{ padding:12px 16px; border:0; border-radius:10px; background:#22aa66; color:white; font-weight:bold; }}
+.small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
 </style>
 </head>
 <body>
-<h1>StockTicker Setup</h1>
-<p>Enter your home WiFi information.</p>
+<div class="card">
+<h1>StockTicker First-Time Setup</h1>
+<p class="small">Connect this device to WiFi and enter customer basics. This setup WiFi uses the device ID so customers can identify the correct unit. You can edit these later from the dashboard.</p>
 <form method="POST" action="/save-wifi">
-<label>WiFi Name</label>
+<label>Home WiFi Name</label>
 <input name="ssid">
-<label>Password</label>
+<label>Home WiFi Password</label>
 <input name="password" type="password">
-<button type="submit">Save WiFi</button>
+<label>Stock Symbols</label>
+<textarea name="symbols" rows="6">SOFI
+RKLB
+ONDS
+HIMS
+PLTR
+AMZN
+SPY</textarea>
+<label>Finnhub API Key</label>
+<input name="finnhub_api_key" type="password" placeholder="Customer API key">
+<p class="small">Required for live stock quotes. The key is saved on this device and hidden after setup.</p>
+<label>Demo Mode</label>
+<select name="demo_mode">
+<option value="false">False - use live market data</option>
+<option value="true">True - show sample demo prices</option>
+</select>
+<p class="small">Use Demo Mode only for testing or showing the display before entering an API key.</p>
+<label>Admin PIN</label>
+<input name="admin_pin" value="1234">
+<label>Brightness 0.00-1.00</label>
+<input name="brightness" value="0.30">
+<label>Update Channel</label>
+<select name="update_channel">
+<option value="stable">Stable</option>
+<option value="beta">Beta</option>
+</select>
+<button type="submit">Save Setup and Restart</button>
 </form>
+</div>
 </body>
 </html>
 """
@@ -359,9 +1287,33 @@ button {{ padding:12px; }}
             "password": password
         })
 
+        setup_cfg = load_config()
+        setup_cfg["finnhub_api_key"] = url_decode(str(form.get("finnhub_api_key", setup_cfg.get("finnhub_api_key", "")))).strip()
+        setup_cfg["require_customer_api_key"] = True
+        setup_cfg["demo_mode"] = bool_from_form(form.get("demo_mode", setup_cfg.get("demo_mode", False)))
+        setup_cfg["admin_pin"] = url_decode(str(form.get("admin_pin", setup_cfg.get("admin_pin", "1234")))).strip() or "1234"
+        setup_cfg["brightness"] = clamp_float(form.get("brightness", setup_cfg.get("brightness", 0.30)), 0.0, 1.0, 0.30)
+
+        channel = url_decode(str(form.get("update_channel", setup_cfg.get("update_channel", "stable")))).strip().lower()
+        setup_cfg["update_channel"] = channel if channel in ("stable", "beta") else "stable"
+
+        save_config(setup_cfg)
+
+        raw_symbols = url_decode(str(form.get("symbols", "")))
+        new_symbols = []
+        seen = set()
+        for line in raw_symbols.replace(",", "\n").replace("\r", "\n").split("\n"):
+            sym = clean_symbol(line)
+            if sym and sym not in seen:
+                new_symbols.append(sym)
+                seen.add(sym)
+
+        if new_symbols:
+            save_symbol_list(new_symbols)
+
         return Response(
             request,
-            "<html><body><h1>WiFi Saved</h1><p>Restarting...</p></body></html>",
+            "<html><body><h1>Setup Saved</h1><p>Restarting and connecting to WiFi...</p></body></html>",
             content_type="text/html"
         )
 
@@ -399,7 +1351,15 @@ def get_wifi_credentials():
     if wifi_cfg.get("ssid"):
         return wifi_cfg["ssid"], wifi_cfg.get("password", "")
 
-    return secrets["ssid"], secrets["password"]
+    try:
+        ssid = str(secrets.get("ssid", "")).strip()
+        password = str(secrets.get("password", ""))
+        if ssid:
+            return ssid, password
+    except Exception:
+        pass
+
+    start_setup_mode("WiFi is not configured.")
 
 
 print("Connecting to Wi-Fi...")
@@ -551,50 +1511,202 @@ HTML = """\
 <!DOCTYPE html>
 <html>
 <head>
-<title>Stock Panel</title>
+<title>StockTicker Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body {{ background:#101018; color:white; font-family:Arial; padding:20px; }}
-.card {{ background:#1b1b2a; padding:16px; border-radius:12px; margin-bottom:16px; }}
-textarea, input, select {{ width:100%; box-sizing:border-box; margin:8px 0 14px; padding:10px; border-radius:8px; border:1px solid #333; background:#080812; color:white; }}
-button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; color:white; font-weight:bold; margin-top:6px; }}
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+.wrap {{ max-width:980px; margin:0 auto; }}
+.hero {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }}
+.card {{ background:#101b2e; border:1px solid #243657; padding:16px; border-radius:18px; margin-bottom:14px; }}
+.stat {{ background:#07111f; border:1px solid #243657; border-radius:12px; padding:10px; margin:6px 0; }}
+.stat b {{ color:#a9bddb; font-size:13px; }}
+label {{ color:#a9bddb; font-size:13px; font-weight:bold; }}
+textarea, input, select {{ width:100%; box-sizing:border-box; margin:6px 0 12px; padding:10px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
+button {{ padding:10px 14px; border:0; border-radius:10px; background:#1f8cff; color:white; font-weight:bold; margin-top:6px; cursor:pointer; }}
 .red {{ background:#cc3333; }}
 .green {{ background:#22aa66; }}
-.small {{ color:#bbbbbb; font-size:13px; }}
+.orange {{ background:#d97706; }}
+.small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
 .good {{ color:#55ff88; }}
 .bad {{ color:#ff7777; }}
+.warning {{ color:#ffd166; }}
+.topline {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap; }}
+.badge {{ display:inline-block; padding:8px 12px; border-radius:999px; font-weight:bold; font-size:13px; }}
+.goodbadge {{ background:#123820; color:#74ff9e; border:1px solid #226d3d; }}
+.warnbadge {{ background:#3a2c10; color:#ffd166; border:1px solid #7a5b17; }}
+.badbadge {{ background:#3a1515; color:#ff8b8b; border:1px solid #733333; }}
+.infobadge {{ background:#102c3a; color:#8edbff; border:1px solid #2a6683; }}
+.onboard {{ background:#162640; border:1px solid #315888; border-radius:14px; padding:12px; margin:12px 0 0; }}
+.onboard.warn {{ background:#33280f; border-color:#7a5b17; }}
+.onboard b {{ display:block; margin-bottom:4px; }}
+.onboard ul {{ margin:6px 0 10px 20px; padding:0; }}
+.errorbox {{ background:#2b171b; border:1px solid #803d46; border-radius:12px; padding:10px; margin-top:10px; color:#ffd9df; }}
+.quiet-ok {{ background:#102a1c; border:1px solid #226d3d; border-radius:12px; padding:10px; margin-top:10px; color:#92ffad; }}
+.smallbtn {{ padding:6px 9px; font-size:12px; margin-top:8px; }}
+.check {{ border:1px solid #273955; border-radius:10px; padding:8px; margin:7px 0; }}
+.check.ok {{ background:#102316; color:#91ffaa; }}
+.check.todo {{ background:#2c2312; color:#ffd166; }}
+.check span {{ color:#d5c8a7; font-size:12px; }}
+h1 {{ margin:0 0 6px; }}
+h2 {{ margin-top:0; }}
+summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
+.button-row {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+.button-row form {{ margin:0; }}
+.slim {{ margin-bottom:10px; }}
 </style>
 </head>
 <body>
-<h1>Stock Ticker Control Panel </h1>
-<p>Version: {version}</p>
-<p>Device ID: {device_id}</p>
-<p>IP: {ip}</p>
-<p>Last Quote Update: {last_update}</p>
+<div class="wrap">
+<div class="hero">
+<div class="topline">
+<div>
+<h1>{device_name}</h1>
+<p class="small">Professional LED market display · {device_id}</p>
+</div>
+<div>{system_health_badge}</div>
+</div>
+<div class="grid">
+<div class="stat"><b>Version</b><br>{version}</div>
+<div class="stat"><b>Market</b><br>{market_status}</div>
+<div class="stat"><b>Quotes</b><br>{quote_status_short}</div>
+<div class="stat"><b>Panel</b><br>{panel_state}</div>
+<div class="stat"><b>Setup</b><br>{setup_progress}</div>
+<div class="stat"><b>IP</b><br>{ip}</div>
+</div>
 <p class="good">Status: {last_web_message}</p>
-<p class="bad">Last Error: {last_error_message}</p>
+{last_error_panel}
+{onboarding_message}
+</div>
+
+<div class="grid">
+<div class="card">
+<h2>Customer Setup</h2>
+<p class="small">Use this for normal customer setup: device name, symbols, API key, demo mode, PIN, brightness, update channel, and logos.</p>
+<div class="button-row">
+<form method="GET" action="/setup-wizard"><button type="submit">Open Setup Wizard</button></form>
+<form method="GET" action="/help"><button type="submit">Help / Quick Guide</button></form>
+</div>
+<p class="small">API Key Status: {api_key_status}</p>
+<details class="slim"><summary>Setup Checklist</summary>{setup_checklist_message}</details>
+</div>
 
 <div class="card">
+<h2>Quick Controls</h2>
+<p class="small"><b>Panel Display:</b> {panel_state}</p>
+<div class="button-row">
+<form method="POST" action="/panel-sleep"><button class="orange" type="submit">Sleep Display</button></form>
+<form method="POST" action="/panel-wake"><button class="green" type="submit">Wake Display</button></form>
+</div>
+<div class="button-row">
+<form method="POST" action="/refresh-now"><button type="submit">Refresh Quotes</button></form>
+<form method="POST" action="/restart"><button class="red" type="submit">Restart Device</button></form>
+</div>
+<p class="small">Sleep turns the LED panels black but keeps WiFi, dashboard, settings, and updates running.</p>
+</div>
+</div>
+
+<details class="card">
+<summary>Display & Ticker Settings</summary>
+<p class="small">Common customer-facing controls. Changes save to the device and update the board after the current scroll cycle.</p>
+<div class="grid">
+<div>
+<h2>Tickers</h2>
+<form method="POST" action="/save-symbols">
+<textarea name="symbols" rows="8">{symbols}</textarea>
+<button class="green" type="submit">Save Symbols</button>
+</form>
+</div>
+<div>
+<h2>Display</h2>
+<form method="POST" action="/save-config">
+<label>Brightness 0.00-1.00</label>
+<input name="brightness" value="{brightness}">
+<label>Scroll Speed When Market Open</label>
+<input name="scroll_speed_open" value="{scroll_speed_open}">
+<label>Scroll Speed When Market Closed</label>
+<input name="scroll_speed_closed" value="{scroll_speed_closed}">
+<label>Scroll Smoothness Delay</label>
+<input name="scroll_delay" value="{scroll_delay}">
+<label>Space Between Ticker Blocks</label>
+<input name="block_gap" value="{block_gap}">
+<label>Show Logos</label>
+<select name="show_logos">
+<option value="true" {logos_true_selected}>True</option>
+<option value="false" {logos_false_selected}>False</option>
+</select>
+<label>Show Dollar Change</label>
+<select name="show_dollar_change">
+<option value="true" {dollar_true_selected}>True</option>
+<option value="false" {dollar_false_selected}>False</option>
+</select>
+<label>Show Percent Change</label>
+<select name="show_percent_change">
+<option value="true" {percent_true_selected}>True</option>
+<option value="false" {percent_false_selected}>False</option>
+</select>
+<button class="green" type="submit">Save Display Settings</button>
+</form>
+</div>
+<div>
+<h2>Night / Demo</h2>
+<form method="POST" action="/save-config">
+<label>Night Mode Enabled</label>
+<select name="night_mode_enabled">
+<option value="true" {night_true_selected}>True</option>
+<option value="false" {night_false_selected}>False</option>
+</select>
+<label>Night Brightness</label>
+<input name="night_brightness" value="{night_brightness}">
+<label>Night Start Hour ET</label>
+<input name="night_start_hour" value="{night_start_hour}">
+<label>Night End Hour ET</label>
+<input name="night_end_hour" value="{night_end_hour}">
+<label>Demo Mode</label>
+<select name="demo_mode">
+<option value="false" {demo_false_selected}>False</option>
+<option value="true" {demo_true_selected}>True</option>
+</select>
+<p class="small">Demo Mode uses sample prices and clearly marks them as demo data.</p>
+<button class="green" type="submit">Save Night / Demo Settings</button>
+</form>
+</div>
+</div>
+</details>
+
+<details class="card">
+<summary>Status Details</summary>
+<div class="grid">
+<div class="card">
+<h2>Price Alerts</h2>
+<p>{alert_message}</p>
+<form method="POST" action="/clear-alerts"><button class="orange" type="submit">Clear Alert Message</button></form>
+</div>
+<div class="card">
+<h2>Quote Freshness</h2>
+<p>{quote_freshness_message}</p>
+<p class="small">STALE means the panel is using cached or older data.</p>
+</div>
+<div class="card">
+<h2>Logo Status</h2>
+<p>{logo_status_message}</p>
+<p class="small">Missing logos are harmless; the ticker uses text fallback.</p>
+</div>
+</div>
+</details>
+
+<details class="card">
+<summary>Diagnostics & Maintenance</summary>
+<div class="grid">
+<div class="card">
 <h2>Test Quote</h2>
-<p class="small">Check if a ticker works before saving it.</p>
 <form method="POST" action="/test-quote">
 <input name="test_symbol" placeholder="Example: ARM">
 <button type="submit">Test Quote</button>
 </form>
 <p>{test_quote_message}</p>
-<form method="POST" action="/validate-symbols">
-<button class="green" type="submit">Validate All Saved Symbols</button>
-</form>
+<form method="POST" action="/validate-symbols"><button class="green" type="submit">Validate All Saved Symbols</button></form>
 </div>
-
-<div class="card">
-<h2>Tickers</h2>
-<form method="POST" action="/save-symbols">
-<textarea name="symbols">{symbols}</textarea>
-<button class="green" type="submit">Save Symbols</button>
-</form>
-</div>
-
 <div class="card">
 <h2>Watchlist Presets</h2>
 <form method="POST" action="/apply-watchlist">
@@ -606,77 +1718,106 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <button type="submit">Apply Watchlist</button>
 </form>
 </div>
-
-<div class="card">
-<h2>Settings</h2>
-<form method="POST" action="/save-config">
-<label>Brightness</label>
-<input name="brightness" value="{brightness}">
-<label>Alert Percent Move</label>
-<input name="alert_percent_move" value="{alert_percent_move}">
-<label>Open Refresh Seconds</label>
-<input name="fetch_interval_open" value="{fetch_interval_open}">
-<label>Scroll Speed Open</label>
-<input name="scroll_speed_open" value="{scroll_speed_open}">
-<label>Scroll Speed Closed</label>
-<input name="scroll_speed_closed" value="{scroll_speed_closed}">
-<label>Block Gap</label>
-<input name="block_gap" value="{block_gap}">
-<label>Night Mode Enabled</label>
-<select name="night_mode_enabled">
-<option value="true">True</option>
-<option value="false">False</option>
-</select>
-<label>Night Brightness</label>
-<input name="night_brightness" value="{night_brightness}">
-<label>Night Start Hour ET</label>
-<input name="night_start_hour" value="{night_start_hour}">
-<label>Night End Hour ET</label>
-<input name="night_end_hour" value="{night_end_hour}">
-<label>Update Channel</label>
-<select name="update_channel">
-<option value="stable">Stable</option>
-<option value="beta">Beta</option>
-</select>
-<label>Manifest URL</label>
-<input name="update_manifest_url" value="{update_manifest_url}">
-<button class="green" type="submit">Save Config</button>
-</form>
-</div>
-
-<div class="card">
-<h2>Market Holidays</h2>
-<p class="small">One date per line. Format: YYYY-MM-DD</p>
-<form method="POST" action="/save-holidays">
-<label>Full Market Closures</label>
-<textarea name="closed">{closed_dates}</textarea>
-<label>Early Close Days</label>
-<textarea name="early_close">{early_close_dates}</textarea>
-<button class="green" type="submit">Save Holidays</button>
-</form>
-</div>
-
-<div class="card">
-<h2>Refresh Quotes</h2>
-<form method="POST" action="/refresh-now">
-<button type="submit">Refresh Quotes Now</button>
-</form>
-</div>
-
 <div class="card">
 <h2>Cloud Status</h2>
 <p>{cloud_status_message}</p>
-<form method="POST" action="/check-cloud-status">
-<button type="submit">Check Cloud Status</button>
-</form>
+<form method="POST" action="/check-cloud-status"><button type="submit">Check Cloud Status</button></form>
 </div>
+<div class="card">
+<h2>Memory / Disk Health</h2>
+<p>{system_health_message}</p>
+<form method="POST" action="/check-system-health"><button type="submit">Check System Health</button></form>
+</div>
+<div class="card">
+<h2>Backup / Export</h2>
+<p class="small">Safe exports hide API keys and WiFi passwords. Use these for troubleshooting or saving a copy of the setup.</p>
+<form method="GET" action="/support-report"><button type="submit">View Support Report</button></form>
+<form method="GET" action="/config-backup"><button type="submit">View Config Backup</button></form>
+<form method="GET" action="/symbols-backup"><button type="submit">View Symbols Backup</button></form>
+</div>
+<div class="card">
+<h2>OTA Status</h2>
+<p>{ota_status_message}</p>
+<form method="POST" action="/check-ota-status"><button type="submit">Check OTA Status</button></form>
+</div>
+<div class="card">
+<h2>Event Log</h2>
+<p>{event_log_message}</p>
+<form method="POST" action="/clear-event-log"><button class="orange" type="submit">Clear Event Log</button></form>
+</div>
+</div>
+</details>
 
+<details class="card">
+<summary>Advanced Admin Settings</summary>
+<p class="small">These are owner/admin controls. Most end users should not need this section.</p>
+<form method="POST" action="/save-config">
+<div class="grid">
+<div>
+<label>Open Refresh Seconds</label>
+<input name="fetch_interval_open" value="{fetch_interval_open}">
+<label>Pre/After Refresh Seconds</label>
+<input name="fetch_interval_pre_after" value="{fetch_interval_pre_after}">
+<label>Closed Refresh Seconds</label>
+<input name="fetch_interval_closed" value="{fetch_interval_closed}">
+<label>Smooth Quote Refresh</label>
+<select name="smooth_quote_refresh">
+<option value="true" {smooth_true_selected}>True</option>
+<option value="false" {smooth_false_selected}>False</option>
+</select>
+<label>After-Hours Color</label>
+<select name="after_hours_color">
+<option value="purple" {after_purple_selected}>Purple</option>
+<option value="normal" {after_normal_selected}>Normal red/green</option>
+</select>
+</div>
+<div>
+<label>Price Alerts Enabled</label>
+<select name="alert_enabled">
+<option value="true" {alert_true_selected}>True</option>
+<option value="false" {alert_false_selected}>False</option>
+</select>
+<label>Alert Percent Move</label>
+<input name="alert_percent_move" value="{alert_percent_move}">
+<label>Stale Quote Minutes</label>
+<input name="stale_quote_minutes" value="{stale_quote_minutes}">
+<label>Show Stale Marker</label>
+<select name="show_stale_marker">
+<option value="true" {stale_true_selected}>True</option>
+<option value="false" {stale_false_selected}>False</option>
+</select>
+</div>
+<div>
+<label>Customer API Key Required</label>
+<select name="require_customer_api_key">
+<option value="true" {require_key_true_selected}>True</option>
+<option value="false" {require_key_false_selected}>False / allow secrets.py fallback</option>
+</select>
+<label>Update Channel</label>
+<select name="update_channel">
+<option value="stable" {stable_selected}>Stable</option>
+<option value="beta" {beta_selected}>Beta</option>
+</select>
+<label>Manifest URL</label>
+<input name="update_manifest_url" value="{update_manifest_url}">
+</div>
+</div>
+<button class="green" type="submit">Save Advanced Settings</button>
+</form>
+</details>
+
+<details class="card">
+<summary>Software Update & Recovery</summary>
+<div class="grid">
+<div class="card">
+<h2>Release Notes</h2>
+<p>{release_notes_message}</p>
+<form method="POST" action="/check-release-notes"><button type="submit">Check Release Notes</button></form>
+</div>
 <div class="card">
 <h2>Software Update</h2>
 <p>{ota_message}</p>
-<form method="POST" action="/check-update">
-<button type="submit">Check for Update</button>
-</form>
+<form method="POST" action="/check-update"><button type="submit">Check for Update</button></form>
 <br>
 <form method="POST" action="/install-update">
 <label>Admin PIN</label>
@@ -689,8 +1830,31 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <input name="admin_pin" type="password" placeholder="Enter PIN">
 <button class="red" type="submit">Rollback to Previous Version</button>
 </form>
+<br>
+<p>{auto_recovery_message}</p>
+<form method="POST" action="/install-auto-recovery" onsubmit="return confirm('Install auto-recovery launcher to code.py?');">
+<label>Admin PIN</label>
+<input name="admin_pin" type="password" placeholder="Enter PIN">
+<button class="orange" type="submit">Install Auto-Recovery Launcher</button>
+</form>
 </div>
+</div>
+</details>
 
+<details class="card">
+<summary>Market Calendar & Factory Reset</summary>
+<div class="grid">
+<div class="card">
+<h2>Market Holidays</h2>
+<p class="small">One date per line. Format: YYYY-MM-DD</p>
+<form method="POST" action="/save-holidays">
+<label>Full Market Closures</label>
+<textarea name="closed" rows="7">{closed_dates}</textarea>
+<label>Early Close Days</label>
+<textarea name="early_close" rows="4">{early_close_dates}</textarea>
+<button class="green" type="submit">Save Holidays</button>
+</form>
+</div>
 <div class="card">
 <h2>Factory Reset</h2>
 <p class="small">Use only for testing setup mode or clearing saved settings.</p>
@@ -706,18 +1870,12 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <button class="red" type="submit">Factory Reset</button>
 </form>
 </div>
-
-<div class="card">
-<h2>Restart</h2>
-<form method="POST" action="/restart">
-<button class="red" type="submit">Restart Device</button>
-</form>
 </div>
-
+</details>
+</div>
 </body>
 </html>
 """
-
 
 def clean_page(title, message):
     return (
@@ -729,22 +1887,132 @@ def clean_page(title, message):
     ).format(title, message)
 
 
+@server.route("/help")
+def help_route(request: Request):
+    return Response(request, help_page(), content_type="text/html")
+
+
+@server.route("/support-report")
+def support_report_route(request: Request):
+    return Response(request, export_page("Support Report", build_support_report_text()), content_type="text/html")
+
+
+@server.route("/config-backup")
+def config_backup_route(request: Request):
+    return Response(request, export_page("Safe Config Backup", build_safe_config_backup_text()), content_type="text/html")
+
+
+@server.route("/symbols-backup")
+def symbols_backup_route(request: Request):
+    return Response(request, export_page("Symbols Backup", build_symbols_backup_text()), content_type="text/html")
+
+
+@server.route("/clear-last-error", methods=["POST"])
+def clear_last_error_route(request: Request):
+    global last_error_message
+    last_error_message = "None"
+    set_web_message("Last error cleared.")
+    return Response(request, clean_page("Error Cleared", "Last error message cleared."), content_type="text/html")
+
+
+@server.route("/setup-wizard")
+def setup_wizard_route(request: Request):
+    return Response(request, setup_wizard_page(), content_type="text/html")
+
+
+@server.route("/save-customer-setup", methods=["POST"])
+def save_customer_setup(request: Request):
+    global SYMBOLS, need_reload, config, BRIGHTNESS_TARGET
+
+    try:
+        form = request.form_data
+
+        config["device_name"] = url_decode(str(form.get("device_name", config.get("device_name", "StockTicker")))).strip() or "StockTicker"
+
+        new_api_key = url_decode(str(form.get("finnhub_api_key", ""))).strip()
+        if new_api_key:
+            config["finnhub_api_key"] = new_api_key
+
+        config["require_customer_api_key"] = bool_from_form(form.get("require_customer_api_key", config.get("require_customer_api_key", True)))
+        config["demo_mode"] = bool_from_form(form.get("demo_mode", config.get("demo_mode", False)))
+
+        new_admin_pin = url_decode(str(form.get("admin_pin", ""))).strip()
+        if new_admin_pin:
+            config["admin_pin"] = new_admin_pin
+
+        config["brightness"] = clamp_float(form.get("brightness", config.get("brightness", 0.30)), 0.0, 1.0, DEFAULT_CONFIG["brightness"])
+        config["show_logos"] = bool_from_form(form.get("show_logos", config.get("show_logos", True)))
+
+        channel = url_decode(str(form.get("update_channel", config.get("update_channel", "stable")))).strip().lower()
+        config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
+
+        raw = url_decode(str(form.get("symbols", "")))
+        new_symbols = []
+        seen = set()
+        for line in raw.replace(",", "\n").replace("\r", "\n").split("\n"):
+            sym = clean_symbol(line)
+            if sym and sym not in seen:
+                new_symbols.append(sym)
+                seen.add(sym)
+
+        if new_symbols:
+            SYMBOLS = new_symbols
+            save_symbol_list(SYMBOLS)
+
+        save_config(config)
+        BRIGHTNESS_TARGET = float(config["brightness"])
+        need_reload = True
+        set_web_message("Customer setup saved.")
+
+        return Response(request, clean_page("Setup Saved", "Customer setup was saved."), content_type="text/html")
+
+    except Exception as e:
+        set_error_message("Customer setup save failed: " + repr(e))
+        return Response(request, clean_page("Setup Failed", last_error_message), content_type="text/html")
+
+
 @server.route("/")
 def index(request: Request):
+    current_market_status = get_market_status(eastern_time_now())
+
     return Response(
         request,
         HTML.format(
             version=APP_VERSION,
+            device_name=safe_html(config.get("device_name", "StockTicker Dashboard")),
             device_id=DEVICE_ID,
             ip=ip,
+            market_status=current_market_status,
+            update_channel=config["update_channel"],
+            system_health_badge=build_system_health_badge_html(),
+            setup_progress=setup_progress_text(),
+            setup_checklist_message=build_setup_checklist_html(),
+            quote_status_short=quote_status_short(),
+            panel_state=panel_state_text(),
+            logo_summary_short=logo_summary_text(),
+            last_error_panel=last_error_panel_html(),
+            onboarding_message=build_onboarding_message_html(),
             symbols="\n".join(SYMBOLS),
             brightness=config["brightness"],
             alert_percent_move=config["alert_percent_move"],
+            stale_quote_minutes=config.get("stale_quote_minutes", 15),
             fetch_interval_open=config["fetch_interval_open"],
+            fetch_interval_pre_after=config["fetch_interval_pre_after"],
+            fetch_interval_closed=config["fetch_interval_closed"],
             scroll_speed_open=config["scroll_speed_open"],
             scroll_speed_closed=config["scroll_speed_closed"],
+            scroll_delay=config["scroll_delay"],
             block_gap=config["block_gap"],
             ota_message=ota_message,
+            ota_status_message=ota_status_message,
+            alert_message=alert_message,
+            quote_freshness_message=build_quote_freshness_html(),
+            system_health_message=build_system_health_html(),
+            event_log_message=build_event_log_html(),
+            logo_status_message=build_logo_status_html(),
+            release_notes_message=release_notes_message,
+            auto_recovery_message=auto_recovery_message,
+            api_key_status=safe_html(get_api_key_status()),
             last_update=last_update_text,
             last_web_message=last_web_message,
             last_error_message=last_error_message,
@@ -754,6 +2022,28 @@ def index(request: Request):
             night_start_hour=config["night_start_hour"],
             night_end_hour=config["night_end_hour"],
             update_manifest_url=config["update_manifest_url"],
+            night_true_selected=selected("true", str(config.get("night_mode_enabled", True)).lower()),
+            night_false_selected=selected("false", str(config.get("night_mode_enabled", True)).lower()),
+            alert_true_selected=selected("true", str(config.get("alert_enabled", True)).lower()),
+            alert_false_selected=selected("false", str(config.get("alert_enabled", True)).lower()),
+            stale_true_selected=selected("true", str(config.get("show_stale_marker", True)).lower()),
+            stale_false_selected=selected("false", str(config.get("show_stale_marker", True)).lower()),
+            smooth_true_selected=selected("true", str(config.get("smooth_quote_refresh", True)).lower()),
+            smooth_false_selected=selected("false", str(config.get("smooth_quote_refresh", True)).lower()),
+            dollar_true_selected=selected("true", str(config.get("show_dollar_change", True)).lower()),
+            dollar_false_selected=selected("false", str(config.get("show_dollar_change", True)).lower()),
+            percent_true_selected=selected("true", str(config.get("show_percent_change", True)).lower()),
+            percent_false_selected=selected("false", str(config.get("show_percent_change", True)).lower()),
+            logos_true_selected=selected("true", str(config.get("show_logos", True)).lower()),
+            logos_false_selected=selected("false", str(config.get("show_logos", True)).lower()),
+            require_key_true_selected=selected("true", str(config.get("require_customer_api_key", True)).lower()),
+            require_key_false_selected=selected("false", str(config.get("require_customer_api_key", True)).lower()),
+            demo_true_selected=selected("true", str(config.get("demo_mode", False)).lower()),
+            demo_false_selected=selected("false", str(config.get("demo_mode", False)).lower()),
+            stable_selected=selected("stable", config.get("update_channel", "stable")),
+            beta_selected=selected("beta", config.get("update_channel", "stable")),
+            after_purple_selected=selected("purple", config.get("after_hours_color", "purple")),
+            after_normal_selected=selected("normal", config.get("after_hours_color", "purple")),
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
         ),
@@ -772,7 +2062,19 @@ def test_quote_route(request: Request):
         return Response(request, clean_page("Test Failed", test_quote_message), content_type="text/html")
 
     try:
-        url = FINNHUB_URL.format(sym, secrets["finnhub_api_key"])
+        if is_demo_mode():
+            e = demo_quote(sym)
+            test_quote_message = "{} demo works: {} {}".format(sym, e.get("price_line", ""), e.get("change_line", ""))
+            set_web_message("Demo quote tested for {}.".format(sym))
+            return Response(request, clean_page("Demo Quote Complete", test_quote_message), content_type="text/html")
+
+        api_key = get_finnhub_api_key()
+        if not api_key:
+            test_quote_message = "Customer API key required. Open Setup Wizard and save a Finnhub API key."
+            set_error_message(test_quote_message)
+            return Response(request, clean_page("Test Failed", friendly_error_text(test_quote_message)), content_type="text/html")
+
+        url = FINNHUB_URL.format(sym, api_key)
         r = requests.get(url)
         data = r.json()
         r.close()
@@ -809,7 +2111,16 @@ def validate_symbols_route(request: Request):
             pass
 
         try:
-            url = FINNHUB_URL.format(sym, secrets["finnhub_api_key"])
+            if is_demo_mode():
+                valid.append("{} DEMO".format(sym))
+                continue
+
+            api_key = get_finnhub_api_key()
+            if not api_key:
+                invalid.append(sym)
+                continue
+
+            url = FINNHUB_URL.format(sym, api_key)
             r = requests.get(url)
             data = r.json()
             r.close()
@@ -895,46 +2206,67 @@ def save_cfg(request: Request):
     global config
     global BRIGHTNESS_TARGET
     global ALERT_PERCENT_MOVE
+    global ALERT_ENABLED
     global FETCH_INTERVAL_OPEN
+    global FETCH_INTERVAL_PRE_AFTER
+    global FETCH_INTERVAL_CLOSED
     global SCROLL_SPEED_OPEN
     global SCROLL_SPEED_CLOSED
     global BLOCK_GAP
+    global SCROLL_DELAY
+    global SMOOTH_QUOTE_REFRESH
     global need_reload
 
     try:
         form = request.form_data
 
-        config["brightness"] = float(url_decode(str(form.get("brightness", config["brightness"]))))
-        config["alert_percent_move"] = float(url_decode(str(form.get("alert_percent_move", config["alert_percent_move"]))))
-        config["fetch_interval_open"] = int(float(url_decode(str(form.get("fetch_interval_open", config["fetch_interval_open"])))))
-        config["scroll_speed_open"] = float(url_decode(str(form.get("scroll_speed_open", config["scroll_speed_open"]))))
-        config["scroll_speed_closed"] = float(url_decode(str(form.get("scroll_speed_closed", config["scroll_speed_closed"]))))
-        config["block_gap"] = int(float(url_decode(str(form.get("block_gap", config["block_gap"])))))
+        config["brightness"] = clamp_float(form.get("brightness", config["brightness"]), 0.0, 1.0, DEFAULT_CONFIG["brightness"])
+        config["night_brightness"] = clamp_float(form.get("night_brightness", config["night_brightness"]), 0.0, 1.0, DEFAULT_CONFIG["night_brightness"])
+        config["alert_percent_move"] = clamp_float(form.get("alert_percent_move", config["alert_percent_move"]), 0.0, 100.0, DEFAULT_CONFIG["alert_percent_move"])
+        config["stale_quote_minutes"] = clamp_int(form.get("stale_quote_minutes", config.get("stale_quote_minutes", 15)), 1, 1440, DEFAULT_CONFIG["stale_quote_minutes"])
+
+        config["fetch_interval_open"] = clamp_int(form.get("fetch_interval_open", config["fetch_interval_open"]), 5, 3600, DEFAULT_CONFIG["fetch_interval_open"])
+        config["fetch_interval_pre_after"] = clamp_int(form.get("fetch_interval_pre_after", config["fetch_interval_pre_after"]), 10, 3600, DEFAULT_CONFIG["fetch_interval_pre_after"])
+        config["fetch_interval_closed"] = clamp_int(form.get("fetch_interval_closed", config["fetch_interval_closed"]), 30, 7200, DEFAULT_CONFIG["fetch_interval_closed"])
+        config["night_start_hour"] = clamp_int(form.get("night_start_hour", config["night_start_hour"]), 0, 23, DEFAULT_CONFIG["night_start_hour"])
+        config["night_end_hour"] = clamp_int(form.get("night_end_hour", config["night_end_hour"]), 0, 23, DEFAULT_CONFIG["night_end_hour"])
+        config["block_gap"] = clamp_int(form.get("block_gap", config["block_gap"]), 0, 120, DEFAULT_CONFIG["block_gap"])
+
+        config["scroll_speed_open"] = clamp_float(form.get("scroll_speed_open", config["scroll_speed_open"]), 0.1, 5.0, DEFAULT_CONFIG["scroll_speed_open"])
+        config["scroll_speed_closed"] = clamp_float(form.get("scroll_speed_closed", config["scroll_speed_closed"]), 0.1, 5.0, DEFAULT_CONFIG["scroll_speed_closed"])
+        config["scroll_delay"] = clamp_float(form.get("scroll_delay", config["scroll_delay"]), 0.005, 0.20, DEFAULT_CONFIG["scroll_delay"])
+
         config["night_mode_enabled"] = bool_from_form(form.get("night_mode_enabled", config["night_mode_enabled"]))
-        config["night_brightness"] = float(url_decode(str(form.get("night_brightness", config["night_brightness"]))))
-        config["night_start_hour"] = int(float(url_decode(str(form.get("night_start_hour", config["night_start_hour"])))))
-        config["night_end_hour"] = int(float(url_decode(str(form.get("night_end_hour", config["night_end_hour"])))))
-        config["update_channel"] = url_decode(str(form.get("update_channel", config["update_channel"])))
+        config["alert_enabled"] = bool_from_form(form.get("alert_enabled", config.get("alert_enabled", True)))
+        config["show_dollar_change"] = bool_from_form(form.get("show_dollar_change", config.get("show_dollar_change", True)))
+        config["show_percent_change"] = bool_from_form(form.get("show_percent_change", config.get("show_percent_change", True)))
+        config["show_logos"] = bool_from_form(form.get("show_logos", config.get("show_logos", True)))
+        config["require_customer_api_key"] = bool_from_form(form.get("require_customer_api_key", config.get("require_customer_api_key", True)))
+        config["demo_mode"] = bool_from_form(form.get("demo_mode", config.get("demo_mode", False)))
+        config["show_stale_marker"] = bool_from_form(form.get("show_stale_marker", config.get("show_stale_marker", True)))
+        config["smooth_quote_refresh"] = bool_from_form(form.get("smooth_quote_refresh", config.get("smooth_quote_refresh", True)))
+
+        channel = url_decode(str(form.get("update_channel", config["update_channel"]))).strip().lower()
+        config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
+
+        after_color = url_decode(str(form.get("after_hours_color", config.get("after_hours_color", "purple")))).strip().lower()
+        config["after_hours_color"] = after_color if after_color in ("purple", "normal") else "purple"
+
         config["update_manifest_url"] = url_decode(str(form.get("update_manifest_url", config["update_manifest_url"]))).strip()
-
-        if config["brightness"] < 0:
-            config["brightness"] = 0
-        if config["brightness"] > 1:
-            config["brightness"] = 1
-
-        if config["night_brightness"] < 0:
-            config["night_brightness"] = 0
-        if config["night_brightness"] > 1:
-            config["night_brightness"] = 1
 
         save_config(config)
 
         BRIGHTNESS_TARGET = float(config["brightness"])
         ALERT_PERCENT_MOVE = float(config["alert_percent_move"])
+        ALERT_ENABLED = bool_from_form(config.get("alert_enabled", True))
         FETCH_INTERVAL_OPEN = int(config["fetch_interval_open"])
+        FETCH_INTERVAL_PRE_AFTER = int(config["fetch_interval_pre_after"])
+        FETCH_INTERVAL_CLOSED = int(config["fetch_interval_closed"])
         SCROLL_SPEED_OPEN = float(config["scroll_speed_open"])
         SCROLL_SPEED_CLOSED = float(config["scroll_speed_closed"])
         BLOCK_GAP = int(config["block_gap"])
+        SCROLL_DELAY = float(config["scroll_delay"])
+        SMOOTH_QUOTE_REFRESH = bool_from_form(config.get("smooth_quote_refresh", True))
 
         need_reload = True
         set_web_message("Settings saved.")
@@ -987,9 +2319,40 @@ def save_holidays_route(request: Request):
 def refresh_now(request: Request):
     global refresh_requested
     refresh_requested = True
-    set_web_message("Manual quote refresh requested.")
+    if SMOOTH_QUOTE_REFRESH:
+        set_web_message("Manual quote refresh queued for smooth update.")
+    else:
+        set_web_message("Manual quote refresh requested.")
 
     return Response(request, clean_page("Refresh Requested", "Quotes will refresh after the current scroll cycle."), content_type="text/html")
+
+
+@server.route("/clear-alerts", methods=["POST"])
+def clear_alerts(request: Request):
+    global alert_message
+    alert_message = "Alert message cleared."
+    set_web_message("Price alert message cleared.")
+
+    return Response(request, clean_page("Alerts Cleared", "Price alert message cleared."), content_type="text/html")
+
+
+@server.route("/check-system-health", methods=["POST"])
+def check_system_health(request: Request):
+    global system_health_message
+    system_health_message = build_system_health_html()
+    set_web_message("System health checked.")
+
+    return Response(request, clean_page("System Health Checked", "Memory and disk health updated."), content_type="text/html")
+
+
+@server.route("/clear-event-log", methods=["POST"])
+def clear_event_log(request: Request):
+    while event_log:
+        del event_log[0]
+
+    set_web_message("Event log cleared.")
+
+    return Response(request, clean_page("Event Log Cleared", "Event log cleared."), content_type="text/html")
 
 
 def fetch_update_manifest():
@@ -1031,6 +2394,53 @@ def get_channel_info(manifest):
 
     return manifest[channel]
 
+
+def build_ota_status_summary(manifest=None):
+    channel = config.get("update_channel", "stable")
+    backup_state = "Found" if file_exists(BACKUP_APP_PATH) else "Missing"
+    manifest_state = "Not checked"
+    stable_version = "unknown"
+    beta_version = "unknown"
+    selected_version = "unknown"
+    selected_url = "unknown"
+
+    if manifest:
+        manifest_state = "OK"
+
+        if "stable" in manifest:
+            stable_version = str(manifest["stable"].get("version", "unknown"))
+
+        if "beta" in manifest:
+            beta_version = str(manifest["beta"].get("version", "unknown"))
+
+        info = get_channel_info(manifest)
+        selected_version = str(info.get("version", "unknown"))
+        selected_url = str(info.get("app_url", "unknown"))
+
+    return (
+        "Current Version: {}<br>"
+        "Current Channel: {}<br>"
+        "Manifest URL: {}<br>"
+        "Manifest Status: {}<br>"
+        "Stable Online: {}<br>"
+        "Beta Online: {}<br>"
+        "Selected Version: {}<br>"
+        "Selected URL: {}<br>"
+        "Backup File: {}<br>"
+        "Last OTA Message: {}"
+    ).format(
+        APP_VERSION,
+        channel,
+        config.get("update_manifest_url", ""),
+        manifest_state,
+        stable_version,
+        beta_version,
+        selected_version,
+        selected_url,
+        backup_state,
+        ota_message
+    )
+
 @server.route("/check-cloud-status", methods=["POST"])
 def check_cloud_status(request: Request):
     global cloud_status_message
@@ -1056,7 +2466,11 @@ def check_cloud_status(request: Request):
         set_error_message("OTA status check failed: " + repr(e))
 
     try:
-        url = FINNHUB_URL.format("AAPL", secrets["finnhub_api_key"])
+        api_key = get_finnhub_api_key()
+        if not api_key:
+            raise Exception("Missing Finnhub API key")
+
+        url = FINNHUB_URL.format("AAPL", api_key)
         r = requests.get(url)
         data = r.json()
         r.close()
@@ -1093,9 +2507,156 @@ def check_cloud_status(request: Request):
         clean_page("Cloud Status Checked", "Cloud status updated."),
         content_type="text/html"
     )
+
+
+@server.route("/check-ota-status", methods=["POST"])
+def check_ota_status(request: Request):
+    global ota_status_message
+
+    manifest = fetch_update_manifest()
+
+    if manifest is None:
+        ota_status_message = build_ota_status_summary(None)
+    else:
+        ota_status_message = build_ota_status_summary(manifest)
+
+    set_web_message("OTA status checked.")
+
+    return Response(request, clean_page("OTA Status Checked", "OTA status section updated."), content_type="text/html")
+
+
+LAUNCHER_CODE = r'''# code.py - AUTO_RECOVERY_LAUNCHER_V1
+# Safe launcher for StockTicker. It restores app_backup.py after repeated app.py crashes.
+
+import time
+import json
+import microcontroller
+
+CRASH_FILE = "/crash_count.json"
+APP_PATH = "/app.py"
+BACKUP_PATH = "/app_backup.py"
+MAX_CRASHES = 3
+
+
+def load_json(path, default):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print("Could not save", path, repr(e))
+
+
+def exists(path):
+    try:
+        with open(path, "rb") as f:
+            f.read(1)
+        return True
+    except Exception:
+        return False
+
+
+def copy_file(src, dst):
+    with open(src, "rb") as source:
+        data = source.read()
+    with open(dst, "wb") as target:
+        target.write(data)
+
+
+def increment_crash_count(error_text):
+    info = load_json(CRASH_FILE, {})
+    count = int(info.get("count", 0)) + 1
+    info["count"] = count
+    info["last_error"] = str(error_text)[:180]
+    save_json(CRASH_FILE, info)
+    return count
+
+
+def restore_backup_and_reset():
+    print("AUTO RECOVERY: restoring app_backup.py to app.py")
+    copy_file(BACKUP_PATH, APP_PATH)
+    save_json(CRASH_FILE, {"count": 0, "restored_backup": True})
+    time.sleep(1)
+    microcontroller.reset()
+
+
+try:
+    import app
+
+except Exception as e:
+    print("APP CRASHED:", repr(e))
+
+    try:
+        import traceback
+        traceback.print_exception(e)
+    except Exception:
+        pass
+
+    crashes = increment_crash_count(repr(e))
+    print("Crash count:", crashes)
+
+    if crashes >= MAX_CRASHES and exists(BACKUP_PATH):
+        try:
+            restore_backup_and_reset()
+        except Exception as restore_error:
+            print("AUTO RECOVERY RESTORE FAILED:", repr(restore_error))
+
+    try:
+        import recovery
+    except Exception as recovery_error:
+        print("RECOVERY ALSO FAILED:", repr(recovery_error))
+        while True:
+            time.sleep(1)
+'''
+
+@server.route("/check-release-notes", methods=["POST"])
+def check_release_notes(request: Request):
+    global release_notes_message, ota_status_message
+
+    manifest = fetch_update_manifest()
+    release_notes_message = build_release_notes_html(manifest)
+    ota_status_message = build_ota_status_summary(manifest)
+    set_web_message("Release notes checked.")
+
+    return Response(request, clean_page("Release Notes Checked", "Release notes updated."), content_type="text/html")
+
+
+@server.route("/install-auto-recovery", methods=["POST"])
+def install_auto_recovery(request: Request):
+    global auto_recovery_message
+
+    entered_pin = url_decode(str(request.form_data.get("admin_pin", "")))
+
+    if entered_pin != str(config["admin_pin"]):
+        auto_recovery_message = "Auto-recovery install blocked: wrong admin PIN."
+        set_error_message(auto_recovery_message)
+        return Response(request, clean_page("Install Blocked", auto_recovery_message), content_type="text/html")
+
+    try:
+        with open("/code.py", "w") as f:
+            f.write(LAUNCHER_CODE)
+
+        auto_recovery_message = "Auto-recovery launcher installed to code.py. It activates on the next restart."
+        set_web_message(auto_recovery_message)
+
+        return Response(request, clean_page("Auto-Recovery Installed", auto_recovery_message), content_type="text/html")
+
+    except Exception as e:
+        auto_recovery_message = "Auto-recovery install failed."
+        set_error_message("Auto-recovery install failed: " + repr(e))
+        return Response(request, clean_page("Install Failed", last_error_message), content_type="text/html")
+
+
 @server.route("/check-update", methods=["POST"])
 def check_update(request: Request):
-    global ota_message
+    global ota_message, ota_status_message
 
     manifest = fetch_update_manifest()
 
@@ -1111,6 +2672,11 @@ def check_update(request: Request):
         else:
             ota_message = "You are up to date."
 
+    if manifest is None:
+        ota_status_message = build_ota_status_summary(None)
+    else:
+        ota_status_message = build_ota_status_summary(manifest)
+
     set_web_message(ota_message)
 
     return Response(request, clean_page("Update Check Complete", ota_message), content_type="text/html")
@@ -1118,7 +2684,7 @@ def check_update(request: Request):
 
 @server.route("/install-update", methods=["POST"])
 def install_update(request: Request):
-    global restart_requested, restart_time, ota_message
+    global restart_requested, restart_time, ota_message, ota_status_message
 
     form = request.form_data
     entered_pin = url_decode(str(form.get("admin_pin", "")))
@@ -1177,6 +2743,7 @@ def install_update(request: Request):
             app_file.write(new_code)
 
         ota_message = "Installed version {}. Restarting...".format(latest)
+        ota_status_message = build_ota_status_summary(manifest)
         restart_requested = True
         restart_time = time.monotonic() + 2.0
         set_web_message(ota_message)
@@ -1193,7 +2760,7 @@ def install_update(request: Request):
 
 @server.route("/rollback", methods=["POST"])
 def rollback_route(request: Request):
-    global restart_requested, restart_time, ota_message
+    global restart_requested, restart_time, ota_message, ota_status_message
 
     form = request.form_data
     entered_pin = url_decode(str(form.get("admin_pin", "")))
@@ -1211,6 +2778,7 @@ def rollback_route(request: Request):
         return Response(request, clean_page("Rollback Failed", msg), content_type="text/html")
 
     ota_message = "Rollback complete. Restarting..."
+    ota_status_message = build_ota_status_summary(None)
     set_web_message(msg)
 
     restart_requested = True
@@ -1261,6 +2829,46 @@ def factory_reset(request: Request):
         return Response(request, clean_page("Reset Failed", last_error_message), content_type="text/html")
 
 
+
+@server.route("/panel-sleep", methods=["POST"])
+def panel_sleep_route(request: Request):
+    global config
+
+    try:
+        config["panel_sleep"] = True
+        save_config(config)
+        try:
+            display.root_group = sleep_root
+            matrix.brightness = 0.0
+        except Exception:
+            pass
+        set_web_message("Panel display is sleeping. Dashboard and updates still work.")
+        return Response(request, clean_page("Display Sleeping", "The LED panels are now blanked. Use Wake Display to turn them back on."), content_type="text/html")
+
+    except Exception as e:
+        set_error_message("Panel sleep failed: " + repr(e))
+        return Response(request, clean_page("Sleep Failed", last_error_message), content_type="text/html")
+
+
+@server.route("/panel-wake", methods=["POST"])
+def panel_wake_route(request: Request):
+    global config
+
+    try:
+        config["panel_sleep"] = False
+        save_config(config)
+        try:
+            display.root_group = root
+        except Exception:
+            pass
+        set_web_message("Panel display is awake.")
+        return Response(request, clean_page("Display Awake", "The LED panels are waking up."), content_type="text/html")
+
+    except Exception as e:
+        set_error_message("Panel wake failed: " + repr(e))
+        return Response(request, clean_page("Wake Failed", last_error_message), content_type="text/html")
+
+
 @server.route("/restart", methods=["POST"])
 def restart(request: Request):
     global restart_requested, restart_time
@@ -1298,7 +2906,9 @@ display = framebufferio.FramebufferDisplay(matrix, auto_refresh=True)
 matrix.brightness = 0.0
 
 root = displayio.Group()
+sleep_root = displayio.Group()
 display.root_group = root
+panel_sleep_applied = False
 
 status_label = label.Label(terminalio.FONT, text="", color=0x00FF00, scale=1)
 status_label.y = 4
@@ -1311,6 +2921,10 @@ root.append(clock_label)
 
 def load_logos():
     logos = {}
+
+    if not config.get("show_logos", True):
+        print("Logos disabled by setting.")
+        return logos
 
     for sym in SYMBOLS:
         path = "/logos/{}.bmp".format(sym)
@@ -1345,8 +2959,20 @@ def update_header():
 
 
 def fetch_quote(sym):
+    now_text = format_12h(eastern_time_now())
+    now_mono = time.monotonic()
+
+    if is_demo_mode():
+        return demo_quote(sym)
+
+    api_key = get_finnhub_api_key()
+
+    if not api_key:
+        set_error_message("Customer API key required. Open Setup Wizard and save a Finnhub API key.")
+        return cached_or_error_quote(sym, "missing API key")
+
     try:
-        url = FINNHUB_URL.format(sym, secrets["finnhub_api_key"])
+        url = FINNHUB_URL.format(sym, api_key)
         r = requests.get(url)
         data = r.json()
         r.close()
@@ -1355,18 +2981,8 @@ def fetch_quote(sym):
         prev = data.get("pc", 0)
 
         if not price:
-            if sym in last_good:
-                return last_good[sym]
-
             set_error_message("{} returned no valid price.".format(sym))
-
-            return {
-                "symbol": sym,
-                "price_line": "${} ERROR".format(sym),
-                "change_line": "",
-                "color": 0xFF0000,
-                "pct": 0
-            }
+            return cached_or_error_quote(sym, "no valid price")
 
         dollar_change = price - prev if prev else 0
         pct = ((price - prev) / prev) * 100 if prev else 0
@@ -1374,40 +2990,74 @@ def fetch_quote(sym):
         sign = "+" if dollar_change >= 0 else "-"
 
         alert = ""
-        if abs(pct) >= ALERT_PERCENT_MOVE:
+        if ALERT_ENABLED and ALERT_PERCENT_MOVE > 0 and abs(pct) >= ALERT_PERCENT_MOVE:
             alert = "*" if pct > 0 else "!"
+
+        change_parts = []
+
+        if config.get("show_dollar_change", True):
+            change_parts.append("{}${:.2f}".format(sign, abs(dollar_change)))
+
+        if config.get("show_percent_change", True):
+            change_parts.append("({:+.2f}%{})".format(pct, alert))
+
+        if not change_parts:
+            change_parts.append("{:+.2f}%{}".format(pct, alert))
 
         return {
             "symbol": sym,
             "price_line": "${} ${:.2f}".format(sym, price),
-            "change_line": "{}${:.2f} ({:+.2f}%{})".format(
-                sign,
-                abs(dollar_change),
-                pct,
-                alert
-            ),
+            "change_line": " ".join(change_parts),
             "color": color,
-            "pct": pct
+            "pct": pct,
+            "updated_text": now_text,
+            "updated_mono": now_mono,
+            "stale": False,
+            "used_cached": False,
+            "error_reason": ""
         }
 
     except Exception as e:
-        set_error_message("Fetch error for {}: {}".format(sym, repr(e)))
+        reason = repr(e)
+        set_error_message("Fetch error for {}: {}".format(sym, reason))
+        return cached_or_error_quote(sym, "fetch error")
 
-        if sym in last_good:
-            return last_good[sym]
+def finalize_quote_batch(entries, success_message):
+    global last_update_text, alert_message, quote_freshness_message
 
-        return {
-            "symbol": sym,
-            "price_line": "${} ERROR".format(sym),
-            "change_line": "",
-            "color": 0xFF0000,
-            "pct": 0
-        }
+    last_update_text = format_12h(eastern_time_now())
+
+    triggered = []
+    stale_symbols = []
+
+    if ALERT_ENABLED and ALERT_PERCENT_MOVE > 0:
+        for e in entries:
+            pct = float(e.get("pct", 0))
+            if abs(pct) >= ALERT_PERCENT_MOVE and not e.get("stale", False):
+                direction = "UP" if pct >= 0 else "DOWN"
+                triggered.append("{} {} {:+.2f}%".format(e["symbol"], direction, pct))
+
+    for e in entries:
+        if quote_is_stale(e):
+            stale_symbols.append(e["symbol"])
+
+    if triggered:
+        new_alert = "Triggered at {}: {}".format(last_update_text, ", ".join(triggered))
+        if new_alert != alert_message:
+            add_event("Price alert: " + ", ".join(triggered))
+        alert_message = new_alert
+    else:
+        alert_message = "No alerts at {}. Threshold: +/-{:.2f}%".format(last_update_text, ALERT_PERCENT_MOVE)
+
+    if stale_symbols:
+        set_error_message("Stale quotes: " + ", ".join(stale_symbols))
+    else:
+        set_web_message(success_message + " at " + last_update_text)
+
+    quote_freshness_message = build_quote_freshness_html()
 
 
 def fetch_entries():
-    global last_update_text
-
     entries = []
 
     for sym in SYMBOLS:
@@ -1421,9 +3071,56 @@ def fetch_entries():
         last_good[sym] = e
         gc.collect()
 
-    last_update_text = format_12h(eastern_time_now())
+    finalize_quote_batch(entries, "Quotes refreshed")
 
     return entries
+
+
+def start_smooth_quote_refresh(reason):
+    global smooth_refresh_active, smooth_refresh_index, refresh_requested
+
+    smooth_refresh_active = True
+    smooth_refresh_index = 0
+    refresh_requested = False
+    add_event("Smooth quote refresh started: " + reason)
+
+
+def smooth_quote_refresh_step():
+    global smooth_refresh_active, smooth_refresh_index, pending_entries
+
+    if not smooth_refresh_active:
+        return
+
+    if smooth_refresh_index >= len(SYMBOLS):
+        smooth_refresh_active = False
+        finalize_quote_batch(pending_entries, "Smooth quotes refreshed")
+        return
+
+    sym = SYMBOLS[smooth_refresh_index]
+
+    try:
+        server.poll()
+    except Exception:
+        pass
+
+    e = fetch_quote(sym)
+    last_good[sym] = e
+    replace_entry_for_symbol(pending_entries, e)
+
+    smooth_refresh_index += 1
+
+    if smooth_refresh_index >= len(SYMBOLS):
+        smooth_refresh_active = False
+        finalize_quote_batch(pending_entries, "Smooth quotes refreshed")
+
+    gc.collect()
+
+
+def display_change_color(entry, after_hours):
+    if after_hours and config.get("after_hours_color", "purple") == "purple":
+        return 0xAA00FF
+
+    return entry["color"]
 
 
 def create_block(entry, after_hours):
@@ -1441,7 +3138,7 @@ def create_block(entry, after_hours):
         g.append(logo_grid)
         x_offset = logo_bmp.width + 3
 
-    color = 0xAA00FF if after_hours else entry["color"]
+    color = display_change_color(entry, after_hours)
 
     top = label.Label(terminalio.FONT, text=entry["price_line"], color=0xFFFFFF, scale=1)
     top.x = x_offset
@@ -1462,28 +3159,65 @@ def create_block(entry, after_hours):
         "symbol": sym,
         "x": 0.0,
         "width": float(width),
+        "x_offset": x_offset,
         "price_label": top,
         "change_label": bottom
     }
 
 
+def apply_entry_to_block(block, entry, after_hours):
+    color = display_change_color(entry, after_hours)
+
+    changed = False
+
+    if block["price_label"].text != entry["price_line"]:
+        block["price_label"].text = entry["price_line"]
+        changed = True
+
+    if block["change_label"].text != entry["change_line"]:
+        block["change_label"].text = entry["change_line"]
+        changed = True
+
+    if block["change_label"].color != color:
+        block["change_label"].color = color
+
+    if changed:
+        try:
+            x_offset = int(block.get("x_offset", 0))
+            block["width"] = float(max(115, x_offset + max(block["price_label"].bounding_box[2], block["change_label"].bounding_box[2]) + 6))
+        except Exception:
+            pass
+
+
+def get_entry_for_symbol(entry_list, sym):
+    for e in entry_list:
+        try:
+            if e.get("symbol") == sym:
+                return e
+        except Exception:
+            pass
+    return None
+
+
+def replace_entry_for_symbol(entry_list, new_entry):
+    sym = new_entry.get("symbol", "")
+
+    for i in range(len(entry_list)):
+        try:
+            if entry_list[i].get("symbol") == sym:
+                entry_list[i] = new_entry
+                return
+        except Exception:
+            pass
+
+    entry_list.append(new_entry)
+
+
 def update_blocks_from_entries(blocks, entries, after_hours):
-    n = min(len(blocks), len(entries))
-
-    for i in range(n):
-        entry = entries[i]
-        block = blocks[i]
-
-        color = 0xAA00FF if after_hours else entry["color"]
-
-        if block["price_label"].text != entry["price_line"]:
-            block["price_label"].text = entry["price_line"]
-
-        if block["change_label"].text != entry["change_line"]:
-            block["change_label"].text = entry["change_line"]
-
-        if block["change_label"].color != color:
-            block["change_label"].color = color
+    for block in blocks:
+        entry = get_entry_for_symbol(entries, block["symbol"])
+        if entry:
+            apply_entry_to_block(block, entry, after_hours)
 
 
 def remove_blocks(blocks):
@@ -1512,7 +3246,11 @@ status = update_header()
 after_hours = status != "OPN"
 
 entries = fetch_entries()
+pending_entries = entries[:]
 blocks = build_blocks(entries, after_hours)
+last_quote_fetch = time.monotonic()
+smooth_refresh_active = False
+smooth_refresh_index = 0
 
 completed_loops = 0
 
@@ -1546,6 +3284,11 @@ while True:
 
     for b in blocks:
         if b["x"] + b["width"] < 0:
+            if SMOOTH_QUOTE_REFRESH:
+                pe = get_entry_for_symbol(pending_entries, b["symbol"])
+                if pe:
+                    apply_entry_to_block(b, pe, after_hours)
+
             b["x"] = max_right + BLOCK_GAP
             b["group"].x = int(b["x"])
             max_right = b["x"] + b["width"]
@@ -1554,12 +3297,38 @@ while True:
     if loop_completed:
         completed_loops += 1
 
-    if (completed_loops >= len(blocks) or refresh_requested) and not need_reload:
-        completed_loops = 0
-        refresh_requested = False
+    if status == "OPN":
+        fetch_interval = FETCH_INTERVAL_OPEN
+    elif status == "PRE" or status == "AFT":
+        fetch_interval = FETCH_INTERVAL_PRE_AFTER
+    else:
+        fetch_interval = FETCH_INTERVAL_CLOSED
 
-        new_entries = fetch_entries()
-        update_blocks_from_entries(blocks, new_entries, after_hours)
+    time_for_quote_fetch = now - last_quote_fetch >= fetch_interval
+    full_scroll_done = completed_loops >= len(blocks)
+
+    if SMOOTH_QUOTE_REFRESH:
+        if smooth_refresh_active and loop_completed:
+            smooth_quote_refresh_step()
+
+        if (refresh_requested or time_for_quote_fetch) and full_scroll_done and not need_reload and not smooth_refresh_active:
+            completed_loops = 0
+            last_quote_fetch = now
+
+            if refresh_requested:
+                start_smooth_quote_refresh("manual request")
+            else:
+                start_smooth_quote_refresh("scheduled refresh")
+
+    else:
+        if (refresh_requested or (time_for_quote_fetch and full_scroll_done)) and not need_reload:
+            completed_loops = 0
+            refresh_requested = False
+            last_quote_fetch = now
+
+            new_entries = fetch_entries()
+            pending_entries = new_entries[:]
+            update_blocks_from_entries(blocks, new_entries, after_hours)
 
     if need_reload:
         need_reload = False
@@ -1567,16 +3336,38 @@ while True:
         remove_blocks(blocks)
         logos = load_logos()
         entries = fetch_entries()
+        pending_entries = entries[:]
+        smooth_refresh_active = False
+        smooth_refresh_index = 0
         blocks = build_blocks(entries, after_hours)
+        last_quote_fetch = now
 
-    target_brightness = BRIGHTNESS_TARGET
+    panel_sleeping_now = bool_from_form(config.get("panel_sleep", False))
 
-    if night_mode_active(status):
-        target_brightness = float(config["night_brightness"])
+    if panel_sleeping_now:
+        if not panel_sleep_applied:
+            try:
+                display.root_group = sleep_root
+            except Exception:
+                pass
+            panel_sleep_applied = True
+        matrix.brightness = 0.0
+    else:
+        if panel_sleep_applied:
+            try:
+                display.root_group = root
+            except Exception:
+                pass
+            panel_sleep_applied = False
 
-    if matrix.brightness < target_brightness:
-        matrix.brightness = min(matrix.brightness + BRIGHTNESS_RAMP_STEP, target_brightness)
-    elif matrix.brightness > target_brightness:
-        matrix.brightness = max(matrix.brightness - BRIGHTNESS_RAMP_STEP, target_brightness)
+        target_brightness = BRIGHTNESS_TARGET
+
+        if night_mode_active(status):
+            target_brightness = float(config["night_brightness"])
+
+        if matrix.brightness < target_brightness:
+            matrix.brightness = min(matrix.brightness + BRIGHTNESS_RAMP_STEP, target_brightness)
+        elif matrix.brightness > target_brightness:
+            matrix.brightness = max(matrix.brightness - BRIGHTNESS_RAMP_STEP, target_brightness)
 
     time.sleep(SCROLL_DELAY)
