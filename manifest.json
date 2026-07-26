@@ -1,6 +1,6 @@
 {
   "stable": {
-    "version": "1.1.7",
+    "version": "1.1.10"
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable ticker release."
   },
