@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.7-beta"
+APP_VERSION = "1.1.8-beta"
 
 import time
 import ssl
@@ -45,7 +45,11 @@ DEFAULT_CONFIG = {
     "night_mode_enabled": True,
     "night_brightness": 0.08,
     "night_start_hour": 16,
-    "night_end_hour": 7
+    "night_end_hour": 7,
+    "alert_enabled": True,
+    "show_dollar_change": True,
+    "show_percent_change": True,
+    "after_hours_color": "purple"
 }
 
 DEFAULT_SYMBOLS = [
@@ -219,6 +223,40 @@ def bool_from_form(value):
     return value in ("1", "true", "yes", "on")
 
 
+def clamp_float(value, low, high, default):
+    try:
+        n = float(url_decode(str(value)))
+    except Exception:
+        n = default
+
+    if n < low:
+        n = low
+    if n > high:
+        n = high
+
+    return n
+
+
+def clamp_int(value, low, high, default):
+    try:
+        n = int(float(url_decode(str(value))))
+    except Exception:
+        n = default
+
+    if n < low:
+        n = low
+    if n > high:
+        n = high
+
+    return n
+
+
+def selected(value, current):
+    if str(value) == str(current):
+        return "selected"
+    return ""
+
+
 APP_PATH = "/app.py"
 BACKUP_APP_PATH = "/app_backup.py"
 
@@ -278,7 +316,10 @@ BRIGHTNESS_RAMP_STEP = 0.01
 SCROLL_SPEED_OPEN = float(config["scroll_speed_open"])
 SCROLL_SPEED_CLOSED = float(config["scroll_speed_closed"])
 FETCH_INTERVAL_OPEN = int(config["fetch_interval_open"])
+FETCH_INTERVAL_PRE_AFTER = int(config["fetch_interval_pre_after"])
+FETCH_INTERVAL_CLOSED = int(config["fetch_interval_closed"])
 ALERT_PERCENT_MOVE = float(config["alert_percent_move"])
+ALERT_ENABLED = bool_from_form(config.get("alert_enabled", True))
 BLOCK_GAP = int(config["block_gap"])
 SCROLL_DELAY = float(config["scroll_delay"])
 
@@ -289,10 +330,12 @@ restart_time = 0
 last_good = {}
 last_update_text = "--:--"
 ota_message = "No update checked yet."
+ota_status_message = "Press Check OTA Status to verify manifest, channel, and backup."
 last_web_message = "System ready."
 last_error_message = "None yet."
 test_quote_message = "No quote tested yet."
 cloud_status_message = "Cloud status not checked yet."
+alert_message = "No price alerts yet."
 time_sync_ok = False
 
 def set_web_message(message):
@@ -551,29 +594,81 @@ HTML = """\
 <!DOCTYPE html>
 <html>
 <head>
-<title>Stock Panel</title>
+<title>StockTicker Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body {{ background:#101018; color:white; font-family:Arial; padding:20px; }}
-.card {{ background:#1b1b2a; padding:16px; border-radius:12px; margin-bottom:16px; }}
-textarea, input, select {{ width:100%; box-sizing:border-box; margin:8px 0 14px; padding:10px; border-radius:8px; border:1px solid #333; background:#080812; color:white; }}
-button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; color:white; font-weight:bold; margin-top:6px; }}
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+.wrap {{ max-width:980px; margin:0 auto; }}
+.hero {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }}
+.card {{ background:#101b2e; border:1px solid #243657; padding:16px; border-radius:18px; margin-bottom:14px; }}
+.stat {{ background:#07111f; border:1px solid #243657; border-radius:12px; padding:10px; margin:6px 0; }}
+label {{ color:#a9bddb; font-size:13px; font-weight:bold; }}
+textarea, input, select {{ width:100%; box-sizing:border-box; margin:6px 0 12px; padding:10px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
+button {{ padding:10px 14px; border:0; border-radius:10px; background:#1f8cff; color:white; font-weight:bold; margin-top:6px; cursor:pointer; }}
 .red {{ background:#cc3333; }}
 .green {{ background:#22aa66; }}
-.small {{ color:#bbbbbb; font-size:13px; }}
+.orange {{ background:#d97706; }}
+.small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
 .good {{ color:#55ff88; }}
 .bad {{ color:#ff7777; }}
+.warning {{ color:#ffd166; }}
+h1 {{ margin:0 0 10px; }}
+h2 {{ margin-top:0; }}
 </style>
 </head>
 <body>
-<h1>Stock Ticker Control Panel - OTA Beta Test</h1>
-<p>Version: {version}</p>
-<p>Device ID: {device_id}</p>
-<p>IP: {ip}</p>
-<p>Last Quote Update: {last_update}</p>
+<div class="wrap">
+<div class="hero">
+<h1>StockTicker Dashboard</h1>
+<div class="grid">
+<div class="stat"><b>Version</b><br>{version}</div>
+<div class="stat"><b>Device ID</b><br>{device_id}</div>
+<div class="stat"><b>IP</b><br>{ip}</div>
+<div class="stat"><b>Market</b><br>{market_status}</div>
+<div class="stat"><b>Last Quote Update</b><br>{last_update}</div>
+<div class="stat"><b>Update Channel</b><br>{update_channel}</div>
+</div>
 <p class="good">Status: {last_web_message}</p>
 <p class="bad">Last Error: {last_error_message}</p>
+</div>
 
+<div class="grid">
+<div class="card">
+<h2>Quick Actions</h2>
+<form method="POST" action="/refresh-now">
+<button type="submit">Refresh Quotes Now</button>
+</form>
+<form method="POST" action="/check-cloud-status">
+<button type="submit">Check Cloud Status</button>
+</form>
+<form method="POST" action="/check-ota-status">
+<button type="submit">Check OTA Status</button>
+</form>
+<form method="POST" action="/restart">
+<button class="red" type="submit">Restart Device</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Price Alerts</h2>
+<p>{alert_message}</p>
+<p class="small">Alert triggers when a saved ticker moves more than your threshold from previous close.</p>
+<form method="POST" action="/clear-alerts">
+<button class="orange" type="submit">Clear Alert Message</button>
+</form>
+</div>
+</div>
+
+<div class="card">
+<h2>Tickers</h2>
+<form method="POST" action="/save-symbols">
+<textarea name="symbols" rows="8">{symbols}</textarea>
+<button class="green" type="submit">Save Symbols</button>
+</form>
+</div>
+
+<div class="grid">
 <div class="card">
 <h2>Test Quote</h2>
 <p class="small">Check if a ticker works before saving it.</p>
@@ -588,14 +683,6 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 </div>
 
 <div class="card">
-<h2>Tickers</h2>
-<form method="POST" action="/save-symbols">
-<textarea name="symbols">{symbols}</textarea>
-<button class="green" type="submit">Save Symbols</button>
-</form>
-</div>
-
-<div class="card">
 <h2>Watchlist Presets</h2>
 <form method="POST" action="/apply-watchlist">
 <select name="watchlist">
@@ -606,26 +693,19 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <button type="submit">Apply Watchlist</button>
 </form>
 </div>
+</div>
 
 <div class="card">
-<h2>Settings</h2>
+<h2>Display Settings</h2>
 <form method="POST" action="/save-config">
-<label>Brightness</label>
+<div class="grid">
+<div>
+<label>Brightness 0.00-1.00</label>
 <input name="brightness" value="{brightness}">
-<label>Alert Percent Move</label>
-<input name="alert_percent_move" value="{alert_percent_move}">
-<label>Open Refresh Seconds</label>
-<input name="fetch_interval_open" value="{fetch_interval_open}">
-<label>Scroll Speed Open</label>
-<input name="scroll_speed_open" value="{scroll_speed_open}">
-<label>Scroll Speed Closed</label>
-<input name="scroll_speed_closed" value="{scroll_speed_closed}">
-<label>Block Gap</label>
-<input name="block_gap" value="{block_gap}">
 <label>Night Mode Enabled</label>
 <select name="night_mode_enabled">
-<option value="true">True</option>
-<option value="false">False</option>
+<option value="true" {night_true_selected}>True</option>
+<option value="false" {night_false_selected}>False</option>
 </select>
 <label>Night Brightness</label>
 <input name="night_brightness" value="{night_brightness}">
@@ -633,42 +713,77 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <input name="night_start_hour" value="{night_start_hour}">
 <label>Night End Hour ET</label>
 <input name="night_end_hour" value="{night_end_hour}">
+</div>
+<div>
+<label>Scroll Speed Open</label>
+<input name="scroll_speed_open" value="{scroll_speed_open}">
+<label>Scroll Speed Closed</label>
+<input name="scroll_speed_closed" value="{scroll_speed_closed}">
+<label>Scroll Delay</label>
+<input name="scroll_delay" value="{scroll_delay}">
+<label>Block Gap</label>
+<input name="block_gap" value="{block_gap}">
+<label>After-Hours Color</label>
+<select name="after_hours_color">
+<option value="purple" {after_purple_selected}>Purple</option>
+<option value="normal" {after_normal_selected}>Normal red/green</option>
+</select>
+</div>
+<div>
+<label>Open Refresh Seconds</label>
+<input name="fetch_interval_open" value="{fetch_interval_open}">
+<label>Pre/After Refresh Seconds</label>
+<input name="fetch_interval_pre_after" value="{fetch_interval_pre_after}">
+<label>Closed Refresh Seconds</label>
+<input name="fetch_interval_closed" value="{fetch_interval_closed}">
+<label>Price Alerts Enabled</label>
+<select name="alert_enabled">
+<option value="true" {alert_true_selected}>True</option>
+<option value="false" {alert_false_selected}>False</option>
+</select>
+<label>Alert Percent Move</label>
+<input name="alert_percent_move" value="{alert_percent_move}">
+</div>
+<div>
+<label>Show Dollar Change</label>
+<select name="show_dollar_change">
+<option value="true" {dollar_true_selected}>True</option>
+<option value="false" {dollar_false_selected}>False</option>
+</select>
+<label>Show Percent Change</label>
+<select name="show_percent_change">
+<option value="true" {percent_true_selected}>True</option>
+<option value="false" {percent_false_selected}>False</option>
+</select>
 <label>Update Channel</label>
 <select name="update_channel">
-<option value="stable">Stable</option>
-<option value="beta">Beta</option>
+<option value="stable" {stable_selected}>Stable</option>
+<option value="beta" {beta_selected}>Beta</option>
 </select>
 <label>Manifest URL</label>
 <input name="update_manifest_url" value="{update_manifest_url}">
+</div>
+</div>
 <button class="green" type="submit">Save Config</button>
 </form>
 </div>
 
-<div class="card">
-<h2>Market Holidays</h2>
-<p class="small">One date per line. Format: YYYY-MM-DD</p>
-<form method="POST" action="/save-holidays">
-<label>Full Market Closures</label>
-<textarea name="closed">{closed_dates}</textarea>
-<label>Early Close Days</label>
-<textarea name="early_close">{early_close_dates}</textarea>
-<button class="green" type="submit">Save Holidays</button>
-</form>
-</div>
-
-<div class="card">
-<h2>Refresh Quotes</h2>
-<form method="POST" action="/refresh-now">
-<button type="submit">Refresh Quotes Now</button>
-</form>
-</div>
-
+<div class="grid">
 <div class="card">
 <h2>Cloud Status</h2>
 <p>{cloud_status_message}</p>
 <form method="POST" action="/check-cloud-status">
 <button type="submit">Check Cloud Status</button>
 </form>
+</div>
+
+<div class="card">
+<h2>OTA Status / Health Check</h2>
+<p>{ota_status_message}</p>
+<form method="POST" action="/check-ota-status">
+<button type="submit">Check OTA Status</button>
+</form>
+</div>
 </div>
 
 <div class="card">
@@ -692,6 +807,18 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 </div>
 
 <div class="card">
+<h2>Market Holidays</h2>
+<p class="small">One date per line. Format: YYYY-MM-DD</p>
+<form method="POST" action="/save-holidays">
+<label>Full Market Closures</label>
+<textarea name="closed" rows="7">{closed_dates}</textarea>
+<label>Early Close Days</label>
+<textarea name="early_close" rows="4">{early_close_dates}</textarea>
+<button class="green" type="submit">Save Holidays</button>
+</form>
+</div>
+
+<div class="card">
 <h2>Factory Reset</h2>
 <p class="small">Use only for testing setup mode or clearing saved settings.</p>
 <form method="POST" action="/factory-reset">
@@ -706,14 +833,7 @@ button {{ padding:10px 14px; border:0; border-radius:8px; background:#1f8cff; co
 <button class="red" type="submit">Factory Reset</button>
 </form>
 </div>
-
-<div class="card">
-<h2>Restart</h2>
-<form method="POST" action="/restart">
-<button class="red" type="submit">Restart Device</button>
-</form>
 </div>
-
 </body>
 </html>
 """
@@ -731,20 +851,29 @@ def clean_page(title, message):
 
 @server.route("/")
 def index(request: Request):
+    current_market_status = get_market_status(eastern_time_now())
+
     return Response(
         request,
         HTML.format(
             version=APP_VERSION,
             device_id=DEVICE_ID,
             ip=ip,
+            market_status=current_market_status,
+            update_channel=config["update_channel"],
             symbols="\n".join(SYMBOLS),
             brightness=config["brightness"],
             alert_percent_move=config["alert_percent_move"],
             fetch_interval_open=config["fetch_interval_open"],
+            fetch_interval_pre_after=config["fetch_interval_pre_after"],
+            fetch_interval_closed=config["fetch_interval_closed"],
             scroll_speed_open=config["scroll_speed_open"],
             scroll_speed_closed=config["scroll_speed_closed"],
+            scroll_delay=config["scroll_delay"],
             block_gap=config["block_gap"],
             ota_message=ota_message,
+            ota_status_message=ota_status_message,
+            alert_message=alert_message,
             last_update=last_update_text,
             last_web_message=last_web_message,
             last_error_message=last_error_message,
@@ -754,6 +883,18 @@ def index(request: Request):
             night_start_hour=config["night_start_hour"],
             night_end_hour=config["night_end_hour"],
             update_manifest_url=config["update_manifest_url"],
+            night_true_selected=selected("true", str(config.get("night_mode_enabled", True)).lower()),
+            night_false_selected=selected("false", str(config.get("night_mode_enabled", True)).lower()),
+            alert_true_selected=selected("true", str(config.get("alert_enabled", True)).lower()),
+            alert_false_selected=selected("false", str(config.get("alert_enabled", True)).lower()),
+            dollar_true_selected=selected("true", str(config.get("show_dollar_change", True)).lower()),
+            dollar_false_selected=selected("false", str(config.get("show_dollar_change", True)).lower()),
+            percent_true_selected=selected("true", str(config.get("show_percent_change", True)).lower()),
+            percent_false_selected=selected("false", str(config.get("show_percent_change", True)).lower()),
+            stable_selected=selected("stable", config.get("update_channel", "stable")),
+            beta_selected=selected("beta", config.get("update_channel", "stable")),
+            after_purple_selected=selected("purple", config.get("after_hours_color", "purple")),
+            after_normal_selected=selected("normal", config.get("after_hours_color", "purple")),
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
         ),
@@ -895,46 +1036,59 @@ def save_cfg(request: Request):
     global config
     global BRIGHTNESS_TARGET
     global ALERT_PERCENT_MOVE
+    global ALERT_ENABLED
     global FETCH_INTERVAL_OPEN
+    global FETCH_INTERVAL_PRE_AFTER
+    global FETCH_INTERVAL_CLOSED
     global SCROLL_SPEED_OPEN
     global SCROLL_SPEED_CLOSED
     global BLOCK_GAP
+    global SCROLL_DELAY
     global need_reload
 
     try:
         form = request.form_data
 
-        config["brightness"] = float(url_decode(str(form.get("brightness", config["brightness"]))))
-        config["alert_percent_move"] = float(url_decode(str(form.get("alert_percent_move", config["alert_percent_move"]))))
-        config["fetch_interval_open"] = int(float(url_decode(str(form.get("fetch_interval_open", config["fetch_interval_open"])))))
-        config["scroll_speed_open"] = float(url_decode(str(form.get("scroll_speed_open", config["scroll_speed_open"]))))
-        config["scroll_speed_closed"] = float(url_decode(str(form.get("scroll_speed_closed", config["scroll_speed_closed"]))))
-        config["block_gap"] = int(float(url_decode(str(form.get("block_gap", config["block_gap"])))))
+        config["brightness"] = clamp_float(form.get("brightness", config["brightness"]), 0.0, 1.0, DEFAULT_CONFIG["brightness"])
+        config["night_brightness"] = clamp_float(form.get("night_brightness", config["night_brightness"]), 0.0, 1.0, DEFAULT_CONFIG["night_brightness"])
+        config["alert_percent_move"] = clamp_float(form.get("alert_percent_move", config["alert_percent_move"]), 0.0, 100.0, DEFAULT_CONFIG["alert_percent_move"])
+
+        config["fetch_interval_open"] = clamp_int(form.get("fetch_interval_open", config["fetch_interval_open"]), 5, 3600, DEFAULT_CONFIG["fetch_interval_open"])
+        config["fetch_interval_pre_after"] = clamp_int(form.get("fetch_interval_pre_after", config["fetch_interval_pre_after"]), 10, 3600, DEFAULT_CONFIG["fetch_interval_pre_after"])
+        config["fetch_interval_closed"] = clamp_int(form.get("fetch_interval_closed", config["fetch_interval_closed"]), 30, 7200, DEFAULT_CONFIG["fetch_interval_closed"])
+        config["night_start_hour"] = clamp_int(form.get("night_start_hour", config["night_start_hour"]), 0, 23, DEFAULT_CONFIG["night_start_hour"])
+        config["night_end_hour"] = clamp_int(form.get("night_end_hour", config["night_end_hour"]), 0, 23, DEFAULT_CONFIG["night_end_hour"])
+        config["block_gap"] = clamp_int(form.get("block_gap", config["block_gap"]), 0, 120, DEFAULT_CONFIG["block_gap"])
+
+        config["scroll_speed_open"] = clamp_float(form.get("scroll_speed_open", config["scroll_speed_open"]), 0.1, 5.0, DEFAULT_CONFIG["scroll_speed_open"])
+        config["scroll_speed_closed"] = clamp_float(form.get("scroll_speed_closed", config["scroll_speed_closed"]), 0.1, 5.0, DEFAULT_CONFIG["scroll_speed_closed"])
+        config["scroll_delay"] = clamp_float(form.get("scroll_delay", config["scroll_delay"]), 0.005, 0.20, DEFAULT_CONFIG["scroll_delay"])
+
         config["night_mode_enabled"] = bool_from_form(form.get("night_mode_enabled", config["night_mode_enabled"]))
-        config["night_brightness"] = float(url_decode(str(form.get("night_brightness", config["night_brightness"]))))
-        config["night_start_hour"] = int(float(url_decode(str(form.get("night_start_hour", config["night_start_hour"])))))
-        config["night_end_hour"] = int(float(url_decode(str(form.get("night_end_hour", config["night_end_hour"])))))
-        config["update_channel"] = url_decode(str(form.get("update_channel", config["update_channel"])))
+        config["alert_enabled"] = bool_from_form(form.get("alert_enabled", config.get("alert_enabled", True)))
+        config["show_dollar_change"] = bool_from_form(form.get("show_dollar_change", config.get("show_dollar_change", True)))
+        config["show_percent_change"] = bool_from_form(form.get("show_percent_change", config.get("show_percent_change", True)))
+
+        channel = url_decode(str(form.get("update_channel", config["update_channel"]))).strip().lower()
+        config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
+
+        after_color = url_decode(str(form.get("after_hours_color", config.get("after_hours_color", "purple")))).strip().lower()
+        config["after_hours_color"] = after_color if after_color in ("purple", "normal") else "purple"
+
         config["update_manifest_url"] = url_decode(str(form.get("update_manifest_url", config["update_manifest_url"]))).strip()
-
-        if config["brightness"] < 0:
-            config["brightness"] = 0
-        if config["brightness"] > 1:
-            config["brightness"] = 1
-
-        if config["night_brightness"] < 0:
-            config["night_brightness"] = 0
-        if config["night_brightness"] > 1:
-            config["night_brightness"] = 1
 
         save_config(config)
 
         BRIGHTNESS_TARGET = float(config["brightness"])
         ALERT_PERCENT_MOVE = float(config["alert_percent_move"])
+        ALERT_ENABLED = bool_from_form(config.get("alert_enabled", True))
         FETCH_INTERVAL_OPEN = int(config["fetch_interval_open"])
+        FETCH_INTERVAL_PRE_AFTER = int(config["fetch_interval_pre_after"])
+        FETCH_INTERVAL_CLOSED = int(config["fetch_interval_closed"])
         SCROLL_SPEED_OPEN = float(config["scroll_speed_open"])
         SCROLL_SPEED_CLOSED = float(config["scroll_speed_closed"])
         BLOCK_GAP = int(config["block_gap"])
+        SCROLL_DELAY = float(config["scroll_delay"])
 
         need_reload = True
         set_web_message("Settings saved.")
@@ -992,6 +1146,15 @@ def refresh_now(request: Request):
     return Response(request, clean_page("Refresh Requested", "Quotes will refresh after the current scroll cycle."), content_type="text/html")
 
 
+@server.route("/clear-alerts", methods=["POST"])
+def clear_alerts(request: Request):
+    global alert_message
+    alert_message = "Alert message cleared."
+    set_web_message("Price alert message cleared.")
+
+    return Response(request, clean_page("Alerts Cleared", "Price alert message cleared."), content_type="text/html")
+
+
 def fetch_update_manifest():
     try:
         url = config["update_manifest_url"]
@@ -1030,6 +1193,53 @@ def get_channel_info(manifest):
         channel = "stable"
 
     return manifest[channel]
+
+
+def build_ota_status_summary(manifest=None):
+    channel = config.get("update_channel", "stable")
+    backup_state = "Found" if file_exists(BACKUP_APP_PATH) else "Missing"
+    manifest_state = "Not checked"
+    stable_version = "unknown"
+    beta_version = "unknown"
+    selected_version = "unknown"
+    selected_url = "unknown"
+
+    if manifest:
+        manifest_state = "OK"
+
+        if "stable" in manifest:
+            stable_version = str(manifest["stable"].get("version", "unknown"))
+
+        if "beta" in manifest:
+            beta_version = str(manifest["beta"].get("version", "unknown"))
+
+        info = get_channel_info(manifest)
+        selected_version = str(info.get("version", "unknown"))
+        selected_url = str(info.get("app_url", "unknown"))
+
+    return (
+        "Current Version: {}<br>"
+        "Current Channel: {}<br>"
+        "Manifest URL: {}<br>"
+        "Manifest Status: {}<br>"
+        "Stable Online: {}<br>"
+        "Beta Online: {}<br>"
+        "Selected Version: {}<br>"
+        "Selected URL: {}<br>"
+        "Backup File: {}<br>"
+        "Last OTA Message: {}"
+    ).format(
+        APP_VERSION,
+        channel,
+        config.get("update_manifest_url", ""),
+        manifest_state,
+        stable_version,
+        beta_version,
+        selected_version,
+        selected_url,
+        backup_state,
+        ota_message
+    )
 
 @server.route("/check-cloud-status", methods=["POST"])
 def check_cloud_status(request: Request):
@@ -1093,9 +1303,27 @@ def check_cloud_status(request: Request):
         clean_page("Cloud Status Checked", "Cloud status updated."),
         content_type="text/html"
     )
+
+
+@server.route("/check-ota-status", methods=["POST"])
+def check_ota_status(request: Request):
+    global ota_status_message
+
+    manifest = fetch_update_manifest()
+
+    if manifest is None:
+        ota_status_message = build_ota_status_summary(None)
+    else:
+        ota_status_message = build_ota_status_summary(manifest)
+
+    set_web_message("OTA status checked.")
+
+    return Response(request, clean_page("OTA Status Checked", "OTA status section updated."), content_type="text/html")
+
+
 @server.route("/check-update", methods=["POST"])
 def check_update(request: Request):
-    global ota_message
+    global ota_message, ota_status_message
 
     manifest = fetch_update_manifest()
 
@@ -1111,6 +1339,11 @@ def check_update(request: Request):
         else:
             ota_message = "You are up to date."
 
+    if manifest is None:
+        ota_status_message = build_ota_status_summary(None)
+    else:
+        ota_status_message = build_ota_status_summary(manifest)
+
     set_web_message(ota_message)
 
     return Response(request, clean_page("Update Check Complete", ota_message), content_type="text/html")
@@ -1118,7 +1351,7 @@ def check_update(request: Request):
 
 @server.route("/install-update", methods=["POST"])
 def install_update(request: Request):
-    global restart_requested, restart_time, ota_message
+    global restart_requested, restart_time, ota_message, ota_status_message
 
     form = request.form_data
     entered_pin = url_decode(str(form.get("admin_pin", "")))
@@ -1177,6 +1410,7 @@ def install_update(request: Request):
             app_file.write(new_code)
 
         ota_message = "Installed version {}. Restarting...".format(latest)
+        ota_status_message = build_ota_status_summary(manifest)
         restart_requested = True
         restart_time = time.monotonic() + 2.0
         set_web_message(ota_message)
@@ -1193,7 +1427,7 @@ def install_update(request: Request):
 
 @server.route("/rollback", methods=["POST"])
 def rollback_route(request: Request):
-    global restart_requested, restart_time, ota_message
+    global restart_requested, restart_time, ota_message, ota_status_message
 
     form = request.form_data
     entered_pin = url_decode(str(form.get("admin_pin", "")))
@@ -1211,6 +1445,7 @@ def rollback_route(request: Request):
         return Response(request, clean_page("Rollback Failed", msg), content_type="text/html")
 
     ota_message = "Rollback complete. Restarting..."
+    ota_status_message = build_ota_status_summary(None)
     set_web_message(msg)
 
     restart_requested = True
@@ -1374,18 +1609,24 @@ def fetch_quote(sym):
         sign = "+" if dollar_change >= 0 else "-"
 
         alert = ""
-        if abs(pct) >= ALERT_PERCENT_MOVE:
+        if ALERT_ENABLED and ALERT_PERCENT_MOVE > 0 and abs(pct) >= ALERT_PERCENT_MOVE:
             alert = "*" if pct > 0 else "!"
+
+        change_parts = []
+
+        if config.get("show_dollar_change", True):
+            change_parts.append("{}${:.2f}".format(sign, abs(dollar_change)))
+
+        if config.get("show_percent_change", True):
+            change_parts.append("({:+.2f}%{})".format(pct, alert))
+
+        if not change_parts:
+            change_parts.append("{:+.2f}%{}".format(pct, alert))
 
         return {
             "symbol": sym,
             "price_line": "${} ${:.2f}".format(sym, price),
-            "change_line": "{}${:.2f} ({:+.2f}%{})".format(
-                sign,
-                abs(dollar_change),
-                pct,
-                alert
-            ),
+            "change_line": " ".join(change_parts),
             "color": color,
             "pct": pct
         }
@@ -1406,7 +1647,7 @@ def fetch_quote(sym):
 
 
 def fetch_entries():
-    global last_update_text
+    global last_update_text, alert_message
 
     entries = []
 
@@ -1423,7 +1664,28 @@ def fetch_entries():
 
     last_update_text = format_12h(eastern_time_now())
 
+    triggered = []
+
+    if ALERT_ENABLED and ALERT_PERCENT_MOVE > 0:
+        for e in entries:
+            pct = float(e.get("pct", 0))
+            if abs(pct) >= ALERT_PERCENT_MOVE:
+                direction = "UP" if pct >= 0 else "DOWN"
+                triggered.append("{} {} {:+.2f}%".format(e["symbol"], direction, pct))
+
+    if triggered:
+        alert_message = "Triggered at {}: {}".format(last_update_text, ", ".join(triggered))
+    else:
+        alert_message = "No alerts at {}. Threshold: +/-{:.2f}%".format(last_update_text, ALERT_PERCENT_MOVE)
+
     return entries
+
+
+def display_change_color(entry, after_hours):
+    if after_hours and config.get("after_hours_color", "purple") == "purple":
+        return 0xAA00FF
+
+    return entry["color"]
 
 
 def create_block(entry, after_hours):
@@ -1441,7 +1703,7 @@ def create_block(entry, after_hours):
         g.append(logo_grid)
         x_offset = logo_bmp.width + 3
 
-    color = 0xAA00FF if after_hours else entry["color"]
+    color = display_change_color(entry, after_hours)
 
     top = label.Label(terminalio.FONT, text=entry["price_line"], color=0xFFFFFF, scale=1)
     top.x = x_offset
@@ -1474,7 +1736,7 @@ def update_blocks_from_entries(blocks, entries, after_hours):
         entry = entries[i]
         block = blocks[i]
 
-        color = 0xAA00FF if after_hours else entry["color"]
+        color = display_change_color(entry, after_hours)
 
         if block["price_label"].text != entry["price_line"]:
             block["price_label"].text = entry["price_line"]
@@ -1513,6 +1775,7 @@ after_hours = status != "OPN"
 
 entries = fetch_entries()
 blocks = build_blocks(entries, after_hours)
+last_quote_fetch = time.monotonic()
 
 completed_loops = 0
 
@@ -1554,9 +1817,20 @@ while True:
     if loop_completed:
         completed_loops += 1
 
-    if (completed_loops >= len(blocks) or refresh_requested) and not need_reload:
+    if status == "OPN":
+        fetch_interval = FETCH_INTERVAL_OPEN
+    elif status == "PRE" or status == "AFT":
+        fetch_interval = FETCH_INTERVAL_PRE_AFTER
+    else:
+        fetch_interval = FETCH_INTERVAL_CLOSED
+
+    time_for_quote_fetch = now - last_quote_fetch >= fetch_interval
+    full_scroll_done = completed_loops >= len(blocks)
+
+    if (refresh_requested or (time_for_quote_fetch and full_scroll_done)) and not need_reload:
         completed_loops = 0
         refresh_requested = False
+        last_quote_fetch = now
 
         new_entries = fetch_entries()
         update_blocks_from_entries(blocks, new_entries, after_hours)
@@ -1568,6 +1842,7 @@ while True:
         logos = load_logos()
         entries = fetch_entries()
         blocks = build_blocks(entries, after_hours)
+        last_quote_fetch = now
 
     target_brightness = BRIGHTNESS_TARGET
 
