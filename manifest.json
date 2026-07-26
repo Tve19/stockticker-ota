@@ -2,11 +2,11 @@
   "stable": {
     "version": "1.1.5",
     "app_url": "https://stockticker-ota.pages.dev/stable/app.py",
-    "notes": "Known-good rollback based on working 1.1.2 with fixed OTA path."
+    "notes": "Stable ticker release."
   },
   "beta": {
-    "version": "1.1.5-beta",
+    "version": "1.1.6-beta",
     "app_url": "https://stockticker-ota.pages.dev/beta/app.py",
-    "notes": "Known-good beta rollback based on working 1.1.2 with fixed OTA path."
+    "notes": "Beta OTA test release."
   }
 }
