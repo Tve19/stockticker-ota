@@ -1,7 +1,7 @@
 print("APP.PY STARTED")
 
 APP_NAME = "StockTicker"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 
 import time
 import ssl
@@ -1099,7 +1099,13 @@ matrix = rgbmatrix.RGBMatrix(
     height=64,
     bit_depth=4,
     rgb_pins=[board.MTX_R1, board.MTX_G1, board.MTX_B1, board.MTX_R2, board.MTX_G2, board.MTX_B2],
-    addr_pins=[board.MTX_ADDRA, board.MTX_ADDRB, board.MTX_ADDRC, board.MTX_ADDRE],
+    addr_pins=[
+        board.MTX_ADDRA,
+        board.MTX_ADDRB,
+        board.MTX_ADDRC,
+        board.MTX_ADDRD,
+        board.MTX_ADDRE
+    ],
     clock_pin=board.MTX_CLK,
     latch_pin=board.MTX_LAT,
     output_enable_pin=board.MTX_OE,
