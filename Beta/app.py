@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6-beta"
 
 import time
 import ssl
