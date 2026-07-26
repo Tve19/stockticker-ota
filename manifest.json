@@ -7,5 +7,5 @@
 "beta": {
   "version": "1.1.11-beta",
   "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
-  "notes": "Added OTA health check, cleaner UI, display polish, and price alert improvements."
+  "notes": "Added customer setup wizard, basic settings page, logo manager, release notes, and auto-recovery launcher."
 }
