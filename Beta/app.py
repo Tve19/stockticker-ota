@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.13-beta"
+APP_VERSION = "1.1.14-beta"
 
 import time
 import ssl
@@ -67,7 +67,8 @@ DEFAULT_CONFIG = {
     "require_customer_api_key": True,
     "demo_mode": False,
     "device_name": "StockTicker",
-    "customer_mode": "basic"
+    "customer_mode": "basic",
+    "panel_sleep": False
 }
 
 DEFAULT_SYMBOLS = [
@@ -830,6 +831,12 @@ def quote_status_short():
     return "OK"
 
 
+def panel_state_text():
+    if bool_from_form(config.get("panel_sleep", False)):
+        return "Sleeping"
+    return "Awake"
+
+
 def demo_quote(sym):
     now_text = format_12h(eastern_time_now())
     now_mono = time.monotonic()
@@ -892,6 +899,7 @@ h1 { margin-top:0; }
 <div class="card"><h2>Demo Mode</h2><p>Demo Mode shows sample prices for display/testing. It is not real market data and should be turned off for normal use.</p></div>
 <div class="card"><h2>Colors and labels</h2><p>Green means up, red means down, purple can indicate pre-market/after-hours. OLD means cached or stale data.</p></div>
 <div class="card"><h2>Software updates</h2><p>Read Release Notes, then use Check for Update and Install Update. Rollback restores the previous app if an update has problems.</p></div>
+<div class="card"><h2>Sleep Display</h2><p>Sleep Display blanks the LED panels without unplugging the device. The dashboard, WiFi, OTA, and settings continue to work.</p></div>
 <div class="card"><h2>Logos</h2><p>BMP logos go in /logos/SYMBOL.bmp. Missing logos are harmless; the ticker automatically uses a clean text fallback.</p></div>
 <p><a href="/">Back to Dashboard</a></p>
 </div>
@@ -908,13 +916,13 @@ def setup_wizard_page(message=""):
 <title>StockTicker Setup Wizard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
 .wrap {{ max-width:760px; margin:0 auto; }}
 .card {{ background:#101b2e; border:1px solid #243657; padding:16px; border-radius:18px; margin-bottom:14px; }}
 textarea, input, select {{ width:100%; box-sizing:border-box; margin:6px 0 12px; padding:10px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
 button {{ padding:12px 16px; border:0; border-radius:10px; background:#22aa66; color:white; font-weight:bold; }}
 .small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
-a { color:#79c7ff; }
+a {{ color:#79c7ff; }}
 </style>
 </head>
 <body>
@@ -1312,7 +1320,7 @@ HTML = """\
 <title>StockTicker Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
 .wrap {{ max-width:980px; margin:0 auto; }}
 .hero {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }}
 .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }}
@@ -1343,6 +1351,8 @@ button {{ padding:10px 14px; border:0; border-radius:10px; background:#1f8cff; c
 h1 {{ margin:0 0 6px; }}
 h2 {{ margin-top:0; }}
 summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
+.button-row {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+.button-row form {{ margin:0; }}
 </style>
 </head>
 <body>
@@ -1389,6 +1399,15 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <div class="grid">
 <div class="card">
 <h2>Quick Actions</h2>
+<p class="small"><b>Panel Display:</b> {panel_state}</p>
+<div class="button-row">
+<form method="POST" action="/panel-sleep">
+<button class="orange" type="submit">Sleep Display</button>
+</form>
+<form method="POST" action="/panel-wake">
+<button class="green" type="submit">Wake Display</button>
+</form>
+</div>
 <form method="POST" action="/refresh-now">
 <button type="submit">Refresh Quotes Now</button>
 </form>
@@ -1759,6 +1778,7 @@ def index(request: Request):
             setup_progress=setup_progress_text(),
             setup_checklist_message=build_setup_checklist_html(),
             quote_status_short=quote_status_short(),
+            panel_state=panel_state_text(),
             logo_summary_short=logo_summary_text(),
             last_error_panel=last_error_panel_html(),
             symbols="\n".join(SYMBOLS),
@@ -2598,6 +2618,37 @@ def factory_reset(request: Request):
         return Response(request, clean_page("Reset Failed", last_error_message), content_type="text/html")
 
 
+
+@server.route("/panel-sleep", methods=["POST"])
+def panel_sleep_route(request: Request):
+    global config
+
+    try:
+        config["panel_sleep"] = True
+        save_config(config)
+        set_web_message("Panel display is sleeping. Dashboard and updates still work.")
+        return Response(request, clean_page("Display Sleeping", "The LED panels are now blanked. Use Wake Display to turn them back on."), content_type="text/html")
+
+    except Exception as e:
+        set_error_message("Panel sleep failed: " + repr(e))
+        return Response(request, clean_page("Sleep Failed", last_error_message), content_type="text/html")
+
+
+@server.route("/panel-wake", methods=["POST"])
+def panel_wake_route(request: Request):
+    global config
+
+    try:
+        config["panel_sleep"] = False
+        save_config(config)
+        set_web_message("Panel display is awake.")
+        return Response(request, clean_page("Display Awake", "The LED panels are waking up."), content_type="text/html")
+
+    except Exception as e:
+        set_error_message("Panel wake failed: " + repr(e))
+        return Response(request, clean_page("Wake Failed", last_error_message), content_type="text/html")
+
+
 @server.route("/restart", methods=["POST"])
 def restart(request: Request):
     global restart_requested, restart_time
@@ -3069,10 +3120,13 @@ while True:
         blocks = build_blocks(entries, after_hours)
         last_quote_fetch = now
 
-    target_brightness = BRIGHTNESS_TARGET
+    if bool_from_form(config.get("panel_sleep", False)):
+        target_brightness = 0.0
+    else:
+        target_brightness = BRIGHTNESS_TARGET
 
-    if night_mode_active(status):
-        target_brightness = float(config["night_brightness"])
+        if night_mode_active(status):
+            target_brightness = float(config["night_brightness"])
 
     if matrix.brightness < target_brightness:
         matrix.brightness = min(matrix.brightness + BRIGHTNESS_RAMP_STEP, target_brightness)
