@@ -5,8 +5,8 @@
     "notes": "Stable ticker release."
   },
   "beta": {
-    "version": "1.1.6-beta",
+    "version": "1.1.7-beta",
     "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
-    "notes": "Beta OTA test release."
+    "notes": "Added rollback button and safer OTA backup."
   }
 }
