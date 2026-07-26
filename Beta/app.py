@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.10-beta"
+APP_VERSION = "1.1.11-beta"
 
 import time
 import ssl
@@ -20,7 +20,14 @@ import microcontroller
 import os
 
 from adafruit_display_text import label
-from secrets import secrets
+try:
+    from secrets import secrets
+except Exception:
+    secrets = {
+        "ssid": "",
+        "password": "",
+        "finnhub_api_key": ""
+    }
 from adafruit_httpserver import Server, Request, Response
 
 
@@ -29,6 +36,7 @@ SYMBOLS_FILE = "/symbols.txt"
 WIFI_FILE = "/wifi_config.json"
 HOLIDAYS_FILE = "/market_holidays.json"
 DEVICE_FILE = "/device.json"
+CRASH_FILE = "/crash_count.json"
 
 DEFAULT_CONFIG = {
     "brightness": 0.30,
@@ -53,7 +61,11 @@ DEFAULT_CONFIG = {
     "after_hours_color": "purple",
     "stale_quote_minutes": 15,
     "show_stale_marker": True,
-    "smooth_quote_refresh": True
+    "smooth_quote_refresh": True,
+    "show_logos": True,
+    "finnhub_api_key": "",
+    "device_name": "StockTicker",
+    "customer_mode": "basic"
 }
 
 DEFAULT_SYMBOLS = [
@@ -261,6 +273,48 @@ def selected(value, current):
     return ""
 
 
+def mask_secret(value):
+    value = str(value or "")
+    if not value:
+        return ""
+    if len(value) <= 6:
+        return "******"
+    return value[:3] + "..." + value[-3:]
+
+
+def get_finnhub_api_key():
+    try:
+        key = str(config.get("finnhub_api_key", "")).strip()
+        if key:
+            return key
+    except Exception:
+        pass
+
+    try:
+        return str(secrets.get("finnhub_api_key", "")).strip()
+    except Exception:
+        return ""
+
+
+def get_api_key_status():
+    key = get_finnhub_api_key()
+    if key:
+        try:
+            if str(config.get("finnhub_api_key", "")).strip():
+                return "Saved in device settings: " + mask_secret(key)
+        except Exception:
+            pass
+        return "Loaded from secrets.py: " + mask_secret(key)
+    return "Missing - enter a Finnhub API key in Customer Setup."
+
+
+def mark_app_boot_success():
+    try:
+        save_json_file(CRASH_FILE, {"count": 0, "last_good_version": APP_VERSION})
+    except Exception as e:
+        print("Could not reset crash counter:", repr(e))
+
+
 APP_PATH = "/app.py"
 BACKUP_APP_PATH = "/app_backup.py"
 
@@ -343,6 +397,8 @@ cloud_status_message = "Cloud status not checked yet."
 alert_message = "No price alerts yet."
 quote_freshness_message = "No quote freshness checked yet."
 system_health_message = "Press Check System Health to refresh memory and disk stats."
+release_notes_message = "Press Check Release Notes to load stable/beta notes from your OTA manifest."
+auto_recovery_message = "Auto-recovery launcher not checked yet."
 time_sync_ok = False
 boot_time = time.monotonic()
 event_log = []
@@ -425,7 +481,8 @@ def build_system_health_html():
         "Used Memory: {} bytes<br>"
         "Disk: {}<br>"
         "app.py Size: {}<br>"
-        "Backup Size: {}"
+        "Backup Size: {}<br>"
+        "Auto-Recovery Launcher: {}"
     ).format(
         hours,
         minutes,
@@ -434,7 +491,8 @@ def build_system_health_html():
         used_mem,
         disk_text,
         file_size_text(APP_PATH),
-        file_size_text(BACKUP_APP_PATH)
+        file_size_text(BACKUP_APP_PATH),
+        launcher_status_text()
     )
 
 
@@ -516,6 +574,136 @@ def build_quote_freshness_html():
     return "<br>".join(lines)
 
 
+def logo_status_for_symbol(sym):
+    path = "/logos/{}.bmp".format(sym)
+    if file_exists(path):
+        return "Found"
+    return "Missing"
+
+
+def build_logo_status_html():
+    if not config.get("show_logos", True):
+        return "Logos are currently disabled. The ticker is running in text-only mode."
+
+    if not SYMBOLS:
+        return "No symbols saved."
+
+    lines = []
+    found = 0
+    missing = 0
+
+    for sym in SYMBOLS:
+        state = logo_status_for_symbol(sym)
+        if state == "Found":
+            found += 1
+        else:
+            missing += 1
+        lines.append("{}: {}".format(sym, state))
+
+    summary = "{} found / {} missing".format(found, missing)
+    return summary + "<br>" + "<br>".join(lines)
+
+
+def launcher_status_text():
+    try:
+        with open("/code.py", "r") as f:
+            text = f.read()
+        if "AUTO_RECOVERY_LAUNCHER_V1" in text:
+            return "Installed"
+        return "Not installed or older launcher"
+    except Exception:
+        return "Unable to read code.py"
+
+
+def build_release_notes_html(manifest=None):
+    if manifest is None:
+        manifest = fetch_update_manifest()
+
+    if manifest is None:
+        return "Could not load release notes. Check the manifest URL."
+
+    lines = []
+    for ch in ("stable", "beta"):
+        if ch in manifest:
+            info = manifest[ch]
+            lines.append("<b>{}</b>: {}<br>{}".format(
+                ch.upper(),
+                safe_html(info.get("version", "unknown")),
+                safe_html(info.get("notes", "No notes."))
+            ))
+        else:
+            lines.append("<b>{}</b>: missing from manifest".format(ch.upper()))
+
+    return "<br><br>".join(lines)
+
+
+def setup_wizard_page(message=""):
+    return """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>StockTicker Setup Wizard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+.wrap {{ max-width:760px; margin:0 auto; }}
+.card {{ background:#101b2e; border:1px solid #243657; padding:16px; border-radius:18px; margin-bottom:14px; }}
+textarea, input, select {{ width:100%; box-sizing:border-box; margin:6px 0 12px; padding:10px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
+button {{ padding:12px 16px; border:0; border-radius:10px; background:#22aa66; color:white; font-weight:bold; }}
+.small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
+a {{ color:#79c7ff; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="card">
+<h1>StockTicker Setup Wizard</h1>
+<p class="small">Use this page for first-time customer setup or to reconfigure the device.</p>
+<p>{message}</p>
+<form method="POST" action="/save-customer-setup">
+<label>Device Name</label>
+<input name="device_name" value="{device_name}">
+<label>Stock Symbols</label>
+<textarea name="symbols" rows="6">{symbols}</textarea>
+<label>Finnhub API Key</label>
+<input name="finnhub_api_key" value="{api_key}" placeholder="Paste customer Finnhub API key here">
+<p class="small">API Key Status: {api_key_status}</p>
+<label>Admin PIN</label>
+<input name="admin_pin" value="{admin_pin}" placeholder="Example: 1234">
+<label>Brightness 0.00-1.00</label>
+<input name="brightness" value="{brightness}">
+<label>Update Channel</label>
+<select name="update_channel">
+<option value="stable" {stable_selected}>Stable</option>
+<option value="beta" {beta_selected}>Beta</option>
+</select>
+<label>Show Logos</label>
+<select name="show_logos">
+<option value="true" {logos_true_selected}>True</option>
+<option value="false" {logos_false_selected}>False</option>
+</select>
+<button type="submit">Save Setup</button>
+</form>
+<p><a href="/">Back to Dashboard</a></p>
+</div>
+</div>
+</body>
+</html>
+""".format(
+        message=message,
+        device_name=safe_html(config.get("device_name", "StockTicker")),
+        symbols=safe_html("\n".join(SYMBOLS)),
+        api_key=safe_html(config.get("finnhub_api_key", "")),
+        api_key_status=safe_html(get_api_key_status()),
+        admin_pin=safe_html(config.get("admin_pin", "1234")),
+        brightness=safe_html(config.get("brightness", DEFAULT_CONFIG["brightness"])),
+        stable_selected=selected("stable", config.get("update_channel", "stable")),
+        beta_selected=selected("beta", config.get("update_channel", "stable")),
+        logos_true_selected=selected("true", str(config.get("show_logos", True)).lower()),
+        logos_false_selected=selected("false", str(config.get("show_logos", True)).lower())
+    )
+
+
 def set_web_message(message):
     global last_web_message
     last_web_message = message
@@ -531,6 +719,7 @@ def set_error_message(message):
 
 
 add_event("Booted " + APP_VERSION)
+mark_app_boot_success()
 
 
 def start_setup_mode(reason):
@@ -549,24 +738,47 @@ def start_setup_mode(reason):
 <!DOCTYPE html>
 <html>
 <head>
-<title>StockTicker Setup</title>
+<title>StockTicker First-Time Setup</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body {{ background:#101018; color:white; font-family:Arial; padding:20px; }}
-input {{ width:100%; box-sizing:border-box; padding:10px; margin:8px 0 14px; }}
-button {{ padding:12px; }}
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+.card {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; }}
+textarea, input, select {{ width:100%; box-sizing:border-box; padding:10px; margin:8px 0 14px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
+button {{ padding:12px 16px; border:0; border-radius:10px; background:#22aa66; color:white; font-weight:bold; }}
+.small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
 </style>
 </head>
 <body>
-<h1>StockTicker Setup</h1>
-<p>Enter your home WiFi information.</p>
+<div class="card">
+<h1>StockTicker First-Time Setup</h1>
+<p class="small">Connect this device to WiFi and enter customer basics. You can edit these later from the dashboard.</p>
 <form method="POST" action="/save-wifi">
-<label>WiFi Name</label>
+<label>Home WiFi Name</label>
 <input name="ssid">
-<label>Password</label>
+<label>Home WiFi Password</label>
 <input name="password" type="password">
-<button type="submit">Save WiFi</button>
+<label>Stock Symbols</label>
+<textarea name="symbols" rows="6">SOFI
+RKLB
+ONDS
+HIMS
+PLTR
+AMZN
+SPY</textarea>
+<label>Finnhub API Key</label>
+<input name="finnhub_api_key" placeholder="Customer API key">
+<label>Admin PIN</label>
+<input name="admin_pin" value="1234">
+<label>Brightness 0.00-1.00</label>
+<input name="brightness" value="0.30">
+<label>Update Channel</label>
+<select name="update_channel">
+<option value="stable">Stable</option>
+<option value="beta">Beta</option>
+</select>
+<button type="submit">Save Setup and Restart</button>
 </form>
+</div>
 </body>
 </html>
 """
@@ -585,9 +797,31 @@ button {{ padding:12px; }}
             "password": password
         })
 
+        setup_cfg = load_config()
+        setup_cfg["finnhub_api_key"] = url_decode(str(form.get("finnhub_api_key", setup_cfg.get("finnhub_api_key", "")))).strip()
+        setup_cfg["admin_pin"] = url_decode(str(form.get("admin_pin", setup_cfg.get("admin_pin", "1234")))).strip() or "1234"
+        setup_cfg["brightness"] = clamp_float(form.get("brightness", setup_cfg.get("brightness", 0.30)), 0.0, 1.0, 0.30)
+
+        channel = url_decode(str(form.get("update_channel", setup_cfg.get("update_channel", "stable")))).strip().lower()
+        setup_cfg["update_channel"] = channel if channel in ("stable", "beta") else "stable"
+
+        save_config(setup_cfg)
+
+        raw_symbols = url_decode(str(form.get("symbols", "")))
+        new_symbols = []
+        seen = set()
+        for line in raw_symbols.replace(",", "\n").replace("\r", "\n").split("\n"):
+            sym = clean_symbol(line)
+            if sym and sym not in seen:
+                new_symbols.append(sym)
+                seen.add(sym)
+
+        if new_symbols:
+            save_symbol_list(new_symbols)
+
         return Response(
             request,
-            "<html><body><h1>WiFi Saved</h1><p>Restarting...</p></body></html>",
+            "<html><body><h1>Setup Saved</h1><p>Restarting and connecting to WiFi...</p></body></html>",
             content_type="text/html"
         )
 
@@ -625,7 +859,15 @@ def get_wifi_credentials():
     if wifi_cfg.get("ssid"):
         return wifi_cfg["ssid"], wifi_cfg.get("password", "")
 
-    return secrets["ssid"], secrets["password"]
+    try:
+        ssid = str(secrets.get("ssid", "")).strip()
+        password = str(secrets.get("password", ""))
+        if ssid:
+            return ssid, password
+    except Exception:
+        pass
+
+    start_setup_mode("WiFi is not configured.")
 
 
 print("Connecting to Wi-Fi...")
@@ -798,12 +1040,13 @@ button {{ padding:10px 14px; border:0; border-radius:10px; background:#1f8cff; c
 .warning {{ color:#ffd166; }}
 h1 {{ margin:0 0 10px; }}
 h2 {{ margin-top:0; }}
+summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </style>
 </head>
 <body>
 <div class="wrap">
 <div class="hero">
-<h1>StockTicker Dashboard</h1>
+<h1>{device_name}</h1>
 <div class="grid">
 <div class="stat"><b>Version</b><br>{version}</div>
 <div class="stat"><b>Device ID</b><br>{device_id}</div>
@@ -814,6 +1057,15 @@ h2 {{ margin-top:0; }}
 </div>
 <p class="good">Status: {last_web_message}</p>
 <p class="bad">Last Error: {last_error_message}</p>
+</div>
+
+<div class="card">
+<h2>Customer Setup / Basic Settings</h2>
+<p class="small">Use this section for normal customer changes. Advanced settings are lower on the page.</p>
+<form method="GET" action="/setup-wizard">
+<button type="submit">Open Setup Wizard</button>
+</form>
+<p class="small">API Key Status: {api_key_status}</p>
 </div>
 
 <div class="grid">
@@ -901,9 +1153,16 @@ h2 {{ margin-top:0; }}
 <button type="submit">Apply Watchlist</button>
 </form>
 </div>
-</div>
 
 <div class="card">
+<h2>Logo Manager</h2>
+<p>{logo_status_message}</p>
+<p class="small">Upload BMP logos to the device in /logos/SYMBOL.bmp. Missing logos are harmless; the ticker will use text only.</p>
+</div>
+</div>
+
+<details class="card">
+<summary>Advanced Settings</summary>
 <h2>Display Settings</h2>
 <form method="POST" action="/save-config">
 <div class="grid">
@@ -976,6 +1235,11 @@ h2 {{ margin-top:0; }}
 <option value="true" {percent_true_selected}>True</option>
 <option value="false" {percent_false_selected}>False</option>
 </select>
+<label>Show Logos</label>
+<select name="show_logos">
+<option value="true" {logos_true_selected}>True</option>
+<option value="false" {logos_false_selected}>False</option>
+</select>
 <label>Update Channel</label>
 <select name="update_channel">
 <option value="stable" {stable_selected}>Stable</option>
@@ -987,7 +1251,7 @@ h2 {{ margin-top:0; }}
 </div>
 <button class="green" type="submit">Save Config</button>
 </form>
-</div>
+</details>
 
 <div class="grid">
 <div class="card">
@@ -1008,6 +1272,14 @@ h2 {{ margin-top:0; }}
 </div>
 
 <div class="card">
+<h2>Release Notes</h2>
+<p>{release_notes_message}</p>
+<form method="POST" action="/check-release-notes">
+<button type="submit">Check Release Notes</button>
+</form>
+</div>
+
+<div class="card">
 <h2>Software Update</h2>
 <p>{ota_message}</p>
 <form method="POST" action="/check-update">
@@ -1024,6 +1296,13 @@ h2 {{ margin-top:0; }}
 <label>Admin PIN</label>
 <input name="admin_pin" type="password" placeholder="Enter PIN">
 <button class="red" type="submit">Rollback to Previous Version</button>
+</form>
+<br>
+<p>{auto_recovery_message}</p>
+<form method="POST" action="/install-auto-recovery" onsubmit="return confirm('Install auto-recovery launcher to code.py?');">
+<label>Admin PIN</label>
+<input name="admin_pin" type="password" placeholder="Enter PIN">
+<button class="orange" type="submit">Install Auto-Recovery Launcher</button>
 </form>
 </div>
 
@@ -1070,6 +1349,52 @@ def clean_page(title, message):
     ).format(title, message)
 
 
+@server.route("/setup-wizard")
+def setup_wizard_route(request: Request):
+    return Response(request, setup_wizard_page(), content_type="text/html")
+
+
+@server.route("/save-customer-setup", methods=["POST"])
+def save_customer_setup(request: Request):
+    global SYMBOLS, need_reload, config, BRIGHTNESS_TARGET
+
+    try:
+        form = request.form_data
+
+        config["device_name"] = url_decode(str(form.get("device_name", config.get("device_name", "StockTicker")))).strip() or "StockTicker"
+        config["finnhub_api_key"] = url_decode(str(form.get("finnhub_api_key", config.get("finnhub_api_key", "")))).strip()
+        config["admin_pin"] = url_decode(str(form.get("admin_pin", config.get("admin_pin", "1234")))).strip() or "1234"
+        config["brightness"] = clamp_float(form.get("brightness", config.get("brightness", 0.30)), 0.0, 1.0, DEFAULT_CONFIG["brightness"])
+        config["show_logos"] = bool_from_form(form.get("show_logos", config.get("show_logos", True)))
+
+        channel = url_decode(str(form.get("update_channel", config.get("update_channel", "stable")))).strip().lower()
+        config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
+
+        raw = url_decode(str(form.get("symbols", "")))
+        new_symbols = []
+        seen = set()
+        for line in raw.replace(",", "\n").replace("\r", "\n").split("\n"):
+            sym = clean_symbol(line)
+            if sym and sym not in seen:
+                new_symbols.append(sym)
+                seen.add(sym)
+
+        if new_symbols:
+            SYMBOLS = new_symbols
+            save_symbol_list(SYMBOLS)
+
+        save_config(config)
+        BRIGHTNESS_TARGET = float(config["brightness"])
+        need_reload = True
+        set_web_message("Customer setup saved.")
+
+        return Response(request, clean_page("Setup Saved", "Customer setup was saved."), content_type="text/html")
+
+    except Exception as e:
+        set_error_message("Customer setup save failed: " + repr(e))
+        return Response(request, clean_page("Setup Failed", last_error_message), content_type="text/html")
+
+
 @server.route("/")
 def index(request: Request):
     current_market_status = get_market_status(eastern_time_now())
@@ -1078,6 +1403,7 @@ def index(request: Request):
         request,
         HTML.format(
             version=APP_VERSION,
+            device_name=safe_html(config.get("device_name", "StockTicker Dashboard")),
             device_id=DEVICE_ID,
             ip=ip,
             market_status=current_market_status,
@@ -1099,6 +1425,10 @@ def index(request: Request):
             quote_freshness_message=build_quote_freshness_html(),
             system_health_message=build_system_health_html(),
             event_log_message=build_event_log_html(),
+            logo_status_message=build_logo_status_html(),
+            release_notes_message=release_notes_message,
+            auto_recovery_message=auto_recovery_message,
+            api_key_status=safe_html(get_api_key_status()),
             last_update=last_update_text,
             last_web_message=last_web_message,
             last_error_message=last_error_message,
@@ -1120,6 +1450,8 @@ def index(request: Request):
             dollar_false_selected=selected("false", str(config.get("show_dollar_change", True)).lower()),
             percent_true_selected=selected("true", str(config.get("show_percent_change", True)).lower()),
             percent_false_selected=selected("false", str(config.get("show_percent_change", True)).lower()),
+            logos_true_selected=selected("true", str(config.get("show_logos", True)).lower()),
+            logos_false_selected=selected("false", str(config.get("show_logos", True)).lower()),
             stable_selected=selected("stable", config.get("update_channel", "stable")),
             beta_selected=selected("beta", config.get("update_channel", "stable")),
             after_purple_selected=selected("purple", config.get("after_hours_color", "purple")),
@@ -1142,7 +1474,13 @@ def test_quote_route(request: Request):
         return Response(request, clean_page("Test Failed", test_quote_message), content_type="text/html")
 
     try:
-        url = FINNHUB_URL.format(sym, secrets["finnhub_api_key"])
+        api_key = get_finnhub_api_key()
+        if not api_key:
+            test_quote_message = "Missing Finnhub API key. Open Setup Wizard and save an API key."
+            set_error_message(test_quote_message)
+            return Response(request, clean_page("Test Failed", test_quote_message), content_type="text/html")
+
+        url = FINNHUB_URL.format(sym, api_key)
         r = requests.get(url)
         data = r.json()
         r.close()
@@ -1179,7 +1517,12 @@ def validate_symbols_route(request: Request):
             pass
 
         try:
-            url = FINNHUB_URL.format(sym, secrets["finnhub_api_key"])
+            api_key = get_finnhub_api_key()
+            if not api_key:
+                invalid.append(sym)
+                continue
+
+            url = FINNHUB_URL.format(sym, api_key)
             r = requests.get(url)
             data = r.json()
             r.close()
@@ -1299,6 +1642,7 @@ def save_cfg(request: Request):
         config["alert_enabled"] = bool_from_form(form.get("alert_enabled", config.get("alert_enabled", True)))
         config["show_dollar_change"] = bool_from_form(form.get("show_dollar_change", config.get("show_dollar_change", True)))
         config["show_percent_change"] = bool_from_form(form.get("show_percent_change", config.get("show_percent_change", True)))
+        config["show_logos"] = bool_from_form(form.get("show_logos", config.get("show_logos", True)))
         config["show_stale_marker"] = bool_from_form(form.get("show_stale_marker", config.get("show_stale_marker", True)))
         config["smooth_quote_refresh"] = bool_from_form(form.get("smooth_quote_refresh", config.get("smooth_quote_refresh", True)))
 
@@ -1522,7 +1866,11 @@ def check_cloud_status(request: Request):
         set_error_message("OTA status check failed: " + repr(e))
 
     try:
-        url = FINNHUB_URL.format("AAPL", secrets["finnhub_api_key"])
+        api_key = get_finnhub_api_key()
+        if not api_key:
+            raise Exception("Missing Finnhub API key")
+
+        url = FINNHUB_URL.format("AAPL", api_key)
         r = requests.get(url)
         data = r.json()
         r.close()
@@ -1575,6 +1923,135 @@ def check_ota_status(request: Request):
     set_web_message("OTA status checked.")
 
     return Response(request, clean_page("OTA Status Checked", "OTA status section updated."), content_type="text/html")
+
+
+LAUNCHER_CODE = r'''# code.py - AUTO_RECOVERY_LAUNCHER_V1
+# Safe launcher for StockTicker. It restores app_backup.py after repeated app.py crashes.
+
+import time
+import json
+import microcontroller
+
+CRASH_FILE = "/crash_count.json"
+APP_PATH = "/app.py"
+BACKUP_PATH = "/app_backup.py"
+MAX_CRASHES = 3
+
+
+def load_json(path, default):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print("Could not save", path, repr(e))
+
+
+def exists(path):
+    try:
+        with open(path, "rb") as f:
+            f.read(1)
+        return True
+    except Exception:
+        return False
+
+
+def copy_file(src, dst):
+    with open(src, "rb") as source:
+        data = source.read()
+    with open(dst, "wb") as target:
+        target.write(data)
+
+
+def increment_crash_count(error_text):
+    info = load_json(CRASH_FILE, {})
+    count = int(info.get("count", 0)) + 1
+    info["count"] = count
+    info["last_error"] = str(error_text)[:180]
+    save_json(CRASH_FILE, info)
+    return count
+
+
+def restore_backup_and_reset():
+    print("AUTO RECOVERY: restoring app_backup.py to app.py")
+    copy_file(BACKUP_PATH, APP_PATH)
+    save_json(CRASH_FILE, {"count": 0, "restored_backup": True})
+    time.sleep(1)
+    microcontroller.reset()
+
+
+try:
+    import app
+
+except Exception as e:
+    print("APP CRASHED:", repr(e))
+
+    try:
+        import traceback
+        traceback.print_exception(e)
+    except Exception:
+        pass
+
+    crashes = increment_crash_count(repr(e))
+    print("Crash count:", crashes)
+
+    if crashes >= MAX_CRASHES and exists(BACKUP_PATH):
+        try:
+            restore_backup_and_reset()
+        except Exception as restore_error:
+            print("AUTO RECOVERY RESTORE FAILED:", repr(restore_error))
+
+    try:
+        import recovery
+    except Exception as recovery_error:
+        print("RECOVERY ALSO FAILED:", repr(recovery_error))
+        while True:
+            time.sleep(1)
+'''
+
+@server.route("/check-release-notes", methods=["POST"])
+def check_release_notes(request: Request):
+    global release_notes_message, ota_status_message
+
+    manifest = fetch_update_manifest()
+    release_notes_message = build_release_notes_html(manifest)
+    ota_status_message = build_ota_status_summary(manifest)
+    set_web_message("Release notes checked.")
+
+    return Response(request, clean_page("Release Notes Checked", "Release notes updated."), content_type="text/html")
+
+
+@server.route("/install-auto-recovery", methods=["POST"])
+def install_auto_recovery(request: Request):
+    global auto_recovery_message
+
+    entered_pin = url_decode(str(request.form_data.get("admin_pin", "")))
+
+    if entered_pin != str(config["admin_pin"]):
+        auto_recovery_message = "Auto-recovery install blocked: wrong admin PIN."
+        set_error_message(auto_recovery_message)
+        return Response(request, clean_page("Install Blocked", auto_recovery_message), content_type="text/html")
+
+    try:
+        with open("/code.py", "w") as f:
+            f.write(LAUNCHER_CODE)
+
+        auto_recovery_message = "Auto-recovery launcher installed to code.py. It activates on the next restart."
+        set_web_message(auto_recovery_message)
+
+        return Response(request, clean_page("Auto-Recovery Installed", auto_recovery_message), content_type="text/html")
+
+    except Exception as e:
+        auto_recovery_message = "Auto-recovery install failed."
+        set_error_message("Auto-recovery install failed: " + repr(e))
+        return Response(request, clean_page("Install Failed", last_error_message), content_type="text/html")
 
 
 @server.route("/check-update", methods=["POST"])
@@ -1803,6 +2280,10 @@ root.append(clock_label)
 def load_logos():
     logos = {}
 
+    if not config.get("show_logos", True):
+        print("Logos disabled by setting.")
+        return logos
+
     for sym in SYMBOLS:
         path = "/logos/{}.bmp".format(sym)
         try:
@@ -1838,9 +2319,14 @@ def update_header():
 def fetch_quote(sym):
     now_text = format_12h(eastern_time_now())
     now_mono = time.monotonic()
+    api_key = get_finnhub_api_key()
+
+    if not api_key:
+        set_error_message("Missing Finnhub API key. Open Setup Wizard and save an API key.")
+        return cached_or_error_quote(sym, "missing API key")
 
     try:
-        url = FINNHUB_URL.format(sym, secrets["finnhub_api_key"])
+        url = FINNHUB_URL.format(sym, api_key)
         r = requests.get(url)
         data = r.json()
         r.close()
