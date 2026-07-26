@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.9-beta"
+APP_VERSION = "1.1.10-beta"
 
 import time
 import ssl
@@ -52,7 +52,8 @@ DEFAULT_CONFIG = {
     "show_percent_change": True,
     "after_hours_color": "purple",
     "stale_quote_minutes": 15,
-    "show_stale_marker": True
+    "show_stale_marker": True,
+    "smooth_quote_refresh": True
 }
 
 DEFAULT_SYMBOLS = [
@@ -325,6 +326,7 @@ ALERT_PERCENT_MOVE = float(config["alert_percent_move"])
 ALERT_ENABLED = bool_from_form(config.get("alert_enabled", True))
 BLOCK_GAP = int(config["block_gap"])
 SCROLL_DELAY = float(config["scroll_delay"])
+SMOOTH_QUOTE_REFRESH = bool_from_form(config.get("smooth_quote_refresh", True))
 
 need_reload = False
 refresh_requested = False
@@ -942,6 +944,12 @@ h2 {{ margin-top:0; }}
 <input name="fetch_interval_pre_after" value="{fetch_interval_pre_after}">
 <label>Closed Refresh Seconds</label>
 <input name="fetch_interval_closed" value="{fetch_interval_closed}">
+<label>Smooth Quote Refresh</label>
+<select name="smooth_quote_refresh">
+<option value="true" {smooth_true_selected}>True</option>
+<option value="false" {smooth_false_selected}>False</option>
+</select>
+<p class="small">True = fetches one symbol at a time and updates text when a block is off-screen.</p>
 <label>Price Alerts Enabled</label>
 <select name="alert_enabled">
 <option value="true" {alert_true_selected}>True</option>
@@ -1106,6 +1114,8 @@ def index(request: Request):
             alert_false_selected=selected("false", str(config.get("alert_enabled", True)).lower()),
             stale_true_selected=selected("true", str(config.get("show_stale_marker", True)).lower()),
             stale_false_selected=selected("false", str(config.get("show_stale_marker", True)).lower()),
+            smooth_true_selected=selected("true", str(config.get("smooth_quote_refresh", True)).lower()),
+            smooth_false_selected=selected("false", str(config.get("smooth_quote_refresh", True)).lower()),
             dollar_true_selected=selected("true", str(config.get("show_dollar_change", True)).lower()),
             dollar_false_selected=selected("false", str(config.get("show_dollar_change", True)).lower()),
             percent_true_selected=selected("true", str(config.get("show_percent_change", True)).lower()),
@@ -1263,6 +1273,7 @@ def save_cfg(request: Request):
     global SCROLL_SPEED_CLOSED
     global BLOCK_GAP
     global SCROLL_DELAY
+    global SMOOTH_QUOTE_REFRESH
     global need_reload
 
     try:
@@ -1289,6 +1300,7 @@ def save_cfg(request: Request):
         config["show_dollar_change"] = bool_from_form(form.get("show_dollar_change", config.get("show_dollar_change", True)))
         config["show_percent_change"] = bool_from_form(form.get("show_percent_change", config.get("show_percent_change", True)))
         config["show_stale_marker"] = bool_from_form(form.get("show_stale_marker", config.get("show_stale_marker", True)))
+        config["smooth_quote_refresh"] = bool_from_form(form.get("smooth_quote_refresh", config.get("smooth_quote_refresh", True)))
 
         channel = url_decode(str(form.get("update_channel", config["update_channel"]))).strip().lower()
         config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
@@ -1310,6 +1322,7 @@ def save_cfg(request: Request):
         SCROLL_SPEED_CLOSED = float(config["scroll_speed_closed"])
         BLOCK_GAP = int(config["block_gap"])
         SCROLL_DELAY = float(config["scroll_delay"])
+        SMOOTH_QUOTE_REFRESH = bool_from_form(config.get("smooth_quote_refresh", True))
 
         need_reload = True
         set_web_message("Settings saved.")
@@ -1362,7 +1375,10 @@ def save_holidays_route(request: Request):
 def refresh_now(request: Request):
     global refresh_requested
     refresh_requested = True
-    set_web_message("Manual quote refresh requested.")
+    if SMOOTH_QUOTE_REFRESH:
+        set_web_message("Manual quote refresh queued for smooth update.")
+    else:
+        set_web_message("Manual quote refresh requested.")
 
     return Response(request, clean_page("Refresh Requested", "Quotes will refresh after the current scroll cycle."), content_type="text/html")
 
@@ -1874,21 +1890,8 @@ def fetch_quote(sym):
         set_error_message("Fetch error for {}: {}".format(sym, reason))
         return cached_or_error_quote(sym, "fetch error")
 
-def fetch_entries():
+def finalize_quote_batch(entries, success_message):
     global last_update_text, alert_message, quote_freshness_message
-
-    entries = []
-
-    for sym in SYMBOLS:
-        try:
-            server.poll()
-        except Exception:
-            pass
-
-        e = fetch_quote(sym)
-        entries.append(e)
-        last_good[sym] = e
-        gc.collect()
 
     last_update_text = format_12h(eastern_time_now())
 
@@ -1917,11 +1920,69 @@ def fetch_entries():
     if stale_symbols:
         set_error_message("Stale quotes: " + ", ".join(stale_symbols))
     else:
-        set_web_message("Quotes refreshed at " + last_update_text)
+        set_web_message(success_message + " at " + last_update_text)
 
     quote_freshness_message = build_quote_freshness_html()
 
+
+def fetch_entries():
+    entries = []
+
+    for sym in SYMBOLS:
+        try:
+            server.poll()
+        except Exception:
+            pass
+
+        e = fetch_quote(sym)
+        entries.append(e)
+        last_good[sym] = e
+        gc.collect()
+
+    finalize_quote_batch(entries, "Quotes refreshed")
+
     return entries
+
+
+def start_smooth_quote_refresh(reason):
+    global smooth_refresh_active, smooth_refresh_index, refresh_requested
+
+    smooth_refresh_active = True
+    smooth_refresh_index = 0
+    refresh_requested = False
+    add_event("Smooth quote refresh started: " + reason)
+
+
+def smooth_quote_refresh_step():
+    global smooth_refresh_active, smooth_refresh_index, pending_entries
+
+    if not smooth_refresh_active:
+        return
+
+    if smooth_refresh_index >= len(SYMBOLS):
+        smooth_refresh_active = False
+        finalize_quote_batch(pending_entries, "Smooth quotes refreshed")
+        return
+
+    sym = SYMBOLS[smooth_refresh_index]
+
+    try:
+        server.poll()
+    except Exception:
+        pass
+
+    e = fetch_quote(sym)
+    last_good[sym] = e
+    replace_entry_for_symbol(pending_entries, e)
+
+    smooth_refresh_index += 1
+
+    if smooth_refresh_index >= len(SYMBOLS):
+        smooth_refresh_active = False
+        finalize_quote_batch(pending_entries, "Smooth quotes refreshed")
+
+    gc.collect()
+
 
 def display_change_color(entry, after_hours):
     if after_hours and config.get("after_hours_color", "purple") == "purple":
@@ -1966,28 +2027,65 @@ def create_block(entry, after_hours):
         "symbol": sym,
         "x": 0.0,
         "width": float(width),
+        "x_offset": x_offset,
         "price_label": top,
         "change_label": bottom
     }
 
 
+def apply_entry_to_block(block, entry, after_hours):
+    color = display_change_color(entry, after_hours)
+
+    changed = False
+
+    if block["price_label"].text != entry["price_line"]:
+        block["price_label"].text = entry["price_line"]
+        changed = True
+
+    if block["change_label"].text != entry["change_line"]:
+        block["change_label"].text = entry["change_line"]
+        changed = True
+
+    if block["change_label"].color != color:
+        block["change_label"].color = color
+
+    if changed:
+        try:
+            x_offset = int(block.get("x_offset", 0))
+            block["width"] = float(max(115, x_offset + max(block["price_label"].bounding_box[2], block["change_label"].bounding_box[2]) + 6))
+        except Exception:
+            pass
+
+
+def get_entry_for_symbol(entry_list, sym):
+    for e in entry_list:
+        try:
+            if e.get("symbol") == sym:
+                return e
+        except Exception:
+            pass
+    return None
+
+
+def replace_entry_for_symbol(entry_list, new_entry):
+    sym = new_entry.get("symbol", "")
+
+    for i in range(len(entry_list)):
+        try:
+            if entry_list[i].get("symbol") == sym:
+                entry_list[i] = new_entry
+                return
+        except Exception:
+            pass
+
+    entry_list.append(new_entry)
+
+
 def update_blocks_from_entries(blocks, entries, after_hours):
-    n = min(len(blocks), len(entries))
-
-    for i in range(n):
-        entry = entries[i]
-        block = blocks[i]
-
-        color = display_change_color(entry, after_hours)
-
-        if block["price_label"].text != entry["price_line"]:
-            block["price_label"].text = entry["price_line"]
-
-        if block["change_label"].text != entry["change_line"]:
-            block["change_label"].text = entry["change_line"]
-
-        if block["change_label"].color != color:
-            block["change_label"].color = color
+    for block in blocks:
+        entry = get_entry_for_symbol(entries, block["symbol"])
+        if entry:
+            apply_entry_to_block(block, entry, after_hours)
 
 
 def remove_blocks(blocks):
@@ -2016,8 +2114,11 @@ status = update_header()
 after_hours = status != "OPN"
 
 entries = fetch_entries()
+pending_entries = entries[:]
 blocks = build_blocks(entries, after_hours)
 last_quote_fetch = time.monotonic()
+smooth_refresh_active = False
+smooth_refresh_index = 0
 
 completed_loops = 0
 
@@ -2051,6 +2152,11 @@ while True:
 
     for b in blocks:
         if b["x"] + b["width"] < 0:
+            if SMOOTH_QUOTE_REFRESH:
+                pe = get_entry_for_symbol(pending_entries, b["symbol"])
+                if pe:
+                    apply_entry_to_block(b, pe, after_hours)
+
             b["x"] = max_right + BLOCK_GAP
             b["group"].x = int(b["x"])
             max_right = b["x"] + b["width"]
@@ -2069,13 +2175,28 @@ while True:
     time_for_quote_fetch = now - last_quote_fetch >= fetch_interval
     full_scroll_done = completed_loops >= len(blocks)
 
-    if (refresh_requested or (time_for_quote_fetch and full_scroll_done)) and not need_reload:
-        completed_loops = 0
-        refresh_requested = False
-        last_quote_fetch = now
+    if SMOOTH_QUOTE_REFRESH:
+        if smooth_refresh_active and loop_completed:
+            smooth_quote_refresh_step()
 
-        new_entries = fetch_entries()
-        update_blocks_from_entries(blocks, new_entries, after_hours)
+        if (refresh_requested or time_for_quote_fetch) and full_scroll_done and not need_reload and not smooth_refresh_active:
+            completed_loops = 0
+            last_quote_fetch = now
+
+            if refresh_requested:
+                start_smooth_quote_refresh("manual request")
+            else:
+                start_smooth_quote_refresh("scheduled refresh")
+
+    else:
+        if (refresh_requested or (time_for_quote_fetch and full_scroll_done)) and not need_reload:
+            completed_loops = 0
+            refresh_requested = False
+            last_quote_fetch = now
+
+            new_entries = fetch_entries()
+            pending_entries = new_entries[:]
+            update_blocks_from_entries(blocks, new_entries, after_hours)
 
     if need_reload:
         need_reload = False
@@ -2083,6 +2204,9 @@ while True:
         remove_blocks(blocks)
         logos = load_logos()
         entries = fetch_entries()
+        pending_entries = entries[:]
+        smooth_refresh_active = False
+        smooth_refresh_index = 0
         blocks = build_blocks(entries, after_hours)
         last_quote_fetch = now
 
