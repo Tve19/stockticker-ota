@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.15-beta"
+APP_VERSION = "1.1.16-beta"
 
 import time
 import ssl
@@ -839,6 +839,197 @@ def panel_state_text():
     return "Awake"
 
 
+def yes_no(value):
+    return "Yes" if value else "No"
+
+
+def setup_blocking_issues():
+    issues = []
+
+    try:
+        if not wifi.radio.connected:
+            issues.append("Connect the device to WiFi.")
+    except Exception:
+        issues.append("Connect the device to WiFi.")
+
+    if not is_demo_mode() and not get_saved_customer_api_key():
+        issues.append("Save a Finnhub API key or turn on Demo Mode.")
+
+    if len(SYMBOLS) <= 0:
+        issues.append("Add at least one stock symbol.")
+
+    return issues
+
+
+def setup_recommendations():
+    items = []
+
+    if str(config.get("admin_pin", "1234")) == "1234":
+        items.append("Change the default admin PIN before selling or gifting this device.")
+
+    if not file_exists(BACKUP_APP_PATH):
+        items.append("Create an OTA backup by installing one known-good update before final use.")
+
+    return items
+
+
+def build_onboarding_message_html():
+    blocking = setup_blocking_issues()
+
+    if blocking:
+        lis = ""
+        for item in blocking:
+            lis += "<li>{}</li>".format(safe_html(item))
+        return (
+            "<div class='onboard warn'><b>Setup Needed</b>"
+            "<div class='small'>Finish these items before using live stock quotes:</div>"
+            "<ul>{}</ul>"
+            "<form method='GET' action='/setup-wizard'><button type='submit'>Open Setup Wizard</button></form>"
+            "</div>"
+        ).format(lis)
+
+    recs = setup_recommendations()
+
+    if recs:
+        lis = ""
+        for item in recs[:2]:
+            lis += "<li>{}</li>".format(safe_html(item))
+        return (
+            "<div class='onboard'><b>Recommended Before Final Use</b>"
+            "<ul>{}</ul>"
+            "</div>"
+        ).format(lis)
+
+    return ""
+
+
+def safe_config_export_dict():
+    export_config = {}
+
+    keys = []
+    for key in DEFAULT_CONFIG:
+        keys.append(key)
+
+    for key in config:
+        if key not in keys:
+            keys.append(key)
+
+    for key in keys:
+        if key not in config:
+            continue
+
+        if key == "finnhub_api_key":
+            if get_saved_customer_api_key():
+                export_config[key] = "__SAVED_KEY_HIDDEN__"
+            else:
+                export_config[key] = ""
+        else:
+            export_config[key] = config[key]
+
+    return {
+        "backup_type": "StockTicker safe config backup",
+        "app_version": APP_VERSION,
+        "device_id": DEVICE_ID,
+        "ip": ip,
+        "api_key_saved": bool(get_saved_customer_api_key()),
+        "wifi_password_included": False,
+        "symbols": SYMBOLS,
+        "config": export_config
+    }
+
+
+def build_safe_config_backup_text():
+    try:
+        return json.dumps(safe_config_export_dict())
+    except Exception as e:
+        return "Config export failed: " + repr(e)
+
+
+def build_symbols_backup_text():
+    if not SYMBOLS:
+        return "No symbols saved."
+
+    return "\n".join(SYMBOLS) + "\n"
+
+
+def build_support_report_text():
+    found, missing = count_missing_logos()
+    lines = []
+
+    lines.append("StockTicker Support Report")
+    lines.append("==========================")
+    lines.append("Device Name: " + str(config.get("device_name", "StockTicker")))
+    lines.append("Device ID: " + str(DEVICE_ID))
+    lines.append("App Version: " + str(APP_VERSION))
+    lines.append("IP Address: " + str(ip))
+    lines.append("System Health: " + system_health_state()[1])
+    lines.append("Panel Display: " + panel_state_text())
+    lines.append("Market Status: " + get_market_status(eastern_time_now()))
+    lines.append("Quote Status: " + quote_status_short())
+    lines.append("WiFi Connected: " + yes_no(wifi.radio.connected))
+    lines.append("Time Sync OK: " + yes_no(time_sync_ok))
+    lines.append("Demo Mode: " + yes_no(is_demo_mode()))
+    lines.append("Customer API Key Required: " + yes_no(customer_api_required()))
+    lines.append("API Key Saved: " + yes_no(bool(get_saved_customer_api_key())))
+    lines.append("Admin PIN Changed: " + yes_no(str(config.get("admin_pin", "1234")) != "1234"))
+    lines.append("Update Channel: " + str(config.get("update_channel", "stable")))
+    lines.append("Manifest URL: " + str(config.get("update_manifest_url", "")))
+    lines.append("Backup App Found: " + yes_no(file_exists(BACKUP_APP_PATH)))
+    lines.append("Auto-Recovery Launcher: " + launcher_status_text())
+    lines.append("Logos: {} found / {} text fallback".format(found, missing))
+    lines.append("Brightness: " + str(config.get("brightness", "")))
+    lines.append("Scroll Speed Open: " + str(config.get("scroll_speed_open", "")))
+    lines.append("Scroll Speed Closed: " + str(config.get("scroll_speed_closed", "")))
+    lines.append("Scroll Delay: " + str(config.get("scroll_delay", "")))
+    lines.append("Block Gap: " + str(config.get("block_gap", "")))
+    lines.append("Last Error: " + str(last_error_message))
+    lines.append("")
+    lines.append("Symbols")
+    lines.append("-------")
+    for sym in SYMBOLS:
+        lines.append(sym + " - Logo: " + logo_status_for_symbol(sym))
+    lines.append("")
+    lines.append("Setup Progress")
+    lines.append("--------------")
+    for ok, label in setup_completion_counts():
+        lines.append(("OK - " if ok else "ACTION - ") + label)
+    lines.append("")
+    lines.append("Event Log")
+    lines.append("---------")
+    if event_log:
+        for item in event_log:
+            lines.append(str(item))
+    else:
+        lines.append("No events yet.")
+
+    return "\n".join(lines)
+
+
+def export_page(title, body):
+    return """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>{}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+.wrap {{ max-width:920px; margin:0 auto; }}
+.card {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }}
+pre {{ white-space:pre-wrap; word-break:break-word; background:#07111f; border:1px solid #243657; border-radius:12px; padding:12px; }}
+a {{ color:#79c7ff; }}
+.small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="card"><h1>{}</h1><p class="small">This page is safe to screenshot or copy. API keys and WiFi passwords are not shown.</p><pre>{}</pre><p><a href="/">Back to Dashboard</a></p></div>
+</div>
+</body>
+</html>
+""".format(safe_html(title), safe_html(title), safe_html(body))
+
+
 def demo_quote(sym):
     now_text = format_12h(eastern_time_now())
     now_mono = time.monotonic()
@@ -1346,6 +1537,10 @@ button {{ padding:10px 14px; border:0; border-radius:10px; background:#1f8cff; c
 .warnbadge {{ background:#3a2c10; color:#ffd166; border:1px solid #7a5b17; }}
 .badbadge {{ background:#3a1515; color:#ff8b8b; border:1px solid #733333; }}
 .infobadge {{ background:#102c3a; color:#8edbff; border:1px solid #2a6683; }}
+.onboard {{ background:#162640; border:1px solid #315888; border-radius:14px; padding:12px; margin:12px 0 0; }}
+.onboard.warn {{ background:#33280f; border-color:#7a5b17; }}
+.onboard b {{ display:block; margin-bottom:4px; }}
+.onboard ul {{ margin:6px 0 10px 20px; padding:0; }}
 .errorbox {{ background:#2b171b; border:1px solid #803d46; border-radius:12px; padding:10px; margin-top:10px; color:#ffd9df; }}
 .quiet-ok {{ background:#102a1c; border:1px solid #226d3d; border-radius:12px; padding:10px; margin-top:10px; color:#92ffad; }}
 .smallbtn {{ padding:6px 9px; font-size:12px; margin-top:8px; }}
@@ -1381,6 +1576,7 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </div>
 <p class="good">Status: {last_web_message}</p>
 {last_error_panel}
+{onboarding_message}
 </div>
 
 <div class="grid">
@@ -1531,6 +1727,13 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <h2>Memory / Disk Health</h2>
 <p>{system_health_message}</p>
 <form method="POST" action="/check-system-health"><button type="submit">Check System Health</button></form>
+</div>
+<div class="card">
+<h2>Backup / Export</h2>
+<p class="small">Safe exports hide API keys and WiFi passwords. Use these for troubleshooting or saving a copy of the setup.</p>
+<form method="GET" action="/support-report"><button type="submit">View Support Report</button></form>
+<form method="GET" action="/config-backup"><button type="submit">View Config Backup</button></form>
+<form method="GET" action="/symbols-backup"><button type="submit">View Symbols Backup</button></form>
 </div>
 <div class="card">
 <h2>OTA Status</h2>
@@ -1689,6 +1892,21 @@ def help_route(request: Request):
     return Response(request, help_page(), content_type="text/html")
 
 
+@server.route("/support-report")
+def support_report_route(request: Request):
+    return Response(request, export_page("Support Report", build_support_report_text()), content_type="text/html")
+
+
+@server.route("/config-backup")
+def config_backup_route(request: Request):
+    return Response(request, export_page("Safe Config Backup", build_safe_config_backup_text()), content_type="text/html")
+
+
+@server.route("/symbols-backup")
+def symbols_backup_route(request: Request):
+    return Response(request, export_page("Symbols Backup", build_symbols_backup_text()), content_type="text/html")
+
+
 @server.route("/clear-last-error", methods=["POST"])
 def clear_last_error_route(request: Request):
     global last_error_message
@@ -1773,6 +1991,7 @@ def index(request: Request):
             panel_state=panel_state_text(),
             logo_summary_short=logo_summary_text(),
             last_error_panel=last_error_panel_html(),
+            onboarding_message=build_onboarding_message_html(),
             symbols="\n".join(SYMBOLS),
             brightness=config["brightness"],
             alert_percent_move=config["alert_percent_move"],
