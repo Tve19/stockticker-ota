@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.8-beta"
+APP_VERSION = "1.1.9-beta"
 
 import time
 import ssl
@@ -17,6 +17,7 @@ import terminalio
 import gc
 import json
 import microcontroller
+import os
 
 from adafruit_display_text import label
 from secrets import secrets
@@ -49,7 +50,9 @@ DEFAULT_CONFIG = {
     "alert_enabled": True,
     "show_dollar_change": True,
     "show_percent_change": True,
-    "after_hours_color": "purple"
+    "after_hours_color": "purple",
+    "stale_quote_minutes": 15,
+    "show_stale_marker": True
 }
 
 DEFAULT_SYMBOLS = [
@@ -336,18 +339,196 @@ last_error_message = "None yet."
 test_quote_message = "No quote tested yet."
 cloud_status_message = "Cloud status not checked yet."
 alert_message = "No price alerts yet."
+quote_freshness_message = "No quote freshness checked yet."
+system_health_message = "Press Check System Health to refresh memory and disk stats."
 time_sync_ok = False
+boot_time = time.monotonic()
+event_log = []
+MAX_EVENT_LOG = 20
+
+def safe_html(text):
+    text = str(text)
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
+
+def add_event(message):
+    try:
+        stamp = format_12h(eastern_time_now())
+    except Exception:
+        stamp = str(int(time.monotonic())) + "s"
+
+    entry = "{} - {}".format(stamp, str(message))
+    event_log.append(entry[:160])
+
+    while len(event_log) > MAX_EVENT_LOG:
+        del event_log[0]
+
+
+def build_event_log_html():
+    if not event_log:
+        return "No events yet."
+
+    lines = []
+
+    for item in reversed(event_log):
+        lines.append(safe_html(item))
+
+    return "<br>".join(lines)
+
+
+def file_size_text(path):
+    try:
+        st = os.stat(path)
+        return str(st[6]) + " bytes"
+    except Exception:
+        return "missing"
+
+
+def build_system_health_html():
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+    try:
+        free_mem = gc.mem_free()
+    except Exception:
+        free_mem = "n/a"
+
+    try:
+        used_mem = gc.mem_alloc()
+    except Exception:
+        used_mem = "n/a"
+
+    try:
+        stat = os.statvfs("/")
+        block_size = stat[0]
+        total_disk = block_size * stat[2]
+        free_disk = block_size * stat[3]
+        disk_text = "{} free / {} total bytes".format(free_disk, total_disk)
+    except Exception as e:
+        disk_text = "unavailable: " + repr(e)
+
+    uptime = int(time.monotonic() - boot_time)
+    hours = uptime // 3600
+    minutes = (uptime % 3600) // 60
+    seconds = uptime % 60
+
+    return (
+        "Uptime: {}h {}m {}s<br>"
+        "Free Memory: {} bytes<br>"
+        "Used Memory: {} bytes<br>"
+        "Disk: {}<br>"
+        "app.py Size: {}<br>"
+        "Backup Size: {}"
+    ).format(
+        hours,
+        minutes,
+        seconds,
+        free_mem,
+        used_mem,
+        disk_text,
+        file_size_text(APP_PATH),
+        file_size_text(BACKUP_APP_PATH)
+    )
+
+
+def age_minutes(entry):
+    try:
+        updated = float(entry.get("updated_mono", 0))
+        if updated <= 0:
+            return 9999
+        return int((time.monotonic() - updated) / 60)
+    except Exception:
+        return 9999
+
+
+def quote_is_stale(entry):
+    try:
+        limit_minutes = int(config.get("stale_quote_minutes", 15))
+    except Exception:
+        limit_minutes = 15
+
+    return bool(entry.get("stale", False)) or age_minutes(entry) >= limit_minutes
+
+
+def cached_or_error_quote(sym, reason):
+    if sym in last_good:
+        old = last_good[sym]
+        e = {}
+
+        for key in old:
+            e[key] = old[key]
+
+        e["stale"] = True
+        e["used_cached"] = True
+        e["error_reason"] = reason
+
+        if config.get("show_stale_marker", True):
+            cl = str(e.get("change_line", ""))
+            if "OLD" not in cl:
+                if cl:
+                    e["change_line"] = cl + " OLD"
+                else:
+                    e["change_line"] = "OLD"
+
+        add_event("Using cached quote for {}: {}".format(sym, reason))
+        return e
+
+    add_event("No quote data for {}: {}".format(sym, reason))
+
+    return {
+        "symbol": sym,
+        "price_line": "${} ERROR".format(sym),
+        "change_line": "NO DATA",
+        "color": 0xFF0000,
+        "pct": 0,
+        "updated_text": "never",
+        "updated_mono": 0,
+        "stale": True,
+        "used_cached": False,
+        "error_reason": reason
+    }
+
+
+def build_quote_freshness_html():
+    if not SYMBOLS:
+        return "No symbols saved."
+
+    lines = []
+
+    for sym in SYMBOLS:
+        if sym not in last_good:
+            lines.append("{}: No data yet".format(sym))
+        else:
+            e = last_good[sym]
+            mins = age_minutes(e)
+            state = "STALE" if quote_is_stale(e) else "OK"
+            cached = " cached" if e.get("used_cached", False) else ""
+            updated = e.get("updated_text", "unknown")
+            lines.append("{}: {} - {} min old{} - {}".format(sym, state, mins, cached, updated))
+
+    return "<br>".join(lines)
+
 
 def set_web_message(message):
     global last_web_message
     last_web_message = message
+    add_event(message)
     print("WEB STATUS:", message)
 
 
 def set_error_message(message):
     global last_error_message
     last_error_message = message
+    add_event("ERROR: " + str(message))
     print("WEB ERROR:", message)
+
+
+add_event("Booted " + APP_VERSION)
 
 
 def start_setup_mode(reason):
@@ -660,6 +841,31 @@ h2 {{ margin-top:0; }}
 </div>
 </div>
 
+<div class="grid">
+<div class="card">
+<h2>Quote Freshness</h2>
+<p>{quote_freshness_message}</p>
+<p class="small">STALE means the panel is using old/cached data instead of a fresh quote.</p>
+</div>
+
+<div class="card">
+<h2>Memory / Disk Health</h2>
+<p>{system_health_message}</p>
+<form method="POST" action="/check-system-health">
+<button type="submit">Check System Health</button>
+</form>
+</div>
+</div>
+
+<div class="card">
+<h2>Event Log</h2>
+<p>{event_log_message}</p>
+<form method="POST" action="/clear-event-log">
+<button class="orange" type="submit">Clear Event Log</button>
+</form>
+<p class="small">This log is stored in memory and clears after a hard power cycle.</p>
+</div>
+
 <div class="card">
 <h2>Tickers</h2>
 <form method="POST" action="/save-symbols">
@@ -743,6 +949,13 @@ h2 {{ margin-top:0; }}
 </select>
 <label>Alert Percent Move</label>
 <input name="alert_percent_move" value="{alert_percent_move}">
+<label>Stale Quote Minutes</label>
+<input name="stale_quote_minutes" value="{stale_quote_minutes}">
+<label>Show Stale Marker</label>
+<select name="show_stale_marker">
+<option value="true" {stale_true_selected}>True</option>
+<option value="false" {stale_false_selected}>False</option>
+</select>
 </div>
 <div>
 <label>Show Dollar Change</label>
@@ -864,6 +1077,7 @@ def index(request: Request):
             symbols="\n".join(SYMBOLS),
             brightness=config["brightness"],
             alert_percent_move=config["alert_percent_move"],
+            stale_quote_minutes=config.get("stale_quote_minutes", 15),
             fetch_interval_open=config["fetch_interval_open"],
             fetch_interval_pre_after=config["fetch_interval_pre_after"],
             fetch_interval_closed=config["fetch_interval_closed"],
@@ -874,6 +1088,9 @@ def index(request: Request):
             ota_message=ota_message,
             ota_status_message=ota_status_message,
             alert_message=alert_message,
+            quote_freshness_message=build_quote_freshness_html(),
+            system_health_message=build_system_health_html(),
+            event_log_message=build_event_log_html(),
             last_update=last_update_text,
             last_web_message=last_web_message,
             last_error_message=last_error_message,
@@ -887,6 +1104,8 @@ def index(request: Request):
             night_false_selected=selected("false", str(config.get("night_mode_enabled", True)).lower()),
             alert_true_selected=selected("true", str(config.get("alert_enabled", True)).lower()),
             alert_false_selected=selected("false", str(config.get("alert_enabled", True)).lower()),
+            stale_true_selected=selected("true", str(config.get("show_stale_marker", True)).lower()),
+            stale_false_selected=selected("false", str(config.get("show_stale_marker", True)).lower()),
             dollar_true_selected=selected("true", str(config.get("show_dollar_change", True)).lower()),
             dollar_false_selected=selected("false", str(config.get("show_dollar_change", True)).lower()),
             percent_true_selected=selected("true", str(config.get("show_percent_change", True)).lower()),
@@ -1052,6 +1271,7 @@ def save_cfg(request: Request):
         config["brightness"] = clamp_float(form.get("brightness", config["brightness"]), 0.0, 1.0, DEFAULT_CONFIG["brightness"])
         config["night_brightness"] = clamp_float(form.get("night_brightness", config["night_brightness"]), 0.0, 1.0, DEFAULT_CONFIG["night_brightness"])
         config["alert_percent_move"] = clamp_float(form.get("alert_percent_move", config["alert_percent_move"]), 0.0, 100.0, DEFAULT_CONFIG["alert_percent_move"])
+        config["stale_quote_minutes"] = clamp_int(form.get("stale_quote_minutes", config.get("stale_quote_minutes", 15)), 1, 1440, DEFAULT_CONFIG["stale_quote_minutes"])
 
         config["fetch_interval_open"] = clamp_int(form.get("fetch_interval_open", config["fetch_interval_open"]), 5, 3600, DEFAULT_CONFIG["fetch_interval_open"])
         config["fetch_interval_pre_after"] = clamp_int(form.get("fetch_interval_pre_after", config["fetch_interval_pre_after"]), 10, 3600, DEFAULT_CONFIG["fetch_interval_pre_after"])
@@ -1068,6 +1288,7 @@ def save_cfg(request: Request):
         config["alert_enabled"] = bool_from_form(form.get("alert_enabled", config.get("alert_enabled", True)))
         config["show_dollar_change"] = bool_from_form(form.get("show_dollar_change", config.get("show_dollar_change", True)))
         config["show_percent_change"] = bool_from_form(form.get("show_percent_change", config.get("show_percent_change", True)))
+        config["show_stale_marker"] = bool_from_form(form.get("show_stale_marker", config.get("show_stale_marker", True)))
 
         channel = url_decode(str(form.get("update_channel", config["update_channel"]))).strip().lower()
         config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
@@ -1153,6 +1374,25 @@ def clear_alerts(request: Request):
     set_web_message("Price alert message cleared.")
 
     return Response(request, clean_page("Alerts Cleared", "Price alert message cleared."), content_type="text/html")
+
+
+@server.route("/check-system-health", methods=["POST"])
+def check_system_health(request: Request):
+    global system_health_message
+    system_health_message = build_system_health_html()
+    set_web_message("System health checked.")
+
+    return Response(request, clean_page("System Health Checked", "Memory and disk health updated."), content_type="text/html")
+
+
+@server.route("/clear-event-log", methods=["POST"])
+def clear_event_log(request: Request):
+    while event_log:
+        del event_log[0]
+
+    set_web_message("Event log cleared.")
+
+    return Response(request, clean_page("Event Log Cleared", "Event log cleared."), content_type="text/html")
 
 
 def fetch_update_manifest():
@@ -1580,6 +1820,9 @@ def update_header():
 
 
 def fetch_quote(sym):
+    now_text = format_12h(eastern_time_now())
+    now_mono = time.monotonic()
+
     try:
         url = FINNHUB_URL.format(sym, secrets["finnhub_api_key"])
         r = requests.get(url)
@@ -1590,18 +1833,8 @@ def fetch_quote(sym):
         prev = data.get("pc", 0)
 
         if not price:
-            if sym in last_good:
-                return last_good[sym]
-
             set_error_message("{} returned no valid price.".format(sym))
-
-            return {
-                "symbol": sym,
-                "price_line": "${} ERROR".format(sym),
-                "change_line": "",
-                "color": 0xFF0000,
-                "pct": 0
-            }
+            return cached_or_error_quote(sym, "no valid price")
 
         dollar_change = price - prev if prev else 0
         pct = ((price - prev) / prev) * 100 if prev else 0
@@ -1628,26 +1861,21 @@ def fetch_quote(sym):
             "price_line": "${} ${:.2f}".format(sym, price),
             "change_line": " ".join(change_parts),
             "color": color,
-            "pct": pct
+            "pct": pct,
+            "updated_text": now_text,
+            "updated_mono": now_mono,
+            "stale": False,
+            "used_cached": False,
+            "error_reason": ""
         }
 
     except Exception as e:
-        set_error_message("Fetch error for {}: {}".format(sym, repr(e)))
-
-        if sym in last_good:
-            return last_good[sym]
-
-        return {
-            "symbol": sym,
-            "price_line": "${} ERROR".format(sym),
-            "change_line": "",
-            "color": 0xFF0000,
-            "pct": 0
-        }
-
+        reason = repr(e)
+        set_error_message("Fetch error for {}: {}".format(sym, reason))
+        return cached_or_error_quote(sym, "fetch error")
 
 def fetch_entries():
-    global last_update_text, alert_message
+    global last_update_text, alert_message, quote_freshness_message
 
     entries = []
 
@@ -1665,21 +1893,35 @@ def fetch_entries():
     last_update_text = format_12h(eastern_time_now())
 
     triggered = []
+    stale_symbols = []
 
     if ALERT_ENABLED and ALERT_PERCENT_MOVE > 0:
         for e in entries:
             pct = float(e.get("pct", 0))
-            if abs(pct) >= ALERT_PERCENT_MOVE:
+            if abs(pct) >= ALERT_PERCENT_MOVE and not e.get("stale", False):
                 direction = "UP" if pct >= 0 else "DOWN"
                 triggered.append("{} {} {:+.2f}%".format(e["symbol"], direction, pct))
 
+    for e in entries:
+        if quote_is_stale(e):
+            stale_symbols.append(e["symbol"])
+
     if triggered:
-        alert_message = "Triggered at {}: {}".format(last_update_text, ", ".join(triggered))
+        new_alert = "Triggered at {}: {}".format(last_update_text, ", ".join(triggered))
+        if new_alert != alert_message:
+            add_event("Price alert: " + ", ".join(triggered))
+        alert_message = new_alert
     else:
         alert_message = "No alerts at {}. Threshold: +/-{:.2f}%".format(last_update_text, ALERT_PERCENT_MOVE)
 
-    return entries
+    if stale_symbols:
+        set_error_message("Stale quotes: " + ", ".join(stale_symbols))
+    else:
+        set_web_message("Quotes refreshed at " + last_update_text)
 
+    quote_freshness_message = build_quote_freshness_html()
+
+    return entries
 
 def display_change_color(entry, after_hours):
     if after_hours and config.get("after_hours_color", "purple") == "purple":
