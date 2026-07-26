@@ -5,8 +5,8 @@
     "notes": "Stable ticker release."
   },
   "beta": {
-    "version": "1.1.14-beta",
+    "version": "1.1.15-beta",
     "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
-    "notes": "Fixed professional dashboard loading issue and added safe Sleep Display button."
+    "notes": "Added cleaner customer dashboard sections, improved display settings, true Sleep Display blanking, and safer PIN handling."
   }
 }
