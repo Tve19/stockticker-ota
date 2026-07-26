@@ -1,11 +1,12 @@
 {
   "stable": {
-    "version": "1.1.7"
+    "version": "1.1.7",
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable ticker release."
   },
-"beta": {
-  "version": "1.1.13-beta",
-  "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
-  "notes": "Added professional dashboard, system health badge, setup checklist, customer-friendly errors, logo fallback, help page, and demo mode."
+  "beta": {
+    "version": "1.1.14-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
+    "notes": "Fixed professional dashboard loading issue and added safe Sleep Display button."
+  }
 }
