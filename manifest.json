@@ -4,9 +4,8 @@
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable customer-ready ticker release with setup wizard, professional dashboard, API key setup, demo mode, sleep display, support report, OTA, and rollback."
   },
-  "beta": {
-    "version": "1.1.16-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
-    "notes": "Current beta build."
-  }
+ "beta": {
+  "version": "1.1.17-beta",
+  "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
+  "notes": "Added Portfolio Module with Raspberry Pi local bridge support."
 }
