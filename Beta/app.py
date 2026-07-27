@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.16-beta"
+APP_VERSION = "1.1.17-beta"
 
 import time
 import ssl
@@ -68,7 +68,15 @@ DEFAULT_CONFIG = {
     "demo_mode": False,
     "device_name": "StockTicker",
     "customer_mode": "basic",
-    "panel_sleep": False
+    "panel_sleep": False,
+    "portfolio_mode": "off",
+    "portfolio_bridge_url": "http://192.168.2.85:8787/portfolio",
+    "portfolio_bridge_key": "",
+    "portfolio_show_value": True,
+    "portfolio_show_day_change": True,
+    "portfolio_show_cash": True,
+    "portfolio_privacy_mode": False,
+    "portfolio_stale_minutes": 15
 }
 
 DEFAULT_SYMBOLS = [
@@ -413,12 +421,14 @@ ota_status_message = "Press Check OTA Status to verify manifest, channel, and ba
 last_web_message = "System ready."
 last_error_message = "None yet."
 test_quote_message = "No quote tested yet."
+portfolio_test_message = "No portfolio bridge tested yet."
 cloud_status_message = "Cloud status not checked yet."
 alert_message = "No price alerts yet."
 quote_freshness_message = "No quote freshness checked yet."
 system_health_message = "Press Check System Health to refresh memory and disk stats."
 release_notes_message = "Press Check Release Notes to load stable/beta notes from your OTA manifest."
 auto_recovery_message = "Auto-recovery launcher not checked yet."
+last_portfolio_entry = None
 time_sync_ok = False
 boot_time = time.monotonic()
 event_log = []
@@ -590,6 +600,186 @@ def build_quote_freshness_html():
             cached = " cached" if e.get("used_cached", False) else ""
             updated = e.get("updated_text", "unknown")
             lines.append("{}: {} - {} min old{} - {}".format(sym, state, mins, cached, updated))
+
+    return "<br>".join(lines)
+
+
+PORTFOLIO_SYMBOL = "__PORTFOLIO__"
+
+
+def is_portfolio_enabled():
+    return str(config.get("portfolio_mode", "off")).strip().lower() == "local_bridge"
+
+
+def is_portfolio_entry(entry):
+    try:
+        return entry.get("symbol") == PORTFOLIO_SYMBOL or entry.get("entry_type") == "portfolio"
+    except Exception:
+        return False
+
+
+def money_text(value):
+    try:
+        return "${:,.0f}".format(float(value))
+    except Exception:
+        return "$0"
+
+
+def signed_money_text(value):
+    try:
+        v = float(value)
+        sign = "+" if v >= 0 else "-"
+        return "{}${:,.0f}".format(sign, abs(v))
+    except Exception:
+        return "+$0"
+
+
+def append_bridge_key(url, key):
+    url = str(url).strip()
+    key = str(key).strip()
+
+    if not url or not key:
+        return url
+
+    if "key=" in url:
+        return url
+
+    joiner = "&" if "?" in url else "?"
+    return url + joiner + "key=" + key
+
+
+def make_portfolio_entry(data, stale_override=False, error_reason=""):
+    privacy = bool_from_form(config.get("portfolio_privacy_mode", False))
+    show_value = bool_from_form(config.get("portfolio_show_value", True)) and not privacy
+    show_change = bool_from_form(config.get("portfolio_show_day_change", True))
+    show_cash = bool_from_form(config.get("portfolio_show_cash", True)) and not privacy
+
+    value = float(data.get("portfolio_value", 0) or 0)
+    day_change = float(data.get("day_change", 0) or 0)
+    day_percent = float(data.get("day_percent", 0) or 0)
+    cash = float(data.get("cash", 0) or 0)
+    updated = str(data.get("updated", "unknown"))
+    age_seconds = int(float(data.get("age_seconds", 0) or 0))
+
+    try:
+        stale_limit = int(config.get("portfolio_stale_minutes", 15)) * 60
+    except Exception:
+        stale_limit = 900
+
+    stale = bool(data.get("stale", False)) or stale_override or age_seconds > stale_limit
+    color = 0x00FF00 if day_change >= 0 else 0xFF0000
+
+    if show_value:
+        top = "PORTFOLIO " + money_text(value)
+    else:
+        top = "PORTFOLIO"
+
+    parts = []
+    if show_change:
+        parts.append("{} ({:+.2f}%)".format(signed_money_text(day_change), day_percent))
+    if show_cash:
+        parts.append("CASH " + money_text(cash))
+    if not parts:
+        parts.append("UPDATED " + updated)
+
+    bottom = " ".join(parts)
+    if stale:
+        bottom = bottom + " OLD " + updated
+
+    if error_reason:
+        bottom = "OFFLINE OLD " + updated
+        color = 0xFFAA00
+
+    return {
+        "symbol": PORTFOLIO_SYMBOL,
+        "entry_type": "portfolio",
+        "price_line": top,
+        "change_line": bottom,
+        "color": color,
+        "pct": day_percent,
+        "updated_text": updated,
+        "updated_mono": time.monotonic(),
+        "stale": stale,
+        "used_cached": stale_override,
+        "error_reason": error_reason
+    }
+
+
+def fetch_portfolio_entry():
+    global last_portfolio_entry
+
+    if not is_portfolio_enabled():
+        return None
+
+    bridge_url = str(config.get("portfolio_bridge_url", "")).strip()
+    bridge_key = str(config.get("portfolio_bridge_key", "")).strip()
+
+    if not bridge_url:
+        return make_portfolio_entry({"updated": "never"}, True, "missing bridge url")
+
+    try:
+        url = append_bridge_key(bridge_url, bridge_key)
+        r = requests.get(url)
+        data = r.json()
+        r.close()
+
+        if data.get("error"):
+            raise Exception(str(data.get("error")))
+
+        entry = make_portfolio_entry(data)
+        last_portfolio_entry = entry
+        add_event("Portfolio bridge refreshed.")
+        return entry
+
+    except Exception as e:
+        reason = repr(e)
+        set_error_message("Portfolio bridge fetch failed: " + reason)
+
+        if last_portfolio_entry:
+            old = {}
+            for key in last_portfolio_entry:
+                old[key] = last_portfolio_entry[key]
+            old["stale"] = True
+            old["used_cached"] = True
+            old["error_reason"] = reason
+            if "OLD" not in str(old.get("change_line", "")):
+                old["change_line"] = str(old.get("change_line", "")) + " OLD"
+            return old
+
+        return make_portfolio_entry({"updated": "never"}, True, reason)
+
+
+def portfolio_status_short():
+    if not is_portfolio_enabled():
+        return "Off"
+
+    if last_portfolio_entry is None:
+        return "Not loaded yet"
+
+    if last_portfolio_entry.get("error_reason"):
+        return "Offline/cached"
+
+    if last_portfolio_entry.get("stale"):
+        return "Stale"
+
+    return "OK " + str(last_portfolio_entry.get("updated_text", ""))
+
+
+def build_portfolio_status_html():
+    if not is_portfolio_enabled():
+        return "Portfolio Module is off."
+
+    if last_portfolio_entry is None:
+        return "Portfolio bridge not loaded yet. Press Test Portfolio Bridge or Refresh Quotes."
+
+    lines = []
+    lines.append("Status: " + safe_html(portfolio_status_short()))
+    lines.append("Top Line: " + safe_html(last_portfolio_entry.get("price_line", "")))
+    lines.append("Bottom Line: " + safe_html(last_portfolio_entry.get("change_line", "")))
+
+    err = last_portfolio_entry.get("error_reason", "")
+    if err:
+        lines.append("Last Error: " + safe_html(err))
 
     return "<br>".join(lines)
 
@@ -920,6 +1110,11 @@ def safe_config_export_dict():
 
         if key == "finnhub_api_key":
             if get_saved_customer_api_key():
+                export_config[key] = "__SAVED_KEY_HIDDEN__"
+            else:
+                export_config[key] = ""
+        elif key == "portfolio_bridge_key":
+            if str(config.get("portfolio_bridge_key", "")).strip():
                 export_config[key] = "__SAVED_KEY_HIDDEN__"
             else:
                 export_config[key] = ""
@@ -1570,6 +1765,7 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <div class="stat"><b>Version</b><br>{version}</div>
 <div class="stat"><b>Market</b><br>{market_status}</div>
 <div class="stat"><b>Quotes</b><br>{quote_status_short}</div>
+<div class="stat"><b>Portfolio</b><br>{portfolio_status_short}</div>
 <div class="stat"><b>Panel</b><br>{panel_state}</div>
 <div class="stat"><b>Setup</b><br>{setup_progress}</div>
 <div class="stat"><b>IP</b><br>{ip}</div>
@@ -1671,6 +1867,46 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <button class="green" type="submit">Save Night / Demo Settings</button>
 </form>
 </div>
+<div>
+<h2>Portfolio Module</h2>
+<form method="POST" action="/save-config">
+<label>Portfolio Display</label>
+<select name="portfolio_mode">
+<option value="off" {portfolio_off_selected}>Off</option>
+<option value="local_bridge" {portfolio_bridge_selected}>Local Bridge / Raspberry Pi</option>
+</select>
+<label>Bridge URL</label>
+<input name="portfolio_bridge_url" value="{portfolio_bridge_url}" placeholder="http://192.168.2.85:8787/portfolio">
+<label>Bridge Display Key</label>
+<input name="portfolio_bridge_key" type="password" value="" placeholder="{portfolio_bridge_key_placeholder}">
+<p class="small">The saved bridge key is hidden. Leave blank to keep it. The S3 only receives portfolio summary data.</p>
+<label>Privacy Mode</label>
+<select name="portfolio_privacy_mode">
+<option value="false" {portfolio_privacy_false_selected}>False - show portfolio value</option>
+<option value="true" {portfolio_privacy_true_selected}>True - hide portfolio value/cash</option>
+</select>
+<label>Show Portfolio Value</label>
+<select name="portfolio_show_value">
+<option value="true" {portfolio_value_true_selected}>True</option>
+<option value="false" {portfolio_value_false_selected}>False</option>
+</select>
+<label>Show Day Change</label>
+<select name="portfolio_show_day_change">
+<option value="true" {portfolio_day_true_selected}>True</option>
+<option value="false" {portfolio_day_false_selected}>False</option>
+</select>
+<label>Show Cash</label>
+<select name="portfolio_show_cash">
+<option value="true" {portfolio_cash_true_selected}>True</option>
+<option value="false" {portfolio_cash_false_selected}>False</option>
+</select>
+<label>Portfolio Stale Minutes</label>
+<input name="portfolio_stale_minutes" value="{portfolio_stale_minutes}">
+<button class="green" type="submit">Save Portfolio Settings</button>
+</form>
+<form method="POST" action="/test-portfolio"><button type="submit">Test Portfolio Bridge</button></form>
+<p>{portfolio_test_message}</p>
+</div>
 </div>
 </details>
 
@@ -1686,6 +1922,11 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <h2>Quote Freshness</h2>
 <p>{quote_freshness_message}</p>
 <p class="small">STALE means the panel is using cached or older data.</p>
+</div>
+<div class="card">
+<h2>Portfolio Status</h2>
+<p>{portfolio_status_message}</p>
+<form method="POST" action="/test-portfolio"><button type="submit">Test Portfolio Bridge</button></form>
 </div>
 <div class="card">
 <h2>Logo Status</h2>
@@ -1943,6 +2184,18 @@ def save_customer_setup(request: Request):
         config["brightness"] = clamp_float(form.get("brightness", config.get("brightness", 0.30)), 0.0, 1.0, DEFAULT_CONFIG["brightness"])
         config["show_logos"] = bool_from_form(form.get("show_logos", config.get("show_logos", True)))
 
+        portfolio_mode = url_decode(str(form.get("portfolio_mode", config.get("portfolio_mode", "off")))).strip().lower()
+        config["portfolio_mode"] = portfolio_mode if portfolio_mode in ("off", "local_bridge") else "off"
+        config["portfolio_bridge_url"] = url_decode(str(form.get("portfolio_bridge_url", config.get("portfolio_bridge_url", "")))).strip()
+        new_portfolio_key = url_decode(str(form.get("portfolio_bridge_key", ""))).strip()
+        if new_portfolio_key:
+            config["portfolio_bridge_key"] = new_portfolio_key
+        config["portfolio_show_value"] = bool_from_form(form.get("portfolio_show_value", config.get("portfolio_show_value", True)))
+        config["portfolio_show_day_change"] = bool_from_form(form.get("portfolio_show_day_change", config.get("portfolio_show_day_change", True)))
+        config["portfolio_show_cash"] = bool_from_form(form.get("portfolio_show_cash", config.get("portfolio_show_cash", True)))
+        config["portfolio_privacy_mode"] = bool_from_form(form.get("portfolio_privacy_mode", config.get("portfolio_privacy_mode", False)))
+        config["portfolio_stale_minutes"] = clamp_int(form.get("portfolio_stale_minutes", config.get("portfolio_stale_minutes", 15)), 1, 1440, DEFAULT_CONFIG["portfolio_stale_minutes"])
+
         channel = url_decode(str(form.get("update_channel", config.get("update_channel", "stable")))).strip().lower()
         config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
 
@@ -1988,6 +2241,7 @@ def index(request: Request):
             setup_progress=setup_progress_text(),
             setup_checklist_message=build_setup_checklist_html(),
             quote_status_short=quote_status_short(),
+            portfolio_status_short=portfolio_status_short(),
             panel_state=panel_state_text(),
             logo_summary_short=logo_summary_text(),
             last_error_panel=last_error_panel_html(),
@@ -2007,6 +2261,7 @@ def index(request: Request):
             ota_status_message=ota_status_message,
             alert_message=alert_message,
             quote_freshness_message=build_quote_freshness_html(),
+            portfolio_status_message=build_portfolio_status_html(),
             system_health_message=build_system_health_html(),
             event_log_message=build_event_log_html(),
             logo_status_message=build_logo_status_html(),
@@ -2017,6 +2272,7 @@ def index(request: Request):
             last_web_message=last_web_message,
             last_error_message=last_error_message,
             test_quote_message=test_quote_message,
+            portfolio_test_message=portfolio_test_message,
             cloud_status_message=cloud_status_message,
             night_brightness=config["night_brightness"],
             night_start_hour=config["night_start_hour"],
@@ -2044,6 +2300,19 @@ def index(request: Request):
             beta_selected=selected("beta", config.get("update_channel", "stable")),
             after_purple_selected=selected("purple", config.get("after_hours_color", "purple")),
             after_normal_selected=selected("normal", config.get("after_hours_color", "purple")),
+            portfolio_off_selected=selected("off", config.get("portfolio_mode", "off")),
+            portfolio_bridge_selected=selected("local_bridge", config.get("portfolio_mode", "off")),
+            portfolio_bridge_url=safe_html(config.get("portfolio_bridge_url", "")),
+            portfolio_bridge_key_placeholder="Saved key hidden. Leave blank to keep it." if str(config.get("portfolio_bridge_key", "")).strip() else "Paste display key here",
+            portfolio_privacy_true_selected=selected("true", str(config.get("portfolio_privacy_mode", False)).lower()),
+            portfolio_privacy_false_selected=selected("false", str(config.get("portfolio_privacy_mode", False)).lower()),
+            portfolio_value_true_selected=selected("true", str(config.get("portfolio_show_value", True)).lower()),
+            portfolio_value_false_selected=selected("false", str(config.get("portfolio_show_value", True)).lower()),
+            portfolio_day_true_selected=selected("true", str(config.get("portfolio_show_day_change", True)).lower()),
+            portfolio_day_false_selected=selected("false", str(config.get("portfolio_show_day_change", True)).lower()),
+            portfolio_cash_true_selected=selected("true", str(config.get("portfolio_show_cash", True)).lower()),
+            portfolio_cash_false_selected=selected("false", str(config.get("portfolio_show_cash", True)).lower()),
+            portfolio_stale_minutes=config.get("portfolio_stale_minutes", 15),
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
         ),
@@ -2095,6 +2364,28 @@ def test_quote_route(request: Request):
         set_error_message(test_quote_message)
 
     return Response(request, clean_page("Quote Test Complete", test_quote_message), content_type="text/html")
+
+
+@server.route("/test-portfolio", methods=["POST"])
+def test_portfolio_route(request: Request):
+    global portfolio_test_message, last_portfolio_entry
+
+    if not is_portfolio_enabled():
+        portfolio_test_message = "Portfolio Module is off. Turn on Local Bridge and save settings first."
+        set_web_message(portfolio_test_message)
+        return Response(request, clean_page("Portfolio Test", portfolio_test_message), content_type="text/html")
+
+    entry = fetch_portfolio_entry()
+    last_portfolio_entry = entry
+
+    if entry and not entry.get("error_reason"):
+        portfolio_test_message = "Portfolio bridge works: {} {}".format(entry.get("price_line", ""), entry.get("change_line", ""))
+        set_web_message("Portfolio bridge tested successfully.")
+    else:
+        portfolio_test_message = "Portfolio bridge test failed or returned cached/offline data. Check Pi IP, bridge key, and /portfolio JSON."
+        set_error_message(portfolio_test_message)
+
+    return Response(request, clean_page("Portfolio Test Complete", portfolio_test_message), content_type="text/html")
 
 
 @server.route("/validate-symbols", methods=["POST"])
@@ -2245,6 +2536,18 @@ def save_cfg(request: Request):
         config["demo_mode"] = bool_from_form(form.get("demo_mode", config.get("demo_mode", False)))
         config["show_stale_marker"] = bool_from_form(form.get("show_stale_marker", config.get("show_stale_marker", True)))
         config["smooth_quote_refresh"] = bool_from_form(form.get("smooth_quote_refresh", config.get("smooth_quote_refresh", True)))
+
+        portfolio_mode = url_decode(str(form.get("portfolio_mode", config.get("portfolio_mode", "off")))).strip().lower()
+        config["portfolio_mode"] = portfolio_mode if portfolio_mode in ("off", "local_bridge") else "off"
+        config["portfolio_bridge_url"] = url_decode(str(form.get("portfolio_bridge_url", config.get("portfolio_bridge_url", "")))).strip()
+        new_portfolio_key = url_decode(str(form.get("portfolio_bridge_key", ""))).strip()
+        if new_portfolio_key:
+            config["portfolio_bridge_key"] = new_portfolio_key
+        config["portfolio_show_value"] = bool_from_form(form.get("portfolio_show_value", config.get("portfolio_show_value", True)))
+        config["portfolio_show_day_change"] = bool_from_form(form.get("portfolio_show_day_change", config.get("portfolio_show_day_change", True)))
+        config["portfolio_show_cash"] = bool_from_form(form.get("portfolio_show_cash", config.get("portfolio_show_cash", True)))
+        config["portfolio_privacy_mode"] = bool_from_form(form.get("portfolio_privacy_mode", config.get("portfolio_privacy_mode", False)))
+        config["portfolio_stale_minutes"] = clamp_int(form.get("portfolio_stale_minutes", config.get("portfolio_stale_minutes", 15)), 1, 1440, DEFAULT_CONFIG["portfolio_stale_minutes"])
 
         channel = url_decode(str(form.get("update_channel", config["update_channel"]))).strip().lower()
         config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
@@ -3032,12 +3335,16 @@ def finalize_quote_batch(entries, success_message):
 
     if ALERT_ENABLED and ALERT_PERCENT_MOVE > 0:
         for e in entries:
+            if is_portfolio_entry(e):
+                continue
             pct = float(e.get("pct", 0))
             if abs(pct) >= ALERT_PERCENT_MOVE and not e.get("stale", False):
                 direction = "UP" if pct >= 0 else "DOWN"
                 triggered.append("{} {} {:+.2f}%".format(e["symbol"], direction, pct))
 
     for e in entries:
+        if is_portfolio_entry(e):
+            continue
         if quote_is_stale(e):
             stale_symbols.append(e["symbol"])
 
@@ -3071,6 +3378,10 @@ def fetch_entries():
         last_good[sym] = e
         gc.collect()
 
+    portfolio_entry = fetch_portfolio_entry()
+    if portfolio_entry:
+        entries.append(portfolio_entry)
+
     finalize_quote_batch(entries, "Quotes refreshed")
 
     return entries
@@ -3092,6 +3403,9 @@ def smooth_quote_refresh_step():
         return
 
     if smooth_refresh_index >= len(SYMBOLS):
+        p_entry = fetch_portfolio_entry()
+        if p_entry:
+            replace_entry_for_symbol(pending_entries, p_entry)
         smooth_refresh_active = False
         finalize_quote_batch(pending_entries, "Smooth quotes refreshed")
         return
@@ -3110,6 +3424,9 @@ def smooth_quote_refresh_step():
     smooth_refresh_index += 1
 
     if smooth_refresh_index >= len(SYMBOLS):
+        p_entry = fetch_portfolio_entry()
+        if p_entry:
+            replace_entry_for_symbol(pending_entries, p_entry)
         smooth_refresh_active = False
         finalize_quote_batch(pending_entries, "Smooth quotes refreshed")
 
@@ -3117,6 +3434,9 @@ def smooth_quote_refresh_step():
 
 
 def display_change_color(entry, after_hours):
+    if is_portfolio_entry(entry):
+        return entry["color"]
+
     if after_hours and config.get("after_hours_color", "purple") == "purple":
         return 0xAA00FF
 
@@ -3129,7 +3449,7 @@ def create_block(entry, after_hours):
     g = displayio.Group()
     x_offset = 0
 
-    logo_bmp = logos.get(sym)
+    logo_bmp = None if sym == PORTFOLIO_SYMBOL else logos.get(sym)
 
     if logo_bmp:
         logo_grid = displayio.TileGrid(logo_bmp, pixel_shader=logo_bmp.pixel_shader)
