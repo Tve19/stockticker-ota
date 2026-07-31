@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.22-beta"
+APP_VERSION = "1.1.23-beta"
 CONFIG_SCHEMA_VERSION = 2
 PORTFOLIO_API_SCHEMA_SUPPORTED = 1
 DEVICE_MODEL = "matrix_portal_s3"
@@ -55,7 +55,7 @@ class _SoftwareSHA256:
             0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
             0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
         ]
-        self._buffer = bytearray()
+        self._buffer = b""
         self._length = 0
         self._finished = False
 
@@ -147,11 +147,14 @@ class _SoftwareSHA256:
             return
 
         self._length += len(data)
-        self._buffer.extend(data)
+
+        # CircuitPython bytearray supports vary by build. Keep the pending
+        # SHA data as immutable bytes so no item or slice deletion is needed.
+        self._buffer = self._buffer + bytes(data)
 
         while len(self._buffer) >= 64:
             block = self._buffer[:64]
-            del self._buffer[:64]
+            self._buffer = self._buffer[64:]
             self._process(block)
 
     def digest(self):
@@ -170,7 +173,7 @@ class _SoftwareSHA256:
                 self._process(final_data[start:start + 64])
 
             self._finished = True
-            self._buffer = bytearray()
+            self._buffer = b""
 
         output = bytearray()
 
