@@ -4,15 +4,15 @@
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable customer-ready ticker release with setup wizard, professional dashboard, API key setup, demo mode, sleep display, support report, OTA, and rollback."
   },
- "beta": {
-    "version": "1.1.22-beta",
+"beta": {
+    "version": "1.1.22-bootstrap",
     "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
-    "notes": "Completes OTA integrity verification with a native-or-software SHA-256 verifier and retains all dashboard and portfolio features.",
+    "notes": "One-time bootstrap that adds a software SHA-256 fallback for CircuitPython builds without native SHA-256.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 2,
-    "size": 161152,
-    "mandatory": false,
-    "sha256": "eaa3ca56cd7bd22e58a34879b2fe6aa27d310f97537f6c55107e5f5b1f91a2ad"
+    "size": 161157,
+    "mandatory": false
   }
+}
