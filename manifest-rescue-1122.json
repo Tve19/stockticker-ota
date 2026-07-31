@@ -5,13 +5,15 @@
     "notes": "Stable customer-ready ticker release."
   },
   "beta": {
-    "version": "1.1.22-rescue",
-    "app_url": "https://stockticker-ota.pages.dev/Rescue/1.1.22/app.py",
-    "notes": "One-time rescue installer. Adds deterministic bundled software SHA-256 verification without calling CircuitPython hashlib.",
+    "version": "1.1.22-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/1.1.22/app.py",
+    "notes": "Final 1.1.22 integrity release using deterministic bundled software SHA-256 verification.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 2,
-    "mandatory": false
+    "size": 161122,
+    "mandatory": false,
+    "sha256": "1ccb34bdf2b37ff6a285a87d27fb1bde2182adac803561f94e89372ec7cbff79"
   }
 }
