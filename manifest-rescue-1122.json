@@ -1,0 +1,17 @@
+{
+  "stable": {
+    "version": "1.1.16",
+    "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
+    "notes": "Stable customer-ready ticker release."
+  },
+  "beta": {
+    "version": "1.1.22-rescue",
+    "app_url": "https://stockticker-ota.pages.dev/Rescue/1.1.22/app.py",
+    "notes": "One-time rescue installer. Adds deterministic bundled software SHA-256 verification without calling CircuitPython hashlib.",
+    "hardware": [
+      "matrix_portal_s3"
+    ],
+    "minimum_config_schema": 2,
+    "mandatory": false
+  }
+}
