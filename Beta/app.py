@@ -1,6 +1,9 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.17-beta"
+APP_VERSION = "1.1.18-beta"
+CONFIG_SCHEMA_VERSION = 2
+PORTFOLIO_API_SCHEMA_SUPPORTED = 1
+DEVICE_MODEL = "matrix_portal_s3"
 
 import time
 import ssl
@@ -18,6 +21,10 @@ import gc
 import json
 import microcontroller
 import os
+try:
+    import hashlib
+except Exception:
+    hashlib = None
 
 from adafruit_display_text import label
 try:
@@ -39,6 +46,7 @@ DEVICE_FILE = "/device.json"
 CRASH_FILE = "/crash_count.json"
 
 DEFAULT_CONFIG = {
+    "config_schema_version": CONFIG_SCHEMA_VERSION,
     "brightness": 0.30,
     "scroll_speed_open": 1.0,
     "scroll_speed_closed": 0.6,
@@ -70,13 +78,19 @@ DEFAULT_CONFIG = {
     "customer_mode": "basic",
     "panel_sleep": False,
     "portfolio_mode": "off",
-    "portfolio_bridge_url": "http://192.168.2.85:8787/portfolio",
+    "portfolio_bridge_url": "",
     "portfolio_bridge_key": "",
+    "portfolio_prefer_api_v1": True,
     "portfolio_show_value": True,
     "portfolio_show_day_change": True,
     "portfolio_show_cash": True,
+    "portfolio_show_buying_power": True,
+    "portfolio_show_positions_count": True,
+    "portfolio_show_largest_winner": True,
+    "portfolio_show_largest_loser": True,
     "portfolio_privacy_mode": False,
-    "portfolio_stale_minutes": 15
+    "portfolio_stale_minutes": 15,
+    "portfolio_capabilities_refresh_minutes": 60
 }
 
 DEFAULT_SYMBOLS = [
@@ -155,10 +169,30 @@ def load_device_info():
 
 def load_config():
     cfg = load_json_file(CONFIG_FILE, {})
+    changed = False
 
     for key in DEFAULT_CONFIG:
         if key not in cfg:
             cfg[key] = DEFAULT_CONFIG[key]
+            changed = True
+
+    try:
+        current_schema = int(cfg.get("config_schema_version", 0) or 0)
+    except Exception:
+        current_schema = 0
+
+    if current_schema < CONFIG_SCHEMA_VERSION:
+        cfg["config_schema_version"] = CONFIG_SCHEMA_VERSION
+        changed = True
+
+    if changed:
+        try:
+            save_json_file(CONFIG_FILE, cfg)
+            print("Config migrated to schema", CONFIG_SCHEMA_VERSION)
+        except OSError as e:
+            print("Config migration could not save:", repr(e))
+        except Exception as e:
+            print("Config migration failed:", repr(e))
 
     return cfg
 
@@ -429,6 +463,16 @@ system_health_message = "Press Check System Health to refresh memory and disk st
 release_notes_message = "Press Check Release Notes to load stable/beta notes from your OTA manifest."
 auto_recovery_message = "Auto-recovery launcher not checked yet."
 last_portfolio_entry = None
+last_portfolio_capabilities = {}
+last_portfolio_capabilities_check = 0
+last_portfolio_api_status = {
+    "mode": "not_checked",
+    "api_version": "unknown",
+    "schema_version": "unknown",
+    "bridge_version": "unknown",
+    "capabilities": False,
+    "last_error": ""
+}
 time_sync_ok = False
 boot_time = time.monotonic()
 event_log = []
@@ -634,6 +678,20 @@ def signed_money_text(value):
         return "+$0"
 
 
+def portfolio_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def portfolio_int(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
 def append_bridge_key(url, key):
     url = str(url).strip()
     key = str(key).strip()
@@ -648,41 +706,347 @@ def append_bridge_key(url, key):
     return url + joiner + "key=" + key
 
 
-def make_portfolio_entry(data, stale_override=False, error_reason=""):
-    privacy = bool_from_form(config.get("portfolio_privacy_mode", False))
-    show_value = bool_from_form(config.get("portfolio_show_value", True)) and not privacy
-    show_change = bool_from_form(config.get("portfolio_show_day_change", True))
-    show_cash = bool_from_form(config.get("portfolio_show_cash", True)) and not privacy
+def portfolio_bridge_base_url():
+    url = str(config.get("portfolio_bridge_url", "")).strip()
 
-    value = float(data.get("portfolio_value", 0) or 0)
-    day_change = float(data.get("day_change", 0) or 0)
-    day_percent = float(data.get("day_percent", 0) or 0)
-    cash = float(data.get("cash", 0) or 0)
-    updated = str(data.get("updated", "unknown"))
-    age_seconds = int(float(data.get("age_seconds", 0) or 0))
+    if not url:
+        return ""
+
+    url = url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+
+    for suffix in (
+        "/api/v1/portfolio",
+        "/api/v1/capabilities",
+        "/portfolio"
+    ):
+        if url.endswith(suffix):
+            url = url[:-len(suffix)].rstrip("/")
+            break
+
+    return url
+
+
+def portfolio_legacy_url():
+    configured = str(config.get("portfolio_bridge_url", "")).strip()
+
+    if configured:
+        clean = configured.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+        if clean.endswith("/portfolio") and not clean.endswith("/api/v1/portfolio"):
+            return clean
+
+    base = portfolio_bridge_base_url()
+    if not base:
+        return ""
+
+    return base + "/portfolio"
+
+
+def portfolio_v1_url():
+    base = portfolio_bridge_base_url()
+    if not base:
+        return ""
+
+    return base + "/api/v1/portfolio"
+
+
+def portfolio_capabilities_url():
+    base = portfolio_bridge_base_url()
+    if not base:
+        return ""
+
+    return base + "/api/v1/capabilities"
+
+
+def bridge_request_json(url, key="", use_header=True):
+    response = None
 
     try:
-        stale_limit = int(config.get("portfolio_stale_minutes", 15)) * 60
+        if use_header and key:
+            response = requests.get(
+                url,
+                headers={"X-Bridge-Key": key}
+            )
+        else:
+            response = requests.get(
+                append_bridge_key(url, key)
+            )
+
+        data = response.json()
+
+        if not isinstance(data, dict):
+            raise Exception("Bridge returned non-object JSON.")
+
+        if data.get("error"):
+            raise Exception(str(data.get("error")))
+
+        return data
+
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
+def record_portfolio_api_status(mode, data=None, error_text=""):
+    global last_portfolio_api_status
+
+    data = data if isinstance(data, dict) else {}
+
+    last_portfolio_api_status = {
+        "mode": str(mode),
+        "api_version": str(data.get("api_version", "legacy" if mode == "legacy" else "unknown")),
+        "schema_version": str(data.get("schema_version", "legacy" if mode == "legacy" else "unknown")),
+        "bridge_version": str(data.get("bridge_version", "unknown")),
+        "capabilities": bool(last_portfolio_capabilities.get("available", False)),
+        "last_error": str(error_text)
+    }
+
+
+def fetch_bridge_capabilities(force=False):
+    global last_portfolio_capabilities
+    global last_portfolio_capabilities_check
+
+    if not is_portfolio_enabled():
+        return {}
+
+    now = time.monotonic()
+
+    try:
+        refresh_seconds = int(
+            config.get("portfolio_capabilities_refresh_minutes", 60)
+        ) * 60
+    except Exception:
+        refresh_seconds = 3600
+
+    if (
+        not force
+        and last_portfolio_capabilities
+        and now - last_portfolio_capabilities_check < refresh_seconds
+    ):
+        return last_portfolio_capabilities
+
+    url = portfolio_capabilities_url()
+    key = str(config.get("portfolio_bridge_key", "")).strip()
+
+    if not url:
+        return {}
+
+    try:
+        data = bridge_request_json(url, key, True)
+        schema = portfolio_int(data.get("schema_version", 0), 0)
+        data["available"] = True
+        data["compatible"] = (
+            schema <= PORTFOLIO_API_SCHEMA_SUPPORTED
+            if schema > 0 else True
+        )
+
+        last_portfolio_capabilities = data
+        last_portfolio_capabilities_check = now
+        add_event(
+            "Bridge capabilities loaded: API {} schema {}.".format(
+                data.get("api_version", "unknown"),
+                data.get("schema_version", "unknown")
+            )
+        )
+        return data
+
+    except Exception as e:
+        last_portfolio_capabilities = {
+            "available": False,
+            "compatible": True,
+            "error": repr(e)
+        }
+        last_portfolio_capabilities_check = now
+        add_event(
+            "Bridge capabilities unavailable; legacy fallback remains enabled."
+        )
+        return last_portfolio_capabilities
+
+
+def fetch_portfolio_payload():
+    key = str(config.get("portfolio_bridge_key", "")).strip()
+    prefer_v1 = bool_from_form(
+        config.get("portfolio_prefer_api_v1", True)
+    )
+
+    v1_url = portfolio_v1_url()
+    legacy_url = portfolio_legacy_url()
+    attempts = []
+
+    if prefer_v1:
+        if v1_url:
+            attempts.append(("v1", v1_url, True))
+        if legacy_url:
+            attempts.append(("legacy", legacy_url, True))
+    else:
+        if legacy_url:
+            attempts.append(("legacy", legacy_url, True))
+        if v1_url:
+            attempts.append(("v1", v1_url, True))
+
+    if not attempts:
+        raise Exception("Missing portfolio bridge URL.")
+
+    errors = []
+
+    for mode, url, use_header in attempts:
+        try:
+            data = bridge_request_json(url, key, use_header)
+
+            if mode == "v1":
+                schema = portfolio_int(data.get("schema_version", 0), 0)
+
+                if (
+                    schema > 0
+                    and schema > PORTFOLIO_API_SCHEMA_SUPPORTED
+                ):
+                    raise Exception(
+                        "Unsupported bridge schema {}.".format(schema)
+                    )
+
+            record_portfolio_api_status(mode, data)
+            return data, mode
+
+        except Exception as e:
+            errors.append("{}: {}".format(mode, repr(e)))
+
+    record_portfolio_api_status(
+        "failed",
+        {},
+        "; ".join(errors)
+    )
+    raise Exception("; ".join(errors))
+
+
+def mover_text(value, prefix, privacy=False):
+    if not isinstance(value, dict):
+        return ""
+
+    symbol = clean_symbol(value.get("symbol", ""))
+
+    if not symbol:
+        return ""
+
+    if privacy:
+        return "{} {}".format(prefix, symbol)
+
+    change = portfolio_float(value.get("day_change", 0), 0)
+    return "{} {} {}".format(
+        prefix,
+        symbol,
+        signed_money_text(change)
+    )
+
+
+def make_portfolio_entry(data, stale_override=False, error_reason=""):
+    privacy = bool_from_form(
+        config.get("portfolio_privacy_mode", False)
+    )
+    show_value = bool_from_form(
+        config.get("portfolio_show_value", True)
+    ) and not privacy
+    show_change = bool_from_form(
+        config.get("portfolio_show_day_change", True)
+    )
+    show_cash = bool_from_form(
+        config.get("portfolio_show_cash", True)
+    ) and not privacy
+    show_buying_power = bool_from_form(
+        config.get("portfolio_show_buying_power", True)
+    ) and not privacy
+    show_positions = bool_from_form(
+        config.get("portfolio_show_positions_count", True)
+    )
+    show_winner = bool_from_form(
+        config.get("portfolio_show_largest_winner", True)
+    )
+    show_loser = bool_from_form(
+        config.get("portfolio_show_largest_loser", True)
+    )
+
+    value = portfolio_float(data.get("portfolio_value", 0), 0)
+    day_change = portfolio_float(data.get("day_change", 0), 0)
+    day_percent = portfolio_float(data.get("day_percent", 0), 0)
+    cash = portfolio_float(data.get("cash", 0), 0)
+    buying_power = portfolio_float(data.get("buying_power", 0), 0)
+    positions_count = portfolio_int(
+        data.get("positions_count", 0),
+        0
+    )
+    updated = str(
+        data.get(
+            "last_successful_sync",
+            data.get("updated", "unknown")
+        )
+    )
+    age_seconds = portfolio_int(data.get("age_seconds", 0), 0)
+
+    try:
+        stale_limit = int(
+            config.get("portfolio_stale_minutes", 15)
+        ) * 60
     except Exception:
         stale_limit = 900
 
-    stale = bool(data.get("stale", False)) or stale_override or age_seconds > stale_limit
+    stale = (
+        bool(data.get("stale", False))
+        or bool(data.get("data_stale", False))
+        or stale_override
+        or age_seconds > stale_limit
+    )
     color = 0x00FF00 if day_change >= 0 else 0xFF0000
 
-    if show_value:
+    if privacy:
+        top = "PORTFOLIO PRIVATE"
+    elif show_value:
         top = "PORTFOLIO " + money_text(value)
     else:
         top = "PORTFOLIO"
 
     parts = []
-    if show_change:
-        parts.append("{} ({:+.2f}%)".format(signed_money_text(day_change), day_percent))
-    if show_cash:
-        parts.append("CASH " + money_text(cash))
+
+    if privacy:
+        if show_positions:
+            parts.append("POS " + str(positions_count))
+        parts.append("PRIVATE")
+    else:
+        if show_change:
+            parts.append(
+                "{} ({:+.2f}%)".format(
+                    signed_money_text(day_change),
+                    day_percent
+                )
+            )
+        if show_cash:
+            parts.append("CASH " + money_text(cash))
+        if show_buying_power:
+            parts.append("BP " + money_text(buying_power))
+        if show_positions:
+            parts.append("POS " + str(positions_count))
+        if show_winner:
+            winner_text = mover_text(
+                data.get("largest_winner"),
+                "WIN",
+                False
+            )
+            if winner_text:
+                parts.append(winner_text)
+        if show_loser:
+            loser_text = mover_text(
+                data.get("largest_loser"),
+                "LOSS",
+                False
+            )
+            if loser_text:
+                parts.append(loser_text)
+
     if not parts:
         parts.append("UPDATED " + updated)
 
     bottom = " ".join(parts)
+
     if stale:
         bottom = bottom + " OLD " + updated
 
@@ -701,7 +1065,11 @@ def make_portfolio_entry(data, stale_override=False, error_reason=""):
         "updated_mono": time.monotonic(),
         "stale": stale,
         "used_cached": stale_override,
-        "error_reason": error_reason
+        "error_reason": error_reason,
+        "bridge_api_mode": str(last_portfolio_api_status.get("mode", "unknown")),
+        "bridge_api_version": str(last_portfolio_api_status.get("api_version", "unknown")),
+        "bridge_schema_version": str(last_portfolio_api_status.get("schema_version", "unknown")),
+        "bridge_version": str(last_portfolio_api_status.get("bridge_version", "unknown"))
     }
 
 
@@ -711,42 +1079,51 @@ def fetch_portfolio_entry():
     if not is_portfolio_enabled():
         return None
 
-    bridge_url = str(config.get("portfolio_bridge_url", "")).strip()
-    bridge_key = str(config.get("portfolio_bridge_key", "")).strip()
-
-    if not bridge_url:
-        return make_portfolio_entry({"updated": "never"}, True, "missing bridge url")
+    if not str(config.get("portfolio_bridge_url", "")).strip():
+        return make_portfolio_entry(
+            {"updated": "never"},
+            True,
+            "missing bridge url"
+        )
 
     try:
-        url = append_bridge_key(bridge_url, bridge_key)
-        r = requests.get(url)
-        data = r.json()
-        r.close()
-
-        if data.get("error"):
-            raise Exception(str(data.get("error")))
-
+        fetch_bridge_capabilities(False)
+        data, mode = fetch_portfolio_payload()
         entry = make_portfolio_entry(data)
         last_portfolio_entry = entry
-        add_event("Portfolio bridge refreshed.")
+        add_event(
+            "Portfolio bridge refreshed via {}.".format(mode)
+        )
         return entry
 
     except Exception as e:
         reason = repr(e)
-        set_error_message("Portfolio bridge fetch failed: " + reason)
+        set_error_message(
+            "Portfolio bridge fetch failed: " + reason
+        )
 
         if last_portfolio_entry:
             old = {}
+
             for key in last_portfolio_entry:
                 old[key] = last_portfolio_entry[key]
+
             old["stale"] = True
             old["used_cached"] = True
             old["error_reason"] = reason
+
             if "OLD" not in str(old.get("change_line", "")):
-                old["change_line"] = str(old.get("change_line", "")) + " OLD"
+                old["change_line"] = (
+                    str(old.get("change_line", "")) + " OLD"
+                )
+
             return old
 
-        return make_portfolio_entry({"updated": "never"}, True, reason)
+        return make_portfolio_entry(
+            {"updated": "never"},
+            True,
+            reason
+        )
 
 
 def portfolio_status_short():
@@ -762,7 +1139,50 @@ def portfolio_status_short():
     if last_portfolio_entry.get("stale"):
         return "Stale"
 
-    return "OK " + str(last_portfolio_entry.get("updated_text", ""))
+    mode = str(
+        last_portfolio_entry.get("bridge_api_mode", "")
+    )
+
+    if mode == "v1":
+        return "OK API v1"
+    if mode == "legacy":
+        return "OK Legacy"
+
+    return "OK " + str(
+        last_portfolio_entry.get("updated_text", "")
+    )
+
+
+def build_portfolio_api_status_html():
+    status = last_portfolio_api_status
+
+    lines = []
+    lines.append(
+        "Mode: " + safe_html(status.get("mode", "not_checked"))
+    )
+    lines.append(
+        "API: " + safe_html(status.get("api_version", "unknown"))
+    )
+    lines.append(
+        "Schema: " + safe_html(status.get("schema_version", "unknown"))
+    )
+    lines.append(
+        "Bridge Version: "
+        + safe_html(status.get("bridge_version", "unknown"))
+    )
+    lines.append(
+        "Capabilities: "
+        + ("Available" if status.get("capabilities") else "Not loaded")
+    )
+
+    error_text = str(status.get("last_error", "")).strip()
+
+    if error_text:
+        lines.append(
+            "Last API Error: " + safe_html(error_text)
+        )
+
+    return "<br>".join(lines)
 
 
 def build_portfolio_status_html():
@@ -770,19 +1190,52 @@ def build_portfolio_status_html():
         return "Portfolio Module is off."
 
     if last_portfolio_entry is None:
-        return "Portfolio bridge not loaded yet. Press Test Portfolio Bridge or Refresh Quotes."
+        return (
+            "Portfolio bridge not loaded yet. "
+            "Press Test Portfolio Bridge or Refresh Quotes."
+        )
 
     lines = []
-    lines.append("Status: " + safe_html(portfolio_status_short()))
-    lines.append("Top Line: " + safe_html(last_portfolio_entry.get("price_line", "")))
-    lines.append("Bottom Line: " + safe_html(last_portfolio_entry.get("change_line", "")))
+    lines.append(
+        "Status: " + safe_html(portfolio_status_short())
+    )
+    lines.append(
+        "API Mode: "
+        + safe_html(
+            last_portfolio_entry.get(
+                "bridge_api_mode",
+                "unknown"
+            )
+        )
+    )
+    lines.append(
+        "Bridge Version: "
+        + safe_html(
+            last_portfolio_entry.get(
+                "bridge_version",
+                "unknown"
+            )
+        )
+    )
+    lines.append(
+        "Top Line: "
+        + safe_html(
+            last_portfolio_entry.get("price_line", "")
+        )
+    )
+    lines.append(
+        "Bottom Line: "
+        + safe_html(
+            last_portfolio_entry.get("change_line", "")
+        )
+    )
 
     err = last_portfolio_entry.get("error_reason", "")
+
     if err:
         lines.append("Last Error: " + safe_html(err))
 
     return "<br>".join(lines)
-
 
 def logo_status_for_symbol(sym):
     path = "/logos/{}.bmp".format(sym)
@@ -911,6 +1364,9 @@ def setup_completion_counts():
     checks.append((wifi.radio.connected, "WiFi connected"))
     checks.append((api_ready_for_quotes(), "API key or demo mode ready"))
     checks.append((len(SYMBOLS) > 0, "Symbols saved"))
+    if is_portfolio_enabled():
+        checks.append((bool(str(config.get("portfolio_bridge_url", "")).strip()), "Portfolio bridge URL saved"))
+        checks.append((bool(str(config.get("portfolio_bridge_key", "")).strip()), "Portfolio bridge key saved"))
     checks.append((str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed"))
     checks.append((file_exists(BACKUP_APP_PATH), "OTA backup available"))
     return checks
@@ -945,6 +1401,13 @@ def build_setup_checklist_html():
         items.append(setup_checklist_item(bool(get_saved_customer_api_key()), "Finnhub API key saved", "Open Setup Wizard and paste a Finnhub API key."))
 
     items.append(setup_checklist_item(len(SYMBOLS) > 0, "Stock symbols saved", "Add symbols in the Tickers section."))
+
+    if is_portfolio_enabled():
+        items.append(setup_checklist_item(bool(str(config.get("portfolio_bridge_url", "")).strip()), "Portfolio bridge URL saved", "Enter the Raspberry Pi bridge URL in Portfolio Module."))
+        items.append(setup_checklist_item(bool(str(config.get("portfolio_bridge_key", "")).strip()), "Portfolio bridge key saved", "Enter the display key from the local bridge."))
+        bridge_ready = bool(last_portfolio_entry and not last_portfolio_entry.get("error_reason"))
+        items.append(setup_checklist_item(bridge_ready, "Portfolio bridge reachable", "Use Test Portfolio Bridge after saving the URL and key."))
+
     items.append(setup_checklist_item(str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed", "For sold units, change the default 1234 PIN."))
     items.append(setup_checklist_item(file_exists(BACKUP_APP_PATH), "Rollback backup available", "Install an OTA update once to create app_backup.py."))
     items.append(setup_checklist_item(launcher_status_text() == "Installed", "Auto-recovery launcher installed", "Install it from Software Update."))
@@ -970,6 +1433,16 @@ def system_health_state():
         return "DEMO", "Demo Mode", "warnbadge"
     if bool_from_form(config.get("panel_sleep", False)):
         return "SLEEP", "Display Sleeping", "infobadge"
+
+    if is_portfolio_enabled():
+        if not str(config.get("portfolio_bridge_url", "")).strip():
+            return "SETUP", "Bridge URL Needed", "warnbadge"
+        if not str(config.get("portfolio_bridge_key", "")).strip():
+            return "SETUP", "Bridge Key Needed", "warnbadge"
+        if last_portfolio_entry and last_portfolio_entry.get("error_reason"):
+            return "WARNING", "Bridge Offline", "warnbadge"
+        if last_portfolio_entry and last_portfolio_entry.get("stale"):
+            return "WARNING", "Portfolio Stale", "warnbadge"
 
     stale_count = 0
     for sym in SYMBOLS:
@@ -1156,11 +1629,20 @@ def build_support_report_text():
     lines.append("Device Name: " + str(config.get("device_name", "StockTicker")))
     lines.append("Device ID: " + str(DEVICE_ID))
     lines.append("App Version: " + str(APP_VERSION))
+    lines.append("Config Schema: " + str(config.get("config_schema_version", CONFIG_SCHEMA_VERSION)))
     lines.append("IP Address: " + str(ip))
     lines.append("System Health: " + system_health_state()[1])
     lines.append("Panel Display: " + panel_state_text())
     lines.append("Market Status: " + get_market_status(eastern_time_now()))
     lines.append("Quote Status: " + quote_status_short())
+    lines.append("Portfolio Status: " + portfolio_status_short())
+    lines.append("Portfolio Mode: " + str(config.get("portfolio_mode", "off")))
+    lines.append("Portfolio API Preference: " + ("v1 first" if bool_from_form(config.get("portfolio_prefer_api_v1", True)) else "legacy first"))
+    lines.append("Portfolio API Mode: " + str(last_portfolio_api_status.get("mode", "not_checked")))
+    lines.append("Portfolio API Version: " + str(last_portfolio_api_status.get("api_version", "unknown")))
+    lines.append("Portfolio Schema: " + str(last_portfolio_api_status.get("schema_version", "unknown")))
+    lines.append("Bridge Version: " + str(last_portfolio_api_status.get("bridge_version", "unknown")))
+    lines.append("Bridge Key Saved: " + yes_no(bool(str(config.get("portfolio_bridge_key", "")).strip())))
     lines.append("WiFi Connected: " + yes_no(wifi.radio.connected))
     lines.append("Time Sync OK: " + yes_no(time_sync_ok))
     lines.append("Demo Mode: " + yes_no(is_demo_mode()))
@@ -1286,7 +1768,9 @@ h1 { margin-top:0; }
 <div class="card"><h2>API key</h2><p>Stock quotes require a Finnhub API key unless Demo Mode is enabled. The saved key is hidden for security.</p></div>
 <div class="card"><h2>Demo Mode</h2><p>Demo Mode shows sample prices for display/testing. It is not real market data and should be turned off for normal use.</p></div>
 <div class="card"><h2>Colors and labels</h2><p>Green means up, red means down, purple can indicate pre-market/after-hours. OLD means cached or stale data.</p></div>
-<div class="card"><h2>Software updates</h2><p>Read Release Notes, then use Check for Update and Install Update. Rollback restores the previous app if an update has problems.</p></div>
+<div class="card"><h2>Portfolio bridge</h2><p>Portfolio mode is optional. Enter the local Raspberry Pi bridge URL and display key, then use Test Portfolio Bridge. API v1 is preferred automatically and the legacy endpoint remains available as a fallback.</p></div>
+<div class="card"><h2>Privacy mode</h2><p>Portfolio Privacy Mode hides portfolio value, daily money change, cash, buying power, and mover amounts from the LED display. It does not disconnect Schwab or delete data from the local bridge.</p></div>
+<div class="card"><h2>Software updates</h2><p>Read Release Notes, then use Check for Update and Install Update. Rollback restores the previous app if an update has problems. WiFi, API keys, symbols, portfolio settings, and bridge keys remain in their separate settings files.</p></div>
 <div class="card"><h2>Sleep Display</h2><p>Sleep Display blanks the LED panels without unplugging the device. The dashboard, WiFi, OTA, and settings continue to work.</p></div>
 <div class="card"><h2>Logos</h2><p>BMP logos go in /logos/SYMBOL.bmp. Missing logos are harmless; the ticker automatically uses a clean text fallback.</p></div>
 <p><a href="/">Back to Dashboard</a></p>
@@ -1876,14 +2360,20 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <option value="local_bridge" {portfolio_bridge_selected}>Local Bridge / Raspberry Pi</option>
 </select>
 <label>Bridge URL</label>
-<input name="portfolio_bridge_url" value="{portfolio_bridge_url}" placeholder="http://192.168.2.85:8787/portfolio">
+<input name="portfolio_bridge_url" value="{portfolio_bridge_url}" placeholder="http://192.168.2.85:8787">
+<p class="small">You may enter the bridge base URL, the legacy /portfolio URL, or the API v1 URL. The ticker will normalize it automatically.</p>
 <label>Bridge Display Key</label>
 <input name="portfolio_bridge_key" type="password" value="" placeholder="{portfolio_bridge_key_placeholder}">
-<p class="small">The saved bridge key is hidden. Leave blank to keep it. The S3 only receives portfolio summary data.</p>
+<p class="small">The saved bridge key is hidden. Leave blank to keep it. API v1 sends this key in a request header instead of the URL.</p>
+<label>Prefer API v1</label>
+<select name="portfolio_prefer_api_v1">
+<option value="true" {portfolio_prefer_v1_true_selected}>True - API v1 with legacy fallback</option>
+<option value="false" {portfolio_prefer_v1_false_selected}>False - legacy first</option>
+</select>
 <label>Privacy Mode</label>
 <select name="portfolio_privacy_mode">
-<option value="false" {portfolio_privacy_false_selected}>False - show portfolio value</option>
-<option value="true" {portfolio_privacy_true_selected}>True - hide portfolio value/cash</option>
+<option value="false" {portfolio_privacy_false_selected}>False - show enabled portfolio fields</option>
+<option value="true" {portfolio_privacy_true_selected}>True - hide all monetary portfolio values</option>
 </select>
 <label>Show Portfolio Value</label>
 <select name="portfolio_show_value">
@@ -1900,12 +2390,35 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <option value="true" {portfolio_cash_true_selected}>True</option>
 <option value="false" {portfolio_cash_false_selected}>False</option>
 </select>
+<label>Show Buying Power</label>
+<select name="portfolio_show_buying_power">
+<option value="true" {portfolio_buying_power_true_selected}>True</option>
+<option value="false" {portfolio_buying_power_false_selected}>False</option>
+</select>
+<label>Show Position Count</label>
+<select name="portfolio_show_positions_count">
+<option value="true" {portfolio_positions_true_selected}>True</option>
+<option value="false" {portfolio_positions_false_selected}>False</option>
+</select>
+<label>Show Largest Winner</label>
+<select name="portfolio_show_largest_winner">
+<option value="true" {portfolio_winner_true_selected}>True</option>
+<option value="false" {portfolio_winner_false_selected}>False</option>
+</select>
+<label>Show Largest Loser</label>
+<select name="portfolio_show_largest_loser">
+<option value="true" {portfolio_loser_true_selected}>True</option>
+<option value="false" {portfolio_loser_false_selected}>False</option>
+</select>
 <label>Portfolio Stale Minutes</label>
 <input name="portfolio_stale_minutes" value="{portfolio_stale_minutes}">
+<label>Capabilities Refresh Minutes</label>
+<input name="portfolio_capabilities_refresh_minutes" value="{portfolio_capabilities_refresh_minutes}">
 <button class="green" type="submit">Save Portfolio Settings</button>
 </form>
 <form method="POST" action="/test-portfolio"><button type="submit">Test Portfolio Bridge</button></form>
 <p>{portfolio_test_message}</p>
+<p class="small"><b>Bridge API Status</b><br>{portfolio_api_status_message}</p>
 </div>
 </div>
 </details>
@@ -2193,8 +2706,14 @@ def save_customer_setup(request: Request):
         config["portfolio_show_value"] = bool_from_form(form.get("portfolio_show_value", config.get("portfolio_show_value", True)))
         config["portfolio_show_day_change"] = bool_from_form(form.get("portfolio_show_day_change", config.get("portfolio_show_day_change", True)))
         config["portfolio_show_cash"] = bool_from_form(form.get("portfolio_show_cash", config.get("portfolio_show_cash", True)))
+        config["portfolio_show_buying_power"] = bool_from_form(form.get("portfolio_show_buying_power", config.get("portfolio_show_buying_power", True)))
+        config["portfolio_show_positions_count"] = bool_from_form(form.get("portfolio_show_positions_count", config.get("portfolio_show_positions_count", True)))
+        config["portfolio_show_largest_winner"] = bool_from_form(form.get("portfolio_show_largest_winner", config.get("portfolio_show_largest_winner", True)))
+        config["portfolio_show_largest_loser"] = bool_from_form(form.get("portfolio_show_largest_loser", config.get("portfolio_show_largest_loser", True)))
+        config["portfolio_prefer_api_v1"] = bool_from_form(form.get("portfolio_prefer_api_v1", config.get("portfolio_prefer_api_v1", True)))
         config["portfolio_privacy_mode"] = bool_from_form(form.get("portfolio_privacy_mode", config.get("portfolio_privacy_mode", False)))
         config["portfolio_stale_minutes"] = clamp_int(form.get("portfolio_stale_minutes", config.get("portfolio_stale_minutes", 15)), 1, 1440, DEFAULT_CONFIG["portfolio_stale_minutes"])
+        config["portfolio_capabilities_refresh_minutes"] = clamp_int(form.get("portfolio_capabilities_refresh_minutes", config.get("portfolio_capabilities_refresh_minutes", 60)), 5, 1440, DEFAULT_CONFIG["portfolio_capabilities_refresh_minutes"])
 
         channel = url_decode(str(form.get("update_channel", config.get("update_channel", "stable")))).strip().lower()
         config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
@@ -2304,6 +2823,8 @@ def index(request: Request):
             portfolio_bridge_selected=selected("local_bridge", config.get("portfolio_mode", "off")),
             portfolio_bridge_url=safe_html(config.get("portfolio_bridge_url", "")),
             portfolio_bridge_key_placeholder="Saved key hidden. Leave blank to keep it." if str(config.get("portfolio_bridge_key", "")).strip() else "Paste display key here",
+            portfolio_prefer_v1_true_selected=selected("true", str(config.get("portfolio_prefer_api_v1", True)).lower()),
+            portfolio_prefer_v1_false_selected=selected("false", str(config.get("portfolio_prefer_api_v1", True)).lower()),
             portfolio_privacy_true_selected=selected("true", str(config.get("portfolio_privacy_mode", False)).lower()),
             portfolio_privacy_false_selected=selected("false", str(config.get("portfolio_privacy_mode", False)).lower()),
             portfolio_value_true_selected=selected("true", str(config.get("portfolio_show_value", True)).lower()),
@@ -2312,7 +2833,17 @@ def index(request: Request):
             portfolio_day_false_selected=selected("false", str(config.get("portfolio_show_day_change", True)).lower()),
             portfolio_cash_true_selected=selected("true", str(config.get("portfolio_show_cash", True)).lower()),
             portfolio_cash_false_selected=selected("false", str(config.get("portfolio_show_cash", True)).lower()),
+            portfolio_buying_power_true_selected=selected("true", str(config.get("portfolio_show_buying_power", True)).lower()),
+            portfolio_buying_power_false_selected=selected("false", str(config.get("portfolio_show_buying_power", True)).lower()),
+            portfolio_positions_true_selected=selected("true", str(config.get("portfolio_show_positions_count", True)).lower()),
+            portfolio_positions_false_selected=selected("false", str(config.get("portfolio_show_positions_count", True)).lower()),
+            portfolio_winner_true_selected=selected("true", str(config.get("portfolio_show_largest_winner", True)).lower()),
+            portfolio_winner_false_selected=selected("false", str(config.get("portfolio_show_largest_winner", True)).lower()),
+            portfolio_loser_true_selected=selected("true", str(config.get("portfolio_show_largest_loser", True)).lower()),
+            portfolio_loser_false_selected=selected("false", str(config.get("portfolio_show_largest_loser", True)).lower()),
             portfolio_stale_minutes=config.get("portfolio_stale_minutes", 15),
+            portfolio_capabilities_refresh_minutes=config.get("portfolio_capabilities_refresh_minutes", 60),
+            portfolio_api_status_message=build_portfolio_api_status_html(),
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
         ),
@@ -2375,14 +2906,25 @@ def test_portfolio_route(request: Request):
         set_web_message(portfolio_test_message)
         return Response(request, clean_page("Portfolio Test", portfolio_test_message), content_type="text/html")
 
+    fetch_bridge_capabilities(True)
     entry = fetch_portfolio_entry()
     last_portfolio_entry = entry
 
     if entry and not entry.get("error_reason"):
-        portfolio_test_message = "Portfolio bridge works: {} {}".format(entry.get("price_line", ""), entry.get("change_line", ""))
+        portfolio_test_message = (
+            "Portfolio bridge works via {} (bridge {}). {} {}"
+        ).format(
+            entry.get("bridge_api_mode", "unknown"),
+            entry.get("bridge_version", "unknown"),
+            entry.get("price_line", ""),
+            entry.get("change_line", "")
+        )
         set_web_message("Portfolio bridge tested successfully.")
     else:
-        portfolio_test_message = "Portfolio bridge test failed or returned cached/offline data. Check Pi IP, bridge key, and /portfolio JSON."
+        portfolio_test_message = (
+            "Portfolio bridge test failed or returned cached/offline data. "
+            "Check Pi IP, bridge key, and bridge API status."
+        )
         set_error_message(portfolio_test_message)
 
     return Response(request, clean_page("Portfolio Test Complete", portfolio_test_message), content_type="text/html")
@@ -2546,8 +3088,14 @@ def save_cfg(request: Request):
         config["portfolio_show_value"] = bool_from_form(form.get("portfolio_show_value", config.get("portfolio_show_value", True)))
         config["portfolio_show_day_change"] = bool_from_form(form.get("portfolio_show_day_change", config.get("portfolio_show_day_change", True)))
         config["portfolio_show_cash"] = bool_from_form(form.get("portfolio_show_cash", config.get("portfolio_show_cash", True)))
+        config["portfolio_show_buying_power"] = bool_from_form(form.get("portfolio_show_buying_power", config.get("portfolio_show_buying_power", True)))
+        config["portfolio_show_positions_count"] = bool_from_form(form.get("portfolio_show_positions_count", config.get("portfolio_show_positions_count", True)))
+        config["portfolio_show_largest_winner"] = bool_from_form(form.get("portfolio_show_largest_winner", config.get("portfolio_show_largest_winner", True)))
+        config["portfolio_show_largest_loser"] = bool_from_form(form.get("portfolio_show_largest_loser", config.get("portfolio_show_largest_loser", True)))
+        config["portfolio_prefer_api_v1"] = bool_from_form(form.get("portfolio_prefer_api_v1", config.get("portfolio_prefer_api_v1", True)))
         config["portfolio_privacy_mode"] = bool_from_form(form.get("portfolio_privacy_mode", config.get("portfolio_privacy_mode", False)))
         config["portfolio_stale_minutes"] = clamp_int(form.get("portfolio_stale_minutes", config.get("portfolio_stale_minutes", 15)), 1, 1440, DEFAULT_CONFIG["portfolio_stale_minutes"])
+        config["portfolio_capabilities_refresh_minutes"] = clamp_int(form.get("portfolio_capabilities_refresh_minutes", config.get("portfolio_capabilities_refresh_minutes", 60)), 5, 1440, DEFAULT_CONFIG["portfolio_capabilities_refresh_minutes"])
 
         channel = url_decode(str(form.get("update_channel", config["update_channel"]))).strip().lower()
         config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
@@ -2706,6 +3254,8 @@ def build_ota_status_summary(manifest=None):
     beta_version = "unknown"
     selected_version = "unknown"
     selected_url = "unknown"
+    selected_hash = "not provided"
+    selected_hardware = "not provided"
 
     if manifest:
         manifest_state = "OK"
@@ -2720,8 +3270,14 @@ def build_ota_status_summary(manifest=None):
         selected_version = str(info.get("version", "unknown"))
         selected_url = str(info.get("app_url", "unknown"))
 
+        if str(info.get("sha256", "")).strip():
+            selected_hash = "provided"
+        selected_hardware = str(info.get("hardware", "not provided"))
+
     return (
         "Current Version: {}<br>"
+        "Device Model: {}<br>"
+        "Config Schema: {}<br>"
         "Current Channel: {}<br>"
         "Manifest URL: {}<br>"
         "Manifest Status: {}<br>"
@@ -2729,10 +3285,15 @@ def build_ota_status_summary(manifest=None):
         "Beta Online: {}<br>"
         "Selected Version: {}<br>"
         "Selected URL: {}<br>"
+        "Selected Hardware: {}<br>"
+        "SHA-256: {}<br>"
         "Backup File: {}<br>"
+        "Protected Settings: config, WiFi, symbols, holidays, device ID<br>"
         "Last OTA Message: {}"
     ).format(
         APP_VERSION,
+        DEVICE_MODEL,
+        config.get("config_schema_version", CONFIG_SCHEMA_VERSION),
         channel,
         config.get("update_manifest_url", ""),
         manifest_state,
@@ -2740,9 +3301,12 @@ def build_ota_status_summary(manifest=None):
         beta_version,
         selected_version,
         selected_url,
+        selected_hardware,
+        selected_hash,
         backup_state,
         ota_message
     )
+
 
 @server.route("/check-cloud-status", methods=["POST"])
 def check_cloud_status(request: Request):
@@ -2752,6 +3316,7 @@ def check_cloud_status(request: Request):
     quote_ok = False
     calendar_ok = False
     wifi_ok = False
+    portfolio_ok = None
 
     try:
         wifi_ok = wifi.radio.connected
@@ -2789,16 +3354,31 @@ def check_cloud_status(request: Request):
     except Exception:
         calendar_ok = False
 
+    if is_portfolio_enabled():
+        try:
+            caps = fetch_bridge_capabilities(True)
+            portfolio_ok = bool(caps.get("available", False))
+        except Exception:
+            portfolio_ok = False
+
+    portfolio_text = "OFF"
+    if portfolio_ok is True:
+        portfolio_text = "OK"
+    elif portfolio_ok is False:
+        portfolio_text = "ERROR"
+
     cloud_status_message = (
         "WiFi: {}<br>"
         "OTA Server: {}<br>"
         "Quote API: {}<br>"
+        "Portfolio Bridge: {}<br>"
         "Time Sync: {}<br>"
         "Market Calendar: {}"
     ).format(
         "OK" if wifi_ok else "ERROR",
         "OK" if ota_ok else "ERROR",
         "OK" if quote_ok else "ERROR",
+        portfolio_text,
         "OK" if time_sync_ok else "ERROR",
         "OK" if calendar_ok else "ERROR"
     )
@@ -2957,6 +3537,93 @@ def install_auto_recovery(request: Request):
         return Response(request, clean_page("Install Failed", last_error_message), content_type="text/html")
 
 
+def ota_protected_settings_snapshot():
+    snapshot = {}
+
+    for path in (
+        CONFIG_FILE,
+        WIFI_FILE,
+        SYMBOLS_FILE,
+        HOLIDAYS_FILE,
+        DEVICE_FILE
+    ):
+        try:
+            snapshot[path] = os.stat(path)[6]
+        except Exception:
+            snapshot[path] = None
+
+    return snapshot
+
+
+def verify_update_payload(new_code, info):
+    if len(new_code) < 1000:
+        return False, "Downloaded app.py was too small."
+
+    if "APP.PY STARTED" not in new_code:
+        return False, "Downloaded file does not look like app.py."
+
+    latest = str(info.get("version", "")).strip()
+
+    if not latest:
+        return False, "Manifest is missing the update version."
+
+    expected_version_line = 'APP_VERSION = "{}"'.format(latest)
+
+    if expected_version_line not in new_code[:500]:
+        return False, "Downloaded app.py version does not match the manifest."
+
+    hardware = info.get("hardware", [])
+
+    if isinstance(hardware, str):
+        hardware = [hardware]
+
+    if hardware and DEVICE_MODEL not in hardware:
+        return False, "Update is not compatible with this hardware model."
+
+    try:
+        minimum_schema = int(info.get("minimum_config_schema", 0) or 0)
+    except Exception:
+        minimum_schema = 0
+
+    if minimum_schema > CONFIG_SCHEMA_VERSION:
+        return False, "Update requires a newer configuration schema."
+
+    expected_size = info.get("size", None)
+    expected_hash = str(info.get("sha256", "")).strip().lower()
+
+    if expected_hash and hashlib is None:
+        return False, "SHA-256 is required by the manifest but unavailable on this firmware."
+
+    try:
+        actual_size = 0
+        hasher = hashlib.sha256() if expected_hash else None
+
+        for start in range(0, len(new_code), 512):
+            chunk = new_code[start:start + 512].encode("utf-8")
+            actual_size += len(chunk)
+
+            if hasher is not None:
+                hasher.update(chunk)
+
+        if expected_size is not None and actual_size != int(expected_size):
+            return False, "Downloaded app.py size does not match the manifest."
+
+        if hasher is not None:
+            digest = hasher.digest()
+            actual_hash = "".join(
+                "{:02x}".format(byte)
+                for byte in digest
+            ).lower()
+
+            if actual_hash != expected_hash:
+                return False, "Downloaded app.py failed SHA-256 verification."
+
+    except Exception as e:
+        return False, "Update integrity verification failed: " + repr(e)
+
+    return True, "Update payload verified."
+
+
 @server.route("/check-update", methods=["POST"])
 def check_update(request: Request):
     global ota_message, ota_status_message
@@ -3019,19 +3686,25 @@ def install_update(request: Request):
     try:
         print("Downloading update:", app_url)
 
-        r = requests.get(app_url)
-        new_code = r.text
-        r.close()
+        response = requests.get(app_url)
+        new_code = response.text
+        response.close()
 
-        if len(new_code) < 1000:
-            ota_message = "Downloaded app.py was too small."
-            set_error_message(ota_message)
-            return Response(request, clean_page("Update Failed", ota_message), content_type="text/html")
+        payload_ok, payload_message = verify_update_payload(
+            new_code,
+            info
+        )
 
-        if "APP.PY STARTED" not in new_code:
-            ota_message = "Downloaded file does not look like app.py."
-            set_error_message(ota_message)
-            return Response(request, clean_page("Update Failed", ota_message), content_type="text/html")
+        if not payload_ok:
+            ota_message = payload_message
+            set_error_message(payload_message)
+            return Response(
+                request,
+                clean_page("Update Failed", payload_message),
+                content_type="text/html"
+            )
+
+        protected_before = ota_protected_settings_snapshot()
 
         backup_ok, backup_msg = backup_current_app()
 
@@ -3045,11 +3718,27 @@ def install_update(request: Request):
         with open(APP_PATH, "w") as app_file:
             app_file.write(new_code)
 
+        protected_after = ota_protected_settings_snapshot()
+
+        if protected_after != protected_before:
+            rollback_ok, rollback_msg = rollback_to_backup()
+            ota_message = "OTA stopped because protected settings changed unexpectedly."
+            set_error_message(
+                ota_message + " " + str(rollback_msg)
+            )
+            return Response(
+                request,
+                clean_page("Update Reverted", last_error_message),
+                content_type="text/html"
+            )
+
         ota_message = "Installed version {}. Restarting...".format(latest)
         ota_status_message = build_ota_status_summary(manifest)
         restart_requested = True
         restart_time = time.monotonic() + 2.0
-        set_web_message(ota_message)
+        set_web_message(
+            ota_message + " " + payload_message
+        )
 
         return Response(request, clean_page("Update Installed", ota_message), content_type="text/html")
 
