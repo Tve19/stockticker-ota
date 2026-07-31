@@ -1,10 +1,9 @@
-{
-  "stable": {
+ "stable": {
     "version": "1.1.16",
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
-    "notes": "Stable customer-ready ticker release with setup wizard, professional dashboard, API key setup, demo mode, sleep display, support report, OTA, and rollback."
+    "notes": "Stable customer-ready ticker release."
   },
- "beta": {
+  "beta": {
     "version": "1.1.22-beta",
     "app_url": "https://stockticker-ota.pages.dev/Beta/1.1.22/app.py",
     "notes": "Final 1.1.22 integrity release using deterministic bundled software SHA-256 verification.",
