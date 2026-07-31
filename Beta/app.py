@@ -186,15 +186,9 @@ class _SoftwareSHA256:
 
 
 def create_sha256_hasher():
-    if hashlib is not None:
-        try:
-            return hashlib.new("sha256"), "native"
-        except Exception as e:
-            print(
-                "Native SHA-256 unavailable; using software fallback:",
-                repr(e)
-            )
-
+    # MatrixPortal S3 CircuitPython builds can expose hashlib while still
+    # rejecting SHA-256 at runtime. Use the bundled implementation every time
+    # so OTA verification behaves consistently across firmware builds.
     return _SoftwareSHA256(), "software"
 
 
