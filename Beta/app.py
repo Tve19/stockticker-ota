@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.20-beta"
+APP_VERSION = "1.1.21-beta"
 CONFIG_SCHEMA_VERSION = 2
 PORTFOLIO_API_SCHEMA_SUPPORTED = 1
 DEVICE_MODEL = "matrix_portal_s3"
@@ -3850,11 +3850,14 @@ def verify_update_payload(new_code, info):
     expected_hash = str(info.get("sha256", "")).strip().lower()
 
     if expected_hash and hashlib is None:
-        return False, "SHA-256 is required by the manifest but unavailable on this firmware."
+        return False, (
+            "SHA-256 is required by the manifest but the CircuitPython "
+            "hashlib module is unavailable."
+        )
 
     try:
         actual_size = 0
-        hasher = hashlib.sha256() if expected_hash else None
+        hasher = hashlib.new("sha256") if expected_hash else None
 
         for start in range(0, len(new_code), 512):
             chunk = new_code[start:start + 512].encode("utf-8")
