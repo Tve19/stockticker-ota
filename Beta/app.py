@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.18-beta"
+APP_VERSION = "1.1.20-beta"
 CONFIG_SCHEMA_VERSION = 2
 PORTFOLIO_API_SCHEMA_SUPPORTED = 1
 DEVICE_MODEL = "matrix_portal_s3"
@@ -486,6 +486,13 @@ def safe_html(text):
     return text
 
 
+def safe_attr(text):
+    text = safe_html(text)
+    text = text.replace('"', "&quot;")
+    text = text.replace("'", "&#39;")
+    return text
+
+
 def add_event(message):
     try:
         stamp = format_12h(eastern_time_now())
@@ -724,6 +731,50 @@ def portfolio_bridge_base_url():
             break
 
     return url
+
+
+def portfolio_bridge_dashboard_url():
+    base = portfolio_bridge_base_url()
+
+    if not base:
+        return ""
+
+    return base + "/dashboard"
+
+
+def portfolio_bridge_health_url():
+    base = portfolio_bridge_base_url()
+
+    if not base:
+        return ""
+
+    return base + "/health"
+
+
+def build_portfolio_bridge_links_html():
+    dashboard_url = portfolio_bridge_dashboard_url()
+    health_url = portfolio_bridge_health_url()
+
+    if not dashboard_url:
+        return (
+            "<span class='linkbtn disabled'>"
+            "Save Bridge URL First"
+            "</span>"
+        )
+
+    return (
+        "<a class='linkbtn portfolio-link' "
+        "href='{}' target='_blank' rel='noopener'>"
+        "Open Portfolio Dashboard"
+        "</a>"
+        "<a class='linkbtn secondary-link' "
+        "href='{}' target='_blank' rel='noopener'>"
+        "Bridge Health"
+        "</a>"
+    ).format(
+        safe_attr(dashboard_url),
+        safe_attr(health_url)
+    )
 
 
 def portfolio_legacy_url():
@@ -1112,10 +1163,10 @@ def fetch_portfolio_entry():
             old["used_cached"] = True
             old["error_reason"] = reason
 
-            if "OLD" not in str(old.get("change_line", "")):
-                old["change_line"] = (
-                    str(old.get("change_line", "")) + " OLD"
-                )
+            old["change_line"] = (
+                "OFFLINE OLD "
+                + str(old.get("updated_text", "unknown"))
+            )
 
             return old
 
@@ -1151,6 +1202,21 @@ def portfolio_status_short():
     return "OK " + str(
         last_portfolio_entry.get("updated_text", "")
     )
+
+
+def portfolio_api_mode_short():
+    mode = str(
+        last_portfolio_api_status.get("mode", "not_checked")
+    )
+
+    if mode == "v1":
+        return "API v1"
+    if mode == "legacy":
+        return "Legacy"
+    if mode == "failed":
+        return "Offline"
+
+    return "Not checked"
 
 
 def build_portfolio_api_status_html():
@@ -2233,36 +2299,209 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 .button-row {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
 .button-row form {{ margin:0; }}
 .slim {{ margin-bottom:10px; }}
+
+/* Customer dashboard polish */
+:root {{
+  --bg:#06101d;
+  --panel:#101d31;
+  --panel2:#0a1627;
+  --line:#263b5d;
+  --text:#f4f8ff;
+  --muted:#a9bddb;
+  --blue:#3994ff;
+  --green:#29bb73;
+  --orange:#dc8b16;
+  --red:#d34b4b;
+}}
+body {{
+  background:
+    radial-gradient(circle at top right, #132c4c 0, #07111f 38%, #050b14 100%);
+  color:var(--text);
+  min-height:100vh;
+}}
+.wrap {{ max-width:1080px; }}
+.hero {{
+  background:
+    linear-gradient(135deg, rgba(31,140,255,.18), rgba(16,27,46,.96) 46%, rgba(11,22,39,.98));
+  border-color:#31527f;
+  box-shadow:0 18px 45px rgba(0,0,0,.28);
+  padding:22px;
+}}
+.hero h1 {{ font-size:29px; letter-spacing:-.5px; }}
+.eyebrow {{
+  color:#79c7ff;
+  font-size:12px;
+  font-weight:bold;
+  letter-spacing:1.4px;
+  text-transform:uppercase;
+  margin-bottom:7px;
+}}
+.hero-subtitle {{
+  color:var(--muted);
+  margin:0;
+  line-height:1.5;
+}}
+.card {{
+  background:linear-gradient(180deg, rgba(16,29,49,.98), rgba(12,23,40,.98));
+  border-color:var(--line);
+  box-shadow:0 10px 25px rgba(0,0,0,.16);
+}}
+.stat {{
+  background:rgba(5,15,27,.72);
+  border-color:#2a4166;
+  min-height:48px;
+}}
+.stat-value {{
+  font-size:17px;
+  font-weight:bold;
+  margin-top:4px;
+}}
+.quicknav {{
+  position:sticky;
+  top:8px;
+  z-index:10;
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  padding:10px;
+  margin:0 0 14px;
+  border:1px solid var(--line);
+  border-radius:15px;
+  background:rgba(7,17,31,.94);
+  backdrop-filter:blur(9px);
+  box-shadow:0 8px 25px rgba(0,0,0,.22);
+}}
+.quicknav a {{
+  color:#dcecff;
+  text-decoration:none;
+  font-size:13px;
+  font-weight:bold;
+  padding:8px 11px;
+  border-radius:9px;
+  background:#10233c;
+  border:1px solid #284a72;
+}}
+.quicknav a:hover {{ background:#18365c; }}
+.linkbtn {{
+  display:inline-block;
+  margin:7px 8px 0 0;
+  padding:10px 13px;
+  border-radius:10px;
+  color:white;
+  text-decoration:none;
+  font-weight:bold;
+  background:var(--blue);
+  border:1px solid rgba(255,255,255,.12);
+}}
+.portfolio-link {{
+  background:linear-gradient(135deg, #7a4cff, #2b8cff);
+}}
+.secondary-link {{ background:#1a334f; }}
+.linkbtn.disabled {{
+  background:#28374a;
+  color:#9badc4;
+  cursor:not-allowed;
+}}
+.feature-card {{
+  position:relative;
+  overflow:hidden;
+}}
+.feature-card:after {{
+  content:"";
+  position:absolute;
+  width:130px;
+  height:130px;
+  border-radius:50%;
+  right:-75px;
+  top:-75px;
+  background:rgba(57,148,255,.10);
+}}
+.card-kicker {{
+  color:#79c7ff;
+  font-size:11px;
+  font-weight:bold;
+  letter-spacing:1.1px;
+  text-transform:uppercase;
+  margin-bottom:7px;
+}}
+.status-line {{
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  padding:9px 0;
+  border-bottom:1px solid rgba(64,90,126,.45);
+}}
+.status-line:last-child {{ border-bottom:0; }}
+.status-line span:first-child {{ color:var(--muted); }}
+.status-line b {{ text-align:right; }}
+.section-note {{
+  border-left:3px solid #3994ff;
+  padding:9px 11px;
+  background:rgba(31,140,255,.08);
+  border-radius:0 9px 9px 0;
+  color:#bdd4ef;
+  font-size:13px;
+  line-height:1.45;
+}}
+summary {{
+  padding:4px 0;
+  font-size:16px;
+}}
+button, .linkbtn, .quicknav a {{
+  transition:transform .12s ease, filter .12s ease;
+}}
+button:hover, .linkbtn:hover, .quicknav a:hover {{
+  filter:brightness(1.1);
+  transform:translateY(-1px);
+}}
+@media (max-width:620px) {{
+  body {{ padding:10px; }}
+  .hero {{ padding:17px; }}
+  .hero h1 {{ font-size:24px; }}
+  .quicknav {{ position:static; }}
+  .grid {{ grid-template-columns:1fr; }}
+}}
 </style>
 </head>
 <body>
 <div class="wrap">
-<div class="hero">
+<div class="hero" id="overview">
 <div class="topline">
 <div>
+<div class="eyebrow">StockTicker Control Center</div>
 <h1>{device_name}</h1>
-<p class="small">Professional LED market display · {device_id}</p>
+<p class="hero-subtitle">Professional LED market display · {device_id}</p>
 </div>
 <div>{system_health_badge}</div>
 </div>
 <div class="grid">
-<div class="stat"><b>Version</b><br>{version}</div>
-<div class="stat"><b>Market</b><br>{market_status}</div>
-<div class="stat"><b>Quotes</b><br>{quote_status_short}</div>
-<div class="stat"><b>Portfolio</b><br>{portfolio_status_short}</div>
-<div class="stat"><b>Panel</b><br>{panel_state}</div>
-<div class="stat"><b>Setup</b><br>{setup_progress}</div>
-<div class="stat"><b>IP</b><br>{ip}</div>
+<div class="stat"><b>Firmware</b><div class="stat-value">{version}</div></div>
+<div class="stat"><b>Market</b><div class="stat-value">{market_status}</div></div>
+<div class="stat"><b>Quotes</b><div class="stat-value">{quote_status_short}</div></div>
+<div class="stat"><b>Portfolio</b><div class="stat-value">{portfolio_status_short}</div></div>
+<div class="stat"><b>Panel</b><div class="stat-value">{panel_state}</div></div>
+<div class="stat"><b>Setup</b><div class="stat-value">{setup_progress}</div></div>
+<div class="stat"><b>Device IP</b><div class="stat-value">{ip}</div></div>
 </div>
-<p class="good">Status: {last_web_message}</p>
+<p class="good"><b>Latest activity:</b> {last_web_message}</p>
 {last_error_panel}
 {onboarding_message}
 </div>
 
+<div class="quicknav">
+<a href="#overview">Overview</a>
+<a href="#portfolio">Portfolio</a>
+<a href="#display-settings">Display</a>
+<a href="#status-details">Status</a>
+<a href="#diagnostics">Diagnostics</a>
+<a href="#software-updates">Updates</a>
+</div>
+
 <div class="grid">
-<div class="card">
+<div class="card feature-card">
+<div class="card-kicker">Start Here</div>
 <h2>Customer Setup</h2>
-<p class="small">Use this for normal customer setup: device name, symbols, API key, demo mode, PIN, brightness, update channel, and logos.</p>
+<p class="small">Configure the device name, stock list, market-data key, display preferences, PIN, and update channel.</p>
 <div class="button-row">
 <form method="GET" action="/setup-wizard"><button type="submit">Open Setup Wizard</button></form>
 <form method="GET" action="/help"><button type="submit">Help / Quick Guide</button></form>
@@ -2271,9 +2510,10 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <details class="slim"><summary>Setup Checklist</summary>{setup_checklist_message}</details>
 </div>
 
-<div class="card">
+<div class="card feature-card">
+<div class="card-kicker">Daily Controls</div>
 <h2>Quick Controls</h2>
-<p class="small"><b>Panel Display:</b> {panel_state}</p>
+<div class="status-line"><span>LED panel</span><b>{panel_state}</b></div>
 <div class="button-row">
 <form method="POST" action="/panel-sleep"><button class="orange" type="submit">Sleep Display</button></form>
 <form method="POST" action="/panel-wake"><button class="green" type="submit">Wake Display</button></form>
@@ -2284,9 +2524,22 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </div>
 <p class="small">Sleep turns the LED panels black but keeps WiFi, dashboard, settings, and updates running.</p>
 </div>
+
+<div class="card feature-card" id="portfolio">
+<div class="card-kicker">Private Local Integration</div>
+<h2>Portfolio & Bridge</h2>
+<div class="status-line"><span>Portfolio status</span><b>{portfolio_status_short}</b></div>
+<div class="status-line"><span>Bridge API</span><b>{portfolio_api_mode_short}</b></div>
+<p class="section-note">The Raspberry Pi keeps Schwab credentials local. The ticker receives only sanitized display data.</p>
+<div>{portfolio_bridge_links_html}</div>
+<div class="button-row">
+<form method="POST" action="/test-portfolio"><button type="submit">Test Bridge</button></form>
+<form method="POST" action="/refresh-now"><button class="green" type="submit">Refresh Display</button></form>
+</div>
+</div>
 </div>
 
-<details class="card">
+<details class="card" id="display-settings">
 <summary>Display & Ticker Settings</summary>
 <p class="small">Common customer-facing controls. Changes save to the device and update the board after the current scroll cycle.</p>
 <div class="grid">
@@ -2351,8 +2604,11 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <button class="green" type="submit">Save Night / Demo Settings</button>
 </form>
 </div>
-<div>
+<div id="portfolio-settings">
+<div class="card-kicker">Brokerage Display</div>
 <h2>Portfolio Module</h2>
+<p class="section-note">Configure what appears on the LED display. Portfolio values stay on your home network.</p>
+<div>{portfolio_bridge_links_html}</div>
 <form method="POST" action="/save-config">
 <label>Portfolio Display</label>
 <select name="portfolio_mode">
@@ -2423,7 +2679,7 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </div>
 </details>
 
-<details class="card">
+<details class="card" id="status-details">
 <summary>Status Details</summary>
 <div class="grid">
 <div class="card">
@@ -2449,7 +2705,7 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </div>
 </details>
 
-<details class="card">
+<details class="card" id="diagnostics">
 <summary>Diagnostics & Maintenance</summary>
 <div class="grid">
 <div class="card">
@@ -2560,7 +2816,7 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </form>
 </details>
 
-<details class="card">
+<details class="card" id="software-updates">
 <summary>Software Update & Recovery</summary>
 <div class="grid">
 <div class="card">
@@ -2844,6 +3100,8 @@ def index(request: Request):
             portfolio_stale_minutes=config.get("portfolio_stale_minutes", 15),
             portfolio_capabilities_refresh_minutes=config.get("portfolio_capabilities_refresh_minutes", 60),
             portfolio_api_status_message=build_portfolio_api_status_html(),
+            portfolio_api_mode_short=portfolio_api_mode_short(),
+            portfolio_bridge_links_html=build_portfolio_bridge_links_html(),
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
         ),
