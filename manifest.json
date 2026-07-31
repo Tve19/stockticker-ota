@@ -5,13 +5,15 @@
     "notes": "Stable customer-ready ticker release."
   },
   "beta": {
-    "version": "1.1.23-repair",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1123-repair-crlf-1",
-    "notes": "One-time updater repair. Uses CircuitPython-safe immutable bytes buffering. Bootstrap intentionally omits size and SHA-256.",
+    "version": "1.1.23-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1123-final-crlf-1",
+    "notes": "Final SHA-verified 1.1.23-beta using the exact CRLF bytes served through the current GitHub/Cloudflare workflow.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 2,
+    "size": 166100,
+    "sha256": "25e87e389f491c35e7f331a623e1ea5dd6efdb2c8b3fcb818e25368e9ac8c4c7",
     "mandatory": false
   }
 }
