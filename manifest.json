@@ -3,8 +3,8 @@
     "version": "1.1.16",
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable customer-ready ticker release with setup wizard, professional dashboard, API key setup, demo mode, sleep display, support report, OTA, and rollback."
-{
-  "beta": {
+  },
+"beta": {
     "version": "1.1.22-beta",
     "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
     "notes": "Restores full OTA integrity verification using firmware version, hardware model, configuration schema, exact file size, and SHA-256. Retains the redesigned dashboard, secure Pi login integration, portfolio API v1, legacy fallback, and OFFLINE OLD handling.",
