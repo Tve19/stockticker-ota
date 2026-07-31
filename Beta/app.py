@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.21-beta"
+APP_VERSION = "1.1.22-beta"
 CONFIG_SCHEMA_VERSION = 2
 PORTFOLIO_API_SCHEMA_SUPPORTED = 1
 DEVICE_MODEL = "matrix_portal_s3"
@@ -3882,7 +3882,7 @@ def verify_update_payload(new_code, info):
     except Exception as e:
         return False, "Update integrity verification failed: " + repr(e)
 
-    return True, "Update payload verified."
+    return True, "Update payload verified: version, hardware, schema, size, and SHA-256."
 
 
 @server.route("/check-update", methods=["POST"])
