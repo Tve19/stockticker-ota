@@ -5,15 +5,13 @@
     "notes": "Stable customer-ready ticker release."
   },
   "beta": {
-    "version": "1.1.22-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/1.1.22/app.py",
-    "notes": "Final 1.1.22 integrity release using deterministic bundled software SHA-256 verification.",
+    "version": "1.1.23-repair",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1123-repair-1",
+    "notes": "One-time updater repair. Removes unsupported bytearray item deletion from software SHA-256. This bootstrap manifest intentionally omits size and sha256.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 2,
-    "size": 161122,
-    "mandatory": false,
-    "sha256": "1ccb34bdf2b37ff6a285a87d27fb1bde2182adac803561f94e89372ec7cbff79"
+    "mandatory": false
   }
 }
