@@ -4,16 +4,14 @@
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable customer-ready ticker release with setup wizard, professional dashboard, API key setup, demo mode, sleep display, support report, OTA, and rollback."
   },
-"beta": {
-    "version": "1.1.20-beta",
+  "beta": {
+    "version": "1.1.21-beta",
     "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
-    "notes": "Rounds portfolio money to whole dollars with comma separators, adds a polished customer dashboard, quick navigation, a dedicated Portfolio & Bridge overview, and safe local links to the Raspberry Pi portfolio dashboard and health page.",
+    "notes": "Repairs CircuitPython OTA SHA-256 verification by using hashlib.new('sha256'). Includes the redesigned customer dashboard, rounded portfolio values with commas, Pi dashboard links, API v1 portfolio support, legacy fallback, and OFFLINE OLD handling.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 2,
-    "size": 156218,
-    "sha256": "5b8fc2f6dc9f26e86d09084bb90f2c2fc6c55f397c3b5ebbaad9d0fa29174b9b",
     "mandatory": false
   }
 }
