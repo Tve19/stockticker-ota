@@ -5,15 +5,7 @@
     "notes": "Stable customer-ready ticker release."
   },
   "beta": {
-    "version": "1.1.25-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1125-recovery-diagnostics-4",
-    "notes": "Adds a persistent OTA journal, delayed healthy-boot confirmation, automatic rollback watchdog, pre-installation memory/storage/write/SHA checks, clear update results, and hardened secret-free support exports.",
-    "hardware": [
-      "matrix_portal_s3"
-    ],
-    "minimum_config_schema": 2,
-    "size": 214584,
-    "sha256": "bcdc49d0ebcef44ab3a27c9e234bc1ceaf9fc744035af1a3ae657866a8e6ddf2",
-    "mandatory": false
-  }
+  "version": "1.1.18-beta",
+  "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
+  "notes": "S3 can now pull quotes and portfolio data from the Raspberry Pi Local Hub, with direct Finnhub fallback."
 }
