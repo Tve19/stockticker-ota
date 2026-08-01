@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.24-beta"
+APP_VERSION = "1.1.25-beta"
 CONFIG_SCHEMA_VERSION = 2
 PORTFOLIO_API_SCHEMA_SUPPORTED = 1
 DEVICE_MODEL = "matrix_portal_s3"
@@ -213,6 +213,13 @@ WIFI_FILE = "/wifi_config.json"
 HOLIDAYS_FILE = "/market_holidays.json"
 DEVICE_FILE = "/device.json"
 CRASH_FILE = "/crash_count.json"
+OTA_JOURNAL_FILE = "/ota_journal.json"
+OTA_JOURNAL_TEMP_FILE = "/ota_journal.tmp"
+OTA_JOURNAL_BACKUP_FILE = "/ota_journal.bak"
+OTA_WRITE_TEST_FILE = "/ota_write_test.tmp"
+OTA_JOURNAL_SCHEMA = 1
+BOOT_HEALTH_DELAY_SECONDS = 20
+BOOT_MAX_ATTEMPTS = 3
 
 DEFAULT_CONFIG = {
     "config_schema_version": CONFIG_SCHEMA_VERSION,
@@ -541,7 +548,11 @@ def get_api_key_status():
 
 def mark_app_boot_success():
     try:
-        save_json_file(CRASH_FILE, {"count": 0, "last_good_version": APP_VERSION})
+        save_json_file(CRASH_FILE, {
+            "count": 0,
+            "last_good_version": APP_VERSION,
+            "boot_confirmed": True
+        })
     except Exception as e:
         print("Could not reset crash counter:", repr(e))
 
@@ -566,16 +577,24 @@ def file_exists(path):
 
 def copy_file_safe(src, dst):
     try:
+        total = 0
         with open(src, "rb") as source:
-            data = source.read()
+            with open(dst, "wb") as target:
+                while True:
+                    chunk = source.read(1024)
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                    total += len(chunk)
 
-        if not data:
+        if total <= 0:
+            try:
+                os.remove(dst)
+            except Exception:
+                pass
             return False, "{} was empty.".format(src)
 
-        with open(dst, "wb") as target:
-            target.write(data)
-
-        return True, "Copied {} to {}".format(src, dst)
+        return True, "Copied {} bytes from {} to {}".format(total, src, dst)
 
     except Exception as e:
         return False, "Copy failed: {}".format(repr(e))
@@ -591,7 +610,405 @@ def rollback_to_backup():
 
     return copy_file_safe(BACKUP_APP_PATH, APP_PATH)
 
+
+def safe_journal_time():
+    try:
+        return format_12h(eastern_time_now())
+    except Exception:
+        try:
+            return "uptime-{}s".format(int(time.monotonic()))
+        except Exception:
+            return "unknown"
+
+
+def default_ota_journal():
+    return {
+        "schema": OTA_JOURNAL_SCHEMA,
+        "last_update": {},
+        "boot": {
+            "pending": False,
+            "pending_version": "",
+            "attempts": 0,
+            "max_attempts": BOOT_MAX_ATTEMPTS,
+            "health": "not_pending",
+            "last_good_version": ""
+        }
+    }
+
+
+def load_ota_journal():
+    journal = load_json_file(OTA_JOURNAL_FILE, {})
+    if not isinstance(journal, dict) or not journal:
+        journal = load_json_file(OTA_JOURNAL_BACKUP_FILE, {})
+    if not isinstance(journal, dict):
+        journal = {}
+
+    defaults = default_ota_journal()
+    if not isinstance(journal.get("last_update"), dict):
+        journal["last_update"] = {}
+    if not isinstance(journal.get("boot"), dict):
+        journal["boot"] = defaults["boot"]
+
+    boot = journal["boot"]
+    for key, value in defaults["boot"].items():
+        if key not in boot:
+            boot[key] = value
+
+    journal["schema"] = OTA_JOURNAL_SCHEMA
+    return journal
+
+
+def save_ota_journal(journal=None):
+    data = journal if isinstance(journal, dict) else ota_journal
+    try:
+        with open(OTA_JOURNAL_TEMP_FILE, "w") as f:
+            json.dump(data, f)
+
+        try:
+            os.remove(OTA_JOURNAL_BACKUP_FILE)
+        except Exception:
+            pass
+
+        if file_exists(OTA_JOURNAL_FILE):
+            try:
+                os.rename(OTA_JOURNAL_FILE, OTA_JOURNAL_BACKUP_FILE)
+            except Exception:
+                ok, message = copy_file_safe(
+                    OTA_JOURNAL_FILE,
+                    OTA_JOURNAL_BACKUP_FILE
+                )
+                if not ok:
+                    raise OSError(message)
+
+        try:
+            os.rename(OTA_JOURNAL_TEMP_FILE, OTA_JOURNAL_FILE)
+        except Exception:
+            ok, message = copy_file_safe(
+                OTA_JOURNAL_TEMP_FILE,
+                OTA_JOURNAL_FILE
+            )
+            if not ok:
+                raise OSError(message)
+            try:
+                os.remove(OTA_JOURNAL_TEMP_FILE)
+            except Exception:
+                pass
+
+        return True
+    except Exception as e:
+        print("Could not save OTA journal:", repr(e))
+        if not file_exists(OTA_JOURNAL_FILE) and file_exists(OTA_JOURNAL_BACKUP_FILE):
+            try:
+                copy_file_safe(OTA_JOURNAL_BACKUP_FILE, OTA_JOURNAL_FILE)
+            except Exception:
+                pass
+        return False
+
+
+def ota_journal_start(target_version="", app_url=""):
+    update = {
+        "from_version": APP_VERSION,
+        "to_version": str(target_version or "unknown"),
+        "channel": str(config.get("update_channel", "stable")),
+        "app_url": strip_url_query(app_url),
+        "started_at": safe_journal_time(),
+        "finished_at": "",
+        "stage": "queued",
+        "result": "in_progress",
+        "verification": "pending",
+        "backup": "pending",
+        "installation": "pending",
+        "restart": "pending",
+        "boot_validation": "pending",
+        "rollback": "not_needed",
+        "error": ""
+    }
+    ota_journal["last_update"] = update
+    save_ota_journal()
+
+
+def ota_journal_set_stage(stage, message=""):
+    update = ota_journal.get("last_update", {})
+    if not isinstance(update, dict) or not update:
+        return
+
+    changed = str(update.get("stage", "")) != str(stage)
+    update["stage"] = str(stage)
+    if message:
+        update["stage_message"] = str(message)[:180]
+    if changed:
+        save_ota_journal()
+
+
+def ota_journal_set_fields(**fields):
+    update = ota_journal.get("last_update", {})
+    if not isinstance(update, dict):
+        update = {}
+        ota_journal["last_update"] = update
+
+    for key, value in fields.items():
+        update[str(key)] = value
+    save_ota_journal()
+
+
+def ota_journal_mark_pending_boot(target_version):
+    boot = ota_journal.get("boot", {})
+    boot["pending"] = True
+    boot["pending_version"] = str(target_version)
+    boot["attempts"] = 0
+    boot["max_attempts"] = BOOT_MAX_ATTEMPTS
+    boot["health"] = "awaiting_first_boot"
+    boot["installed_from_version"] = APP_VERSION
+    ota_journal["boot"] = boot
+
+    ota_journal_set_fields(
+        stage="awaiting_boot",
+        result="installed_pending_boot",
+        installation="written",
+        restart="scheduled",
+        boot_validation="pending"
+    )
+
+
+def ota_journal_fail(message, rollback_state="not_needed"):
+    ota_journal_set_fields(
+        stage="failed",
+        result="failed",
+        finished_at=safe_journal_time(),
+        error=str(message)[:240],
+        rollback=str(rollback_state)
+    )
+
+
+def strip_url_query(value):
+    value = str(value or "").strip()
+    if "?" in value:
+        value = value.split("?", 1)[0]
+    if "#" in value:
+        value = value.split("#", 1)[0]
+    return value
+
+
+def safe_network_label(value):
+    value = strip_url_query(value)
+    if not value:
+        return "not configured"
+
+    if "://" in value:
+        scheme, rest = value.split("://", 1)
+        host = rest.split("/", 1)[0]
+        if ":" in host:
+            host = host.split(":", 1)[0] + ":port"
+        if host.count(".") == 3:
+            parts = host.split(".")
+            host = ".".join(parts[:3] + ["x"])
+        return scheme + "://" + host
+
+    if value.count(".") == 3:
+        parts = value.split(".")
+        return ".".join(parts[:3] + ["x"])
+    return value[:80]
+
+
+def redact_sensitive_text(value):
+    text = str(value or "")
+    secrets_to_hide = []
+
+    for candidate in (
+        config.get("finnhub_api_key", "") if "config" in globals() else "",
+        config.get("portfolio_bridge_key", "") if "config" in globals() else "",
+        config.get("admin_pin", "") if "config" in globals() else "",
+    ):
+        candidate = str(candidate or "").strip()
+        if candidate and len(candidate) >= 3:
+            secrets_to_hide.append(candidate)
+
+    try:
+        wifi_data = load_json_file(WIFI_FILE, {})
+        for key in ("password", "wifi_password", "passphrase"):
+            candidate = str(wifi_data.get(key, "") or "").strip()
+            if candidate:
+                secrets_to_hide.append(candidate)
+    except Exception:
+        pass
+
+    try:
+        for key in ("password", "finnhub_api_key"):
+            candidate = str(secrets.get(key, "") or "").strip()
+            if candidate:
+                secrets_to_hide.append(candidate)
+    except Exception:
+        pass
+
+    for candidate in secrets_to_hide:
+        text = text.replace(candidate, "[REDACTED]")
+
+    return text
+
+
+def boot_watchdog_begin():
+    global boot_watchdog_pending, boot_watchdog_message
+
+    boot = ota_journal.get("boot", {})
+    pending = bool(boot.get("pending", False))
+    pending_version = str(boot.get("pending_version", ""))
+
+    if not pending:
+        crash_info = load_json_file(CRASH_FILE, {})
+        previous_good = str(crash_info.get("last_good_version", "")).strip()
+
+        if previous_good and previous_good != APP_VERSION:
+            ota_journal["last_update"] = {
+                "from_version": previous_good,
+                "to_version": APP_VERSION,
+                "channel": str(config.get("update_channel", "stable")),
+                "app_url": "not_recorded_by_previous_version",
+                "started_at": "detected_on_first_boot",
+                "finished_at": "",
+                "stage": "awaiting_boot",
+                "result": "installed_pending_boot",
+                "verification": "not_recorded_by_previous_version",
+                "backup": (
+                    "found" if file_exists(BACKUP_APP_PATH) else "missing"
+                ),
+                "installation": "detected",
+                "restart": "completed",
+                "boot_validation": "pending",
+                "rollback": "not_needed",
+                "error": ""
+            }
+            boot["pending"] = True
+            boot["pending_version"] = APP_VERSION
+            boot["attempts"] = 0
+            boot["max_attempts"] = BOOT_MAX_ATTEMPTS
+            boot["health"] = "detected_upgrade"
+            boot["installed_from_version"] = previous_good
+            ota_journal["boot"] = boot
+            save_ota_journal()
+            pending = True
+            pending_version = APP_VERSION
+        else:
+            boot_watchdog_message = "No firmware boot validation is pending."
+            return
+
+    if pending_version != APP_VERSION:
+        update = ota_journal.get("last_update", {})
+        from_version = str(update.get("from_version", ""))
+        if APP_VERSION == from_version:
+            boot["pending"] = False
+            boot["health"] = "rollback_detected"
+            update["result"] = "rolled_back"
+            update["rollback"] = "detected_on_boot"
+            update["restart"] = "completed"
+            update["boot_validation"] = "failed"
+            update["finished_at"] = safe_journal_time()
+            save_ota_journal()
+            boot_watchdog_message = "Rollback detected and recorded."
+        else:
+            boot_watchdog_message = (
+                "Pending version {} does not match running version {}."
+            ).format(pending_version, APP_VERSION)
+        return
+
+    attempts = int(boot.get("attempts", 0) or 0) + 1
+    boot["attempts"] = attempts
+    boot["health"] = "checking"
+    boot["last_start_version"] = APP_VERSION
+    boot["last_start_at"] = safe_journal_time()
+    ota_journal["boot"] = boot
+    save_ota_journal()
+
+    boot_watchdog_pending = True
+    boot_watchdog_message = "Validating boot attempt {} of {}.".format(
+        attempts,
+        BOOT_MAX_ATTEMPTS
+    )
+
+    if attempts >= BOOT_MAX_ATTEMPTS and file_exists(BACKUP_APP_PATH):
+        ok, message = rollback_to_backup()
+        update = ota_journal.get("last_update", {})
+        if ok:
+            boot["pending"] = False
+            boot["health"] = "automatic_rollback"
+            update["result"] = "rolled_back"
+            update["rollback"] = "automatic_watchdog"
+            update["boot_validation"] = "failed"
+            update["restart"] = "rollback_restart"
+            update["finished_at"] = safe_journal_time()
+            update["error"] = (
+                "New firmware did not confirm a healthy boot after {} attempts."
+            ).format(attempts)
+            save_ota_journal()
+            time.sleep(1)
+            microcontroller.reset()
+        else:
+            update["rollback"] = "automatic_rollback_failed"
+            update["error"] = str(message)[:240]
+            save_ota_journal()
+
+
+def boot_watchdog_confirm_healthy():
+    global boot_watchdog_pending, boot_health_confirmed
+    global boot_watchdog_message
+
+    if boot_health_confirmed:
+        return
+
+    mark_app_boot_success()
+    boot = ota_journal.get("boot", {})
+    update = ota_journal.get("last_update", {})
+
+    if bool(boot.get("pending", False)) and str(
+        boot.get("pending_version", "")
+    ) == APP_VERSION:
+        boot["pending"] = False
+        boot["health"] = "confirmed"
+        boot["last_good_version"] = APP_VERSION
+        boot["confirmed_at"] = safe_journal_time()
+        update["stage"] = "complete"
+        update["result"] = "successful"
+        update["restart"] = "completed"
+        update["boot_validation"] = "passed"
+        update["finished_at"] = safe_journal_time()
+        update["error"] = ""
+        ota_journal["last_update"] = update
+    else:
+        boot["last_good_version"] = APP_VERSION
+        boot["health"] = "confirmed"
+        boot["confirmed_at"] = safe_journal_time()
+
+    ota_journal["boot"] = boot
+    save_ota_journal()
+    boot_watchdog_pending = False
+    boot_health_confirmed = True
+    boot_watchdog_message = "Healthy boot confirmed for {}.".format(APP_VERSION)
+
+    try:
+        add_event(boot_watchdog_message)
+    except Exception:
+        print(boot_watchdog_message)
+
+    try:
+        upgrade_managed_launcher_if_needed()
+    except Exception as e:
+        print("Managed launcher upgrade skipped:", repr(e))
+
+
+def boot_watchdog_step():
+    if boot_health_confirmed:
+        return
+    if time.monotonic() < boot_health_due:
+        return
+    boot_watchdog_confirm_healthy()
+
+
 config = load_config()
+ota_journal = load_ota_journal()
+boot_watchdog_pending = False
+boot_health_confirmed = False
+boot_watchdog_message = "Boot validation has not started."
+boot_health_due = time.monotonic() + BOOT_HEALTH_DELAY_SECONDS
+boot_watchdog_begin()
 
 # DEV SAFE DEVICE ID
 # This avoids OSError(30) when CIRCUITPY is mounted on your laptop.
@@ -664,6 +1081,7 @@ cloud_status_message = "Cloud status not checked yet."
 alert_message = "No price alerts yet."
 quote_freshness_message = "No quote freshness checked yet."
 system_health_message = "Press Check System Health to refresh memory and disk stats."
+preflight_message = "Pre-installation checks have not been run yet."
 release_notes_message = "Press Check Release Notes to load stable/beta notes from your OTA manifest."
 auto_recovery_message = "Auto-recovery launcher not checked yet."
 last_portfolio_entry = None
@@ -1542,9 +1960,11 @@ def launcher_status_text():
     try:
         with open("/code.py", "r") as f:
             text = f.read()
+        if "AUTO_RECOVERY_LAUNCHER_V2" in text:
+            return "Installed (V2 watchdog)"
         if "AUTO_RECOVERY_LAUNCHER_V1" in text:
-            return "Installed"
-        return "Not installed or older launcher"
+            return "Installed (V1 - upgrade pending)"
+        return "Not installed or custom launcher"
     except Exception:
         return "Unable to read code.py"
 
@@ -1680,7 +2100,7 @@ def build_setup_checklist_html():
 
     items.append(setup_checklist_item(str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed", "For sold units, change the default 1234 PIN."))
     items.append(setup_checklist_item(file_exists(BACKUP_APP_PATH), "Rollback backup available", "Install an OTA update once to create app_backup.py."))
-    items.append(setup_checklist_item(launcher_status_text() == "Installed", "Auto-recovery launcher installed", "Install it from Software Update."))
+    items.append(setup_checklist_item(launcher_status_text().startswith("Installed"), "Auto-recovery launcher installed", "Install it from Software Update."))
 
     found, missing = count_missing_logos()
     if config.get("show_logos", True):
@@ -1851,16 +2271,17 @@ def safe_config_export_dict():
         if key not in config:
             continue
 
-        if key == "finnhub_api_key":
-            if get_saved_customer_api_key():
-                export_config[key] = "__SAVED_KEY_HIDDEN__"
+        if key in ("finnhub_api_key", "portfolio_bridge_key"):
+            if str(config.get(key, "")).strip():
+                export_config[key] = "__SAVED_SECRET_HIDDEN__"
             else:
                 export_config[key] = ""
-        elif key == "portfolio_bridge_key":
-            if str(config.get("portfolio_bridge_key", "")).strip():
-                export_config[key] = "__SAVED_KEY_HIDDEN__"
-            else:
-                export_config[key] = ""
+        elif key == "admin_pin":
+            export_config[key] = "__ADMIN_PIN_HIDDEN__"
+        elif key == "portfolio_bridge_url":
+            export_config[key] = safe_network_label(config.get(key, ""))
+        elif key == "update_manifest_url":
+            export_config[key] = strip_url_query(config.get(key, ""))
         else:
             export_config[key] = config[key]
 
@@ -1868,7 +2289,7 @@ def safe_config_export_dict():
         "backup_type": "StockTicker safe config backup",
         "app_version": APP_VERSION,
         "device_id": DEVICE_ID,
-        "ip": ip,
+        "local_network": safe_network_label(ip),
         "api_key_saved": bool(get_saved_customer_api_key()),
         "wifi_password_included": False,
         "symbols": SYMBOLS,
@@ -1890,6 +2311,86 @@ def build_symbols_backup_text():
     return "\n".join(SYMBOLS) + "\n"
 
 
+def update_result_dict():
+    update = ota_journal.get("last_update", {})
+    if not isinstance(update, dict):
+        return {}
+    return update
+
+
+def update_result_text():
+    update = update_result_dict()
+    if not update:
+        return "No OTA update history recorded yet."
+
+    labels = (
+        ("Result", "result"),
+        ("From", "from_version"),
+        ("To", "to_version"),
+        ("Stage", "stage"),
+        ("Verification", "verification"),
+        ("Backup", "backup"),
+        ("Installation", "installation"),
+        ("Restart", "restart"),
+        ("Boot Validation", "boot_validation"),
+        ("Rollback", "rollback"),
+        ("Started", "started_at"),
+        ("Finished", "finished_at"),
+        ("Error", "error")
+    )
+    lines = []
+    for label_text, key in labels:
+        value = update.get(key, "")
+        if value not in (None, ""):
+            lines.append("{}: {}".format(label_text, value))
+    return "\n".join(lines)
+
+
+def build_update_recovery_html():
+    update = update_result_dict()
+    boot = ota_journal.get("boot", {})
+    if not update:
+        update_html = "No OTA update history recorded yet."
+    else:
+        rows = []
+        for label_text, key in (
+            ("Result", "result"),
+            ("From", "from_version"),
+            ("To", "to_version"),
+            ("Verification", "verification"),
+            ("Backup", "backup"),
+            ("Installation", "installation"),
+            ("Restart", "restart"),
+            ("Boot validation", "boot_validation"),
+            ("Rollback", "rollback"),
+            ("Started", "started_at"),
+            ("Finished", "finished_at"),
+            ("Error", "error")
+        ):
+            value = update.get(key, "")
+            if value not in (None, ""):
+                rows.append("<b>{}</b>: {}".format(
+                    safe_html(label_text),
+                    safe_html(value)
+                ))
+        update_html = "<br>".join(rows)
+
+    return (
+        "{}<hr>"
+        "<b>Boot watchdog</b>: {}<br>"
+        "<b>Pending version</b>: {}<br>"
+        "<b>Attempts</b>: {} / {}<br>"
+        "<b>Last good version</b>: {}"
+    ).format(
+        update_html,
+        safe_html(boot.get("health", "unknown")),
+        safe_html(boot.get("pending_version", "none") or "none"),
+        int(boot.get("attempts", 0) or 0),
+        int(boot.get("max_attempts", BOOT_MAX_ATTEMPTS) or BOOT_MAX_ATTEMPTS),
+        safe_html(boot.get("last_good_version", "unknown") or "unknown")
+    )
+
+
 def build_support_report_text():
     found, missing = count_missing_logos()
     lines = []
@@ -1900,7 +2401,7 @@ def build_support_report_text():
     lines.append("Device ID: " + str(DEVICE_ID))
     lines.append("App Version: " + str(APP_VERSION))
     lines.append("Config Schema: " + str(config.get("config_schema_version", CONFIG_SCHEMA_VERSION)))
-    lines.append("IP Address: " + str(ip))
+    lines.append("Local Network: " + safe_network_label(ip))
     lines.append("System Health: " + system_health_state()[1])
     lines.append("Panel Display: " + panel_state_text())
     lines.append("Market Status: " + get_market_status(eastern_time_now()))
@@ -1920,16 +2421,22 @@ def build_support_report_text():
     lines.append("API Key Saved: " + yes_no(bool(get_saved_customer_api_key())))
     lines.append("Admin PIN Changed: " + yes_no(str(config.get("admin_pin", "1234")) != "1234"))
     lines.append("Update Channel: " + str(config.get("update_channel", "stable")))
-    lines.append("Manifest URL: " + str(config.get("update_manifest_url", "")))
+    lines.append("Manifest URL: " + strip_url_query(config.get("update_manifest_url", "")))
     lines.append("Backup App Found: " + yes_no(file_exists(BACKUP_APP_PATH)))
     lines.append("Auto-Recovery Launcher: " + launcher_status_text())
+    lines.append("Boot Validation: " + str(ota_journal.get("boot", {}).get("health", "unknown")))
     lines.append("Logos: {} found / {} text fallback".format(found, missing))
     lines.append("Brightness: " + str(config.get("brightness", "")))
     lines.append("Scroll Speed Open: " + str(config.get("scroll_speed_open", "")))
     lines.append("Scroll Speed Closed: " + str(config.get("scroll_speed_closed", "")))
     lines.append("Scroll Delay: " + str(config.get("scroll_delay", "")))
     lines.append("Block Gap: " + str(config.get("block_gap", "")))
-    lines.append("Last Error: " + str(last_error_message))
+    lines.append("Last Error: " + redact_sensitive_text(last_error_message))
+    lines.append("Boot Watchdog: " + str(boot_watchdog_message))
+    lines.append("")
+    lines.append("Last Update Result")
+    lines.append("------------------")
+    lines.append(update_result_text())
     lines.append("")
     lines.append("Symbols")
     lines.append("-------")
@@ -1945,11 +2452,11 @@ def build_support_report_text():
     lines.append("---------")
     if event_log:
         for item in event_log:
-            lines.append(str(item))
+            lines.append(redact_sensitive_text(item))
     else:
         lines.append("No events yet.")
 
-    return "\n".join(lines)
+    return redact_sensitive_text("\n".join(lines))
 
 
 def export_page(title, body):
@@ -1970,7 +2477,7 @@ a {{ color:#79c7ff; }}
 </head>
 <body>
 <div class="wrap">
-<div class="card"><h1>{}</h1><p class="small">This page is safe to screenshot or copy. API keys and WiFi passwords are not shown.</p><pre>{}</pre><p><a href="/">Back to Dashboard</a></p></div>
+<div class="card"><h1>{}</h1><p class="small">This page is safe to screenshot or copy. API keys, WiFi passwords, bridge keys, admin PINs, tokens, and portfolio values are not shown.</p><pre>{}</pre><p><a href="/">Back to Dashboard</a></p></div>
 </div>
 </body>
 </html>
@@ -2149,8 +2656,8 @@ def set_error_message(message):
     print("WEB ERROR:", message)
 
 
-add_event("Booted " + APP_VERSION)
-mark_app_boot_success()
+add_event("Boot sequence started " + APP_VERSION)
+add_event(boot_watchdog_message)
 
 
 def start_setup_mode(reason):
@@ -2287,6 +2794,8 @@ SPY</textarea>
                     saved_restart_time = time.monotonic() + 2
             except Exception:
                 pass
+
+        boot_watchdog_step()
 
         if saved_restart_time and time.monotonic() >= saved_restart_time:
             microcontroller.reset()
@@ -2949,10 +3458,21 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 </div>
 <div class="card">
 <h2>Backup / Export</h2>
-<p class="small">Safe exports hide API keys and WiFi passwords. Use these for troubleshooting or saving a copy of the setup.</p>
-<form method="GET" action="/support-report"><button type="submit">View Support Report</button></form>
-<form method="GET" action="/config-backup"><button type="submit">View Config Backup</button></form>
+<p class="small">Safe exports hide API keys, WiFi passwords, bridge keys, admin PINs, tokens, and portfolio values.</p>
+<form method="GET" action="/support-report"><button type="submit">View Safe Support Report</button></form>
+<form method="GET" action="/support-report.txt"><button type="submit">Open Plain-Text Support Report</button></form>
+<form method="GET" action="/config-backup"><button type="submit">View Safe Config Backup</button></form>
 <form method="GET" action="/symbols-backup"><button type="submit">View Symbols Backup</button></form>
+</div>
+<div class="card">
+<h2>Update Recovery Journal</h2>
+<p>{update_recovery_message}</p>
+<form method="POST" action="/clear-update-history"><button class="orange" type="submit">Clear Update History</button></form>
+</div>
+<div class="card">
+<h2>Pre-Installation Checks</h2>
+<p>{preflight_message}</p>
+<form method="POST" action="/run-update-preflight"><button type="submit">Run Preflight Check</button></form>
 </div>
 <div class="card">
 <h2>OTA Status</h2>
@@ -3114,7 +3634,26 @@ def help_route(request: Request):
 
 @server.route("/support-report")
 def support_report_route(request: Request):
-    return Response(request, export_page("Support Report", build_support_report_text()), content_type="text/html")
+    return Response(request, export_page("Safe Support Report", build_support_report_text()), content_type="text/html")
+
+
+@server.route("/support-report.txt")
+def support_report_text_route(request: Request):
+    return Response(request, build_support_report_text(), content_type="text/plain")
+
+
+@server.route("/clear-update-history", methods=["POST"])
+def clear_update_history_route(request: Request):
+    boot = ota_journal.get("boot", {})
+    ota_journal["last_update"] = {}
+    ota_journal["boot"] = boot
+    save_ota_journal()
+    set_web_message("Update history cleared; boot watchdog state preserved.")
+    return Response(
+        request,
+        clean_page("Update History Cleared", "OTA result history was cleared."),
+        content_type="text/html"
+    )
 
 
 @server.route("/config-backup")
@@ -3251,6 +3790,8 @@ def index(request: Request):
             quote_freshness_message=build_quote_freshness_html(),
             portfolio_status_message=build_portfolio_status_html(),
             system_health_message=build_system_health_html(),
+            preflight_message=preflight_message,
+            update_recovery_message=build_update_recovery_html(),
             event_log_message=build_event_log_html(),
             logo_status_message=build_logo_status_html(),
             release_notes_message=release_notes_message,
@@ -3879,17 +4420,20 @@ def check_ota_status(request: Request):
     return Response(request, clean_page("OTA Status Checked", "OTA status section updated."), content_type="text/html")
 
 
-LAUNCHER_CODE = r'''# code.py - AUTO_RECOVERY_LAUNCHER_V1
-# Safe launcher for StockTicker. It restores app_backup.py after repeated app.py crashes.
+LAUNCHER_CODE = r'''# code.py - AUTO_RECOVERY_LAUNCHER_V2
+# StockTicker crash watchdog. It restores app_backup.py after repeated failures
+# and records the rollback in ota_journal.json.
 
 import time
 import json
 import microcontroller
 
 CRASH_FILE = "/crash_count.json"
+JOURNAL_FILE = "/ota_journal.json"
 APP_PATH = "/app.py"
 BACKUP_PATH = "/app_backup.py"
-MAX_CRASHES = 3
+MAX_NORMAL_CRASHES = 3
+MAX_PENDING_UPDATE_CRASHES = 2
 
 
 def load_json(path, default):
@@ -3918,25 +4462,61 @@ def exists(path):
 
 
 def copy_file(src, dst):
+    total = 0
     with open(src, "rb") as source:
-        data = source.read()
-    with open(dst, "wb") as target:
-        target.write(data)
+        with open(dst, "wb") as target:
+            while True:
+                chunk = source.read(1024)
+                if not chunk:
+                    break
+                target.write(chunk)
+                total += len(chunk)
+    if total <= 0:
+        raise OSError("Backup file was empty")
 
 
 def increment_crash_count(error_text):
     info = load_json(CRASH_FILE, {})
-    count = int(info.get("count", 0)) + 1
+    count = int(info.get("count", 0) or 0) + 1
     info["count"] = count
     info["last_error"] = str(error_text)[:180]
+    info["boot_confirmed"] = False
     save_json(CRASH_FILE, info)
     return count
 
 
-def restore_backup_and_reset():
+def update_journal_for_rollback(error_text):
+    journal = load_json(JOURNAL_FILE, {})
+    update = journal.get("last_update", {})
+    boot = journal.get("boot", {})
+    update["stage"] = "launcher_rollback"
+    update["result"] = "rolled_back"
+    update["rollback"] = "automatic_launcher"
+    update["boot_validation"] = "failed"
+    update["restart"] = "rollback_restart"
+    update["error"] = str(error_text)[:240]
+    boot["pending"] = False
+    boot["health"] = "automatic_launcher_rollback"
+    journal["last_update"] = update
+    journal["boot"] = boot
+    save_json(JOURNAL_FILE, journal)
+
+
+def pending_update_boot():
+    journal = load_json(JOURNAL_FILE, {})
+    boot = journal.get("boot", {})
+    return bool(boot.get("pending", False))
+
+
+def restore_backup_and_reset(error_text):
     print("AUTO RECOVERY: restoring app_backup.py to app.py")
     copy_file(BACKUP_PATH, APP_PATH)
-    save_json(CRASH_FILE, {"count": 0, "restored_backup": True})
+    update_journal_for_rollback(error_text)
+    save_json(CRASH_FILE, {
+        "count": 0,
+        "restored_backup": True,
+        "last_error": str(error_text)[:180]
+    })
     time.sleep(1)
     microcontroller.reset()
 
@@ -3954,11 +4534,16 @@ except Exception as e:
         pass
 
     crashes = increment_crash_count(repr(e))
-    print("Crash count:", crashes)
+    threshold = (
+        MAX_PENDING_UPDATE_CRASHES
+        if pending_update_boot()
+        else MAX_NORMAL_CRASHES
+    )
+    print("Crash count:", crashes, "threshold:", threshold)
 
-    if crashes >= MAX_CRASHES and exists(BACKUP_PATH):
+    if crashes >= threshold and exists(BACKUP_PATH):
         try:
-            restore_backup_and_reset()
+            restore_backup_and_reset(repr(e))
         except Exception as restore_error:
             print("AUTO RECOVERY RESTORE FAILED:", repr(restore_error))
 
@@ -3969,6 +4554,32 @@ except Exception as e:
         while True:
             time.sleep(1)
 '''
+
+
+def upgrade_managed_launcher_if_needed():
+    try:
+        existing = ""
+        try:
+            with open("/code.py", "r") as f:
+                existing = f.read()
+        except Exception:
+            return False, "No managed launcher found."
+
+        if (
+            "AUTO_RECOVERY_LAUNCHER_V1" not in existing
+            and "AUTO_RECOVERY_LAUNCHER_V2" not in existing
+        ):
+            return False, "Custom code.py preserved."
+
+        if "AUTO_RECOVERY_LAUNCHER_V2" in existing:
+            return True, "V2 launcher already installed."
+
+        with open("/code.py", "w") as f:
+            f.write(LAUNCHER_CODE)
+        return True, "Managed launcher upgraded to V2."
+    except Exception as e:
+        return False, "Managed launcher upgrade failed: " + repr(e)
+
 
 @server.route("/check-release-notes", methods=["POST"])
 def check_release_notes(request: Request):
@@ -3997,7 +4608,7 @@ def install_auto_recovery(request: Request):
         with open("/code.py", "w") as f:
             f.write(LAUNCHER_CODE)
 
-        auto_recovery_message = "Auto-recovery launcher installed to code.py. It activates on the next restart."
+        auto_recovery_message = "Auto-recovery V2 watchdog installed to code.py. It activates on the next restart."
         set_web_message(auto_recovery_message)
 
         return Response(request, clean_page("Auto-Recovery Installed", auto_recovery_message), content_type="text/html")
@@ -4006,6 +4617,222 @@ def install_auto_recovery(request: Request):
         auto_recovery_message = "Auto-recovery install failed."
         set_error_message("Auto-recovery install failed: " + repr(e))
         return Response(request, clean_page("Install Failed", last_error_message), content_type="text/html")
+
+
+def ota_free_disk_bytes():
+    try:
+        stat = os.statvfs("/")
+        return int(stat[0]) * int(stat[3])
+    except Exception:
+        return -1
+
+
+def ota_free_memory_bytes():
+    try:
+        gc.collect()
+        return int(gc.mem_free())
+    except Exception:
+        return -1
+
+
+def ota_write_test():
+    try:
+        with open(OTA_WRITE_TEST_FILE, "wb") as f:
+            f.write(b"StockTicker OTA write test")
+        with open(OTA_WRITE_TEST_FILE, "rb") as f:
+            ok = f.read() == b"StockTicker OTA write test"
+        try:
+            os.remove(OTA_WRITE_TEST_FILE)
+        except Exception:
+            pass
+        if not ok:
+            return False, "Filesystem write test did not read back correctly."
+        return True, "Filesystem is writable."
+    except Exception as e:
+        try:
+            os.remove(OTA_WRITE_TEST_FILE)
+        except Exception:
+            pass
+        return False, "Filesystem is not writable: " + repr(e)
+
+
+def ota_sha_self_test():
+    try:
+        hasher, mode = create_sha256_hasher()
+        hasher.update(b"abc")
+        digest = "".join("{:02x}".format(b) for b in hasher.digest())
+        expected = (
+            "ba7816bf8f01cfea414140de5dae2223"
+            "b00361a396177a9cb410ff61f20015ad"
+        )
+        if digest != expected:
+            return False, "SHA-256 self-test failed."
+        return True, "SHA-256 verifier passed ({})".format(mode)
+    except Exception as e:
+        return False, "SHA-256 verifier unavailable: " + repr(e)
+
+
+def ota_preflight_checks(info=None):
+    checks = []
+
+    def add(ok, label_text, detail):
+        checks.append({
+            "ok": bool(ok),
+            "label": str(label_text),
+            "detail": str(detail)
+        })
+
+    add(
+        bool(wifi.radio.connected),
+        "WiFi connection",
+        "Connected" if wifi.radio.connected else "WiFi is offline"
+    )
+    add(
+        file_exists(APP_PATH),
+        "Current firmware readable",
+        file_size_text(APP_PATH)
+    )
+
+    write_ok, write_message = ota_write_test()
+    add(write_ok, "Filesystem writable", write_message)
+
+    free_memory = ota_free_memory_bytes()
+    memory_ok = free_memory < 0 or free_memory >= 18000
+    add(
+        memory_ok,
+        "Free memory",
+        "{} bytes".format(free_memory) if free_memory >= 0 else "unavailable"
+    )
+
+    expected_size = 0
+    if isinstance(info, dict):
+        try:
+            expected_size = int(info.get("size", 0) or 0)
+        except Exception:
+            expected_size = 0
+    try:
+        current_size = int(os.stat(APP_PATH)[6])
+    except Exception:
+        current_size = 0
+
+    if expected_size <= 0:
+        expected_size = max(current_size, 1000)
+
+    required_disk = expected_size + current_size + 32768
+    free_disk = ota_free_disk_bytes()
+    disk_ok = free_disk < 0 or free_disk >= required_disk
+    add(
+        disk_ok,
+        "Free storage",
+        "{} bytes free; {} required".format(free_disk, required_disk)
+        if free_disk >= 0 else "unavailable"
+    )
+
+    if isinstance(info, dict):
+        version = str(info.get("version", "")).strip()
+        app_url = str(info.get("app_url", "")).strip()
+        add(bool(version), "Manifest version", version or "missing")
+        add(app_url.startswith("http"), "Firmware URL", strip_url_query(app_url))
+
+        hardware = info.get("hardware", [])
+        if isinstance(hardware, str):
+            hardware = [hardware]
+        hardware_ok = not hardware or DEVICE_MODEL in hardware
+        add(
+            hardware_ok,
+            "Hardware compatibility",
+            str(hardware or "not restricted")
+        )
+
+        try:
+            minimum_schema = int(info.get("minimum_config_schema", 0) or 0)
+        except Exception:
+            minimum_schema = 999999
+        add(
+            minimum_schema <= CONFIG_SCHEMA_VERSION,
+            "Configuration schema",
+            "device {} / required {}".format(
+                CONFIG_SCHEMA_VERSION,
+                minimum_schema
+            )
+        )
+
+        raw_size = info.get("size", None)
+        if raw_size is not None:
+            try:
+                manifest_size = int(raw_size)
+                size_ok = manifest_size >= 1000
+            except Exception:
+                manifest_size = 0
+                size_ok = False
+            add(
+                size_ok,
+                "Manifest firmware size",
+                "{} bytes".format(manifest_size) if size_ok else "invalid"
+            )
+
+        expected_hash = str(info.get("sha256", "")).strip().lower()
+        if expected_hash:
+            hash_format_ok = len(expected_hash) == 64
+            if hash_format_ok:
+                for ch in expected_hash:
+                    if ch not in "0123456789abcdef":
+                        hash_format_ok = False
+                        break
+            add(
+                hash_format_ok,
+                "Manifest SHA-256 format",
+                "64 hexadecimal characters" if hash_format_ok else "invalid"
+            )
+            sha_ok, sha_message = ota_sha_self_test()
+            add(sha_ok, "SHA-256 verifier", sha_message)
+        else:
+            add(True, "SHA-256 verifier", "Not requested by manifest")
+    else:
+        add(False, "Manifest", "A valid manifest was not available")
+
+    add(
+        bool(file_exists(BACKUP_APP_PATH) or write_ok),
+        "Rollback path",
+        "Existing backup found" if file_exists(BACKUP_APP_PATH)
+        else "Backup will be created before installation"
+    )
+
+    return all(item["ok"] for item in checks), checks
+
+
+def ota_preflight_text(info=None):
+    ok, checks = ota_preflight_checks(info)
+    lines = ["PASS" if ok else "BLOCKED"]
+    for item in checks:
+        lines.append("{} - {}: {}".format(
+            "OK" if item["ok"] else "ERROR",
+            item["label"],
+            item["detail"]
+        ))
+    return ok, "<br>".join(safe_html(line) for line in lines)
+
+
+@server.route("/run-update-preflight", methods=["POST"])
+def run_update_preflight_route(request: Request):
+    global preflight_message
+
+    manifest = fetch_update_manifest()
+    info = get_channel_info(manifest) if manifest else None
+    ok, preflight_message = ota_preflight_text(info)
+    if ok:
+        set_web_message("OTA pre-installation checks passed.")
+    else:
+        set_error_message("OTA pre-installation checks found a blocking issue.")
+
+    return Response(
+        request,
+        clean_page(
+            "Preflight Complete",
+            "All checks passed." if ok else "One or more checks blocked installation."
+        ),
+        content_type="text/html"
+    )
 
 
 def ota_protected_settings_snapshot():
@@ -4054,11 +4881,14 @@ def ota_job_public_status():
 
 
 def ota_job_set(stage, percent, message, detail=""):
+    previous_stage = str(ota_job.get("stage", ""))
     ota_job["stage"] = stage
     ota_job["percent"] = max(0, min(100, int(percent)))
     ota_job["message"] = str(message)
     ota_job["detail"] = str(detail)
     ota_job["updated"] = time.monotonic()
+    if str(stage) != previous_stage:
+        ota_journal_set_stage(stage, message)
 
 
 def ota_close_resource(name):
@@ -4092,17 +4922,21 @@ def ota_job_fail(message):
     failed_stage = str(ota_job.get("stage", ""))
     ota_cleanup_resources()
 
-    if failed_stage == "installing" and file_exists(BACKUP_APP_PATH):
+    rollback_state = "not_needed"
+    if failed_stage in ("installing", "restarting") and file_exists(BACKUP_APP_PATH):
         rollback_ok, rollback_message = rollback_to_backup()
         if rollback_ok:
+            rollback_state = "automatic_immediate"
             message = str(message) + " Previous firmware restored."
         else:
+            rollback_state = "automatic_failed"
             message = (
                 str(message)
                 + " Automatic rollback failed: "
                 + str(rollback_message)
             )
 
+    ota_journal_fail(message, rollback_state)
     ota_job["active"] = False
     ota_job["stage"] = "error"
     ota_job["percent"] = 0
@@ -4151,6 +4985,7 @@ def start_ota_job():
         "restart_seconds": 0
     })
 
+    ota_journal_start()
     ota_message = "Update processing started. Open progress to monitor it."
     add_event("OTA update job queued.")
 
@@ -4421,6 +5256,31 @@ def ota_job_step():
             ota_job["expected_hash"] = expected_hash
             ota_job["expected_size"] = expected_size
             ota_status_message = build_ota_status_summary(manifest)
+
+            ota_journal_set_fields(
+                to_version=latest,
+                app_url=strip_url_query(app_url),
+                verification="pending",
+                backup="pending",
+                installation="pending",
+                restart="pending",
+                boot_validation="pending"
+            )
+
+            preflight_ok, preflight_checks = ota_preflight_checks(info)
+            if not preflight_ok:
+                failures = []
+                for item in preflight_checks:
+                    if not item.get("ok"):
+                        failures.append(
+                            "{}: {}".format(item.get("label"), item.get("detail"))
+                        )
+                ota_job_fail(
+                    "Pre-installation checks failed. " + "; ".join(failures)
+                )
+                return
+
+            ota_journal_set_fields(preflight="passed")
             ota_job_set(
                 "open_download",
                 6,
@@ -4537,6 +5397,7 @@ def ota_job_step():
                 return
 
             ota_job["payload_message"] = message
+            ota_journal_set_fields(verification="passed")
             ota_job["protected_before"] = ota_protected_settings_snapshot()
             ota_remove_file(OTA_BACKUP_TEMP_PATH)
             ota_job["source"] = open(APP_PATH, "rb")
@@ -4580,6 +5441,7 @@ def ota_job_step():
                 ota_job_fail("OTA stopped. " + message)
                 return
 
+            ota_journal_set_fields(backup="created")
             ota_job["source"] = open(OTA_TEMP_PATH, "rb")
             ota_job["target"] = open(APP_PATH, "wb")
             ota_job["copy_total"] = int(ota_job.get("bytes_done", 0) or 0)
@@ -4622,6 +5484,7 @@ def ota_job_step():
                 return
 
             ota_remove_file(OTA_TEMP_PATH)
+            ota_journal_mark_pending_boot(ota_job.get("latest", ""))
             ota_job_set(
                 "restarting",
                 100,
@@ -4760,6 +5623,20 @@ def rollback_route(request: Request):
         set_error_message(msg)
         return Response(request, clean_page("Rollback Failed", msg), content_type="text/html")
 
+    ota_journal_set_fields(
+        stage="manual_rollback",
+        result="rolled_back",
+        rollback="manual",
+        boot_validation="not_applicable",
+        restart="scheduled",
+        finished_at=safe_journal_time()
+    )
+    boot = ota_journal.get("boot", {})
+    boot["pending"] = False
+    boot["health"] = "manual_rollback"
+    ota_journal["boot"] = boot
+    save_ota_journal()
+
     ota_message = "Rollback complete. Restarting..."
     ota_status_message = build_ota_status_summary(None)
     set_web_message(msg)
@@ -4792,7 +5669,10 @@ def factory_reset(request: Request):
         elif reset_type == "symbols":
             files_to_remove = [SYMBOLS_FILE]
         elif reset_type == "all":
-            files_to_remove = [WIFI_FILE, CONFIG_FILE, SYMBOLS_FILE, HOLIDAYS_FILE]
+            files_to_remove = [
+                WIFI_FILE, CONFIG_FILE, SYMBOLS_FILE, HOLIDAYS_FILE,
+                OTA_JOURNAL_FILE, OTA_JOURNAL_BACKUP_FILE, CRASH_FILE
+            ]
 
         for path in files_to_remove:
             try:
@@ -5264,6 +6144,7 @@ while True:
     now = time.monotonic()
 
     ota_job_step()
+    boot_watchdog_step()
     now = time.monotonic()
 
     if restart_requested and now >= restart_time:
