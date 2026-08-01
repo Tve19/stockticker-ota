@@ -1,8 +1,10 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.27-beta"
-CONFIG_SCHEMA_VERSION = 4
+APP_VERSION = "1.1.26-beta"
+CONFIG_SCHEMA_VERSION = 3
 PORTFOLIO_API_SCHEMA_SUPPORTED = 1
+PORTFOLIO_PROCESSING_LOCATION = "Raspberry Pi bridge"
+PORTFOLIO_TICKER_ROLE = "Read-only sanitized API client"
 DEVICE_MODEL = "matrix_portal_s3"
 
 import time
@@ -279,12 +281,7 @@ DEFAULT_CONFIG = {
     "portfolio_stale_minutes": 15,
     "portfolio_capabilities_refresh_minutes": 60,
     "mdns_enabled": True,
-    "wifi_customer_manager": True,
-    "quote_source": "direct_finnhub",
-    "pi_hub_ticker_url": "http://192.168.2.85:8787/ticker",
-    "pi_hub_display_key": "",
-    "pi_hub_fallback_direct": True,
-    "pi_hub_quote_stale_minutes": 10
+    "wifi_customer_manager": True
 }
 
 DEFAULT_SYMBOLS = [
@@ -946,14 +943,6 @@ def get_api_key_status():
     if saved_key:
         return "Saved in device settings: " + mask_secret(saved_key)
 
-    try:
-        if is_pi_hub_quote_source():
-            if bool_from_form(config.get("pi_hub_fallback_direct", True)):
-                return "Pi Hub quote source selected. S3 Finnhub key is missing, so direct fallback will not work until a key is saved."
-            return "Pi Hub quote source selected. S3 Finnhub key is not required."
-    except Exception:
-        pass
-
     if customer_api_required():
         return "Required mode ON - missing customer API key. Quotes will not load until setup is completed."
 
@@ -1238,7 +1227,6 @@ def redact_sensitive_text(value):
     for candidate in (
         config.get("finnhub_api_key", "") if "config" in globals() else "",
         config.get("portfolio_bridge_key", "") if "config" in globals() else "",
-        config.get("pi_hub_display_key", "") if "config" in globals() else "",
         config.get("admin_pin", "") if "config" in globals() else "",
     ):
         candidate = str(candidate or "").strip()
@@ -1507,7 +1495,6 @@ last_web_message = "System ready."
 last_error_message = "None yet."
 test_quote_message = "No quote tested yet."
 portfolio_test_message = "No portfolio bridge tested yet."
-pi_hub_test_message = "No Pi hub quote test yet."
 cloud_status_message = "Cloud status not checked yet."
 alert_message = "No price alerts yet."
 quote_freshness_message = "No quote freshness checked yet."
@@ -1516,7 +1503,6 @@ preflight_message = "Pre-installation checks have not been run yet."
 release_notes_message = "Press Check Release Notes to load stable/beta notes from your OTA manifest."
 auto_recovery_message = "Auto-recovery launcher not checked yet."
 last_portfolio_entry = None
-last_pi_hub_payload = None
 last_portfolio_capabilities = {}
 last_portfolio_capabilities_check = 0
 last_portfolio_api_status = {
@@ -2646,216 +2632,6 @@ def build_portfolio_status_html():
 
     return "<br>".join(lines)
 
-
-
-def is_pi_hub_quote_source():
-    return str(
-        config.get("quote_source", "direct_finnhub")
-    ).strip().lower() == "pi_hub"
-
-
-def get_pi_hub_display_key():
-    key = str(config.get("pi_hub_display_key", "")).strip()
-
-    if key:
-        return key
-
-    # Convenience fallback: if the same Raspberry Pi bridge key is already
-    # saved for portfolio display, reuse it for /ticker unless a separate
-    # Pi Hub key is entered.
-    return str(config.get("portfolio_bridge_key", "")).strip()
-
-
-def pi_hub_status_short():
-    if not is_pi_hub_quote_source():
-        return "Direct Finnhub"
-
-    if last_pi_hub_payload is None:
-        return "Pi Hub selected; not loaded yet"
-
-    try:
-        quotes = last_pi_hub_payload.get("quotes", {})
-        return "Pi Hub OK - {} quotes".format(len(quotes))
-    except Exception:
-        return "Pi Hub loaded"
-
-
-def build_pi_hub_status_html():
-    lines = []
-    lines.append(
-        "Quote Source: "
-        + safe_html(str(config.get("quote_source", "direct_finnhub")))
-    )
-    lines.append(
-        "Pi Hub URL: "
-        + safe_html(str(config.get("pi_hub_ticker_url", "")))
-    )
-    lines.append(
-        "Pi Hub Key Saved: " + yes_no(bool(get_pi_hub_display_key()))
-    )
-    lines.append(
-        "Fallback to Direct Finnhub: "
-        + yes_no(bool_from_form(config.get("pi_hub_fallback_direct", True)))
-    )
-    lines.append("Status: " + safe_html(pi_hub_status_short()))
-    lines.append("Last Test: " + safe_html(str(pi_hub_test_message)))
-    return "<br>".join(lines)
-
-
-def fetch_pi_hub_ticker_payload():
-    global last_pi_hub_payload
-
-    hub_url = str(config.get("pi_hub_ticker_url", "")).strip()
-    hub_key = get_pi_hub_display_key()
-
-    if not hub_url:
-        raise Exception("Pi Hub ticker URL is missing.")
-
-    url = append_bridge_key(hub_url, hub_key)
-    response = None
-
-    try:
-        response = requests.get(url)
-        data = response.json()
-
-        if not isinstance(data, dict):
-            raise Exception("Pi Hub returned non-object JSON.")
-
-        if data.get("error"):
-            raise Exception(str(data.get("error")))
-
-        if data.get("ok") is False:
-            raise Exception("Pi Hub returned ok=false.")
-
-        if "quotes" not in data:
-            raise Exception("Pi Hub response missing quotes.")
-
-        last_pi_hub_payload = data
-        return data
-
-    finally:
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
-
-
-def hub_updated_text(quote):
-    try:
-        age = int(float(quote.get("age_seconds", 0) or 0))
-        if age < 90:
-            return "now"
-        return "{}m".format(int(age / 60))
-    except Exception:
-        return format_12h(eastern_time_now())
-
-
-def quote_stale_from_hub(quote):
-    try:
-        age = int(float(quote.get("age_seconds", 0) or 0))
-        limit = int(config.get("pi_hub_quote_stale_minutes", 10)) * 60
-    except Exception:
-        age = 0
-        limit = 600
-
-    return bool(quote.get("stale", False)) or age > limit
-
-
-def make_quote_entry_from_hub(sym, quote):
-    now_mono = time.monotonic()
-    price = float(quote.get("price", quote.get("c", 0)) or 0)
-    dollar_change = float(quote.get("change", quote.get("d", 0)) or 0)
-    pct = float(quote.get("percent_change", quote.get("dp", 0)) or 0)
-
-    if price <= 0:
-        raise Exception("Pi Hub returned no valid price for {}.".format(sym))
-
-    color = 0x00FF00 if dollar_change >= 0 else 0xFF0000
-    sign = "+" if dollar_change >= 0 else "-"
-
-    alert = ""
-    if (
-        ALERT_ENABLED
-        and ALERT_PERCENT_MOVE > 0
-        and abs(pct) >= ALERT_PERCENT_MOVE
-    ):
-        alert = "*" if pct > 0 else "!"
-
-    change_parts = []
-
-    if config.get("show_dollar_change", True):
-        change_parts.append("{}${:.2f}".format(sign, abs(dollar_change)))
-
-    if config.get("show_percent_change", True):
-        change_parts.append("({:+.2f}%{})".format(pct, alert))
-
-    if not change_parts:
-        change_parts.append("{:+.2f}%{}".format(pct, alert))
-
-    stale = quote_stale_from_hub(quote)
-
-    if stale and config.get("show_stale_marker", True):
-        change_parts.append("OLD")
-
-    return {
-        "symbol": sym,
-        "price_line": "${} ${:.2f}".format(sym, price),
-        "change_line": " ".join(change_parts),
-        "color": color,
-        "pct": pct,
-        "updated_text": hub_updated_text(quote),
-        "updated_mono": now_mono,
-        "stale": stale,
-        "used_cached": stale,
-        "error_reason": ""
-    }
-
-
-def fetch_entries_from_pi_hub():
-    global last_portfolio_entry
-
-    try:
-        data = fetch_pi_hub_ticker_payload()
-        quote_map = data.get("quotes", {})
-        entries = []
-
-        for sym in SYMBOLS:
-            q = quote_map.get(sym) or quote_map.get(str(sym).upper())
-
-            if not q:
-                e = cached_or_error_quote(sym, "not in Pi Hub cache")
-            else:
-                try:
-                    e = make_quote_entry_from_hub(sym, q)
-                except Exception as quote_error:
-                    e = cached_or_error_quote(sym, repr(quote_error))
-
-            entries.append(e)
-            last_good[sym] = e
-            gc.collect()
-
-        if is_portfolio_enabled():
-            portfolio_data = data.get("portfolio")
-
-            if portfolio_data:
-                p_entry = make_portfolio_entry(portfolio_data)
-                last_portfolio_entry = p_entry
-                entries.append(p_entry)
-            else:
-                p_entry = fetch_portfolio_entry()
-                if p_entry:
-                    entries.append(p_entry)
-
-        finalize_quote_batch(entries, "Pi Hub ticker refreshed")
-        return entries
-
-    except Exception as e:
-        reason = repr(e)
-        set_error_message("Pi Hub ticker fetch failed: " + reason)
-        add_event("Pi Hub ticker fetch failed: " + reason)
-        return None
-
 def logo_status_for_symbol(sym):
     path = "/logos/{}.bmp".format(sym)
     if file_exists(path):
@@ -2948,13 +2724,6 @@ def is_demo_mode():
 def api_ready_for_quotes():
     if is_demo_mode():
         return True
-
-    if is_pi_hub_quote_source():
-        return bool(
-            str(config.get("pi_hub_ticker_url", "")).strip()
-            and get_pi_hub_display_key()
-        )
-
     return bool(get_finnhub_api_key())
 
 
@@ -3025,14 +2794,6 @@ def build_setup_checklist_html():
 
     if is_demo_mode():
         items.append(setup_checklist_item(True, "Demo mode enabled", "Device is using sample prices."))
-    elif is_pi_hub_quote_source():
-        items.append(
-            setup_checklist_item(
-                api_ready_for_quotes(),
-                "Pi Hub quote source ready",
-                "Set Pi Hub Ticker URL and display key."
-            )
-        )
     else:
         items.append(setup_checklist_item(bool(get_saved_customer_api_key()), "Finnhub API key saved", "Open Setup Wizard and paste a Finnhub API key."))
 
@@ -3067,11 +2828,6 @@ def system_health_state():
         return "SETUP", "Setup Needed", "warnbadge"
     if is_demo_mode():
         return "DEMO", "Demo Mode", "warnbadge"
-    if is_pi_hub_quote_source():
-        if not str(config.get("pi_hub_ticker_url", "")).strip():
-            return "SETUP", "Pi Hub URL Needed", "warnbadge"
-        if not get_pi_hub_display_key():
-            return "SETUP", "Pi Hub Key Needed", "warnbadge"
     if bool_from_form(config.get("panel_sleep", False)):
         return "SLEEP", "Display Sleeping", "infobadge"
 
@@ -3119,10 +2875,6 @@ def last_error_panel_html():
 def quote_status_short():
     if is_demo_mode():
         return "Demo Data"
-    if is_pi_hub_quote_source():
-        if not api_ready_for_quotes():
-            return "Pi Hub Setup Needed"
-        return pi_hub_status_short()
     if not get_finnhub_api_key():
         return "API Key Needed"
 
@@ -3160,14 +2912,8 @@ def setup_blocking_issues():
     except Exception:
         issues.append("Connect the device to WiFi.")
 
-    if not is_demo_mode():
-        if is_pi_hub_quote_source():
-            if not api_ready_for_quotes():
-                issues.append(
-                    "Set the Pi Hub Ticker URL and Pi Hub Display Key, or turn on Demo Mode."
-                )
-        elif not get_saved_customer_api_key():
-            issues.append("Save a Finnhub API key or turn on Demo Mode.")
+    if not is_demo_mode() and not get_saved_customer_api_key():
+        issues.append("Save a Finnhub API key or turn on Demo Mode.")
 
     if len(SYMBOLS) <= 0:
         issues.append("Add at least one stock symbol.")
@@ -3232,14 +2978,14 @@ def safe_config_export_dict():
         if key not in config:
             continue
 
-        if key in ("finnhub_api_key", "portfolio_bridge_key", "pi_hub_display_key"):
+        if key in ("finnhub_api_key", "portfolio_bridge_key"):
             if str(config.get(key, "")).strip():
                 export_config[key] = "__SAVED_SECRET_HIDDEN__"
             else:
                 export_config[key] = ""
         elif key == "admin_pin":
             export_config[key] = "__ADMIN_PIN_HIDDEN__"
-        elif key in ("portfolio_bridge_url", "pi_hub_ticker_url"):
+        elif key == "portfolio_bridge_url":
             export_config[key] = safe_network_label(config.get(key, ""))
         elif key == "update_manifest_url":
             export_config[key] = strip_url_query(config.get(key, ""))
@@ -3367,9 +3113,6 @@ def build_support_report_text():
     lines.append("Panel Display: " + panel_state_text())
     lines.append("Market Status: " + get_market_status(eastern_time_now()))
     lines.append("Quote Status: " + quote_status_short())
-    lines.append("Quote Source: " + str(config.get("quote_source", "direct_finnhub")))
-    lines.append("Pi Hub Status: " + pi_hub_status_short())
-    lines.append("Pi Hub Key Saved: " + yes_no(bool(get_pi_hub_display_key())))
     lines.append("Portfolio Status: " + portfolio_status_short())
     lines.append("Portfolio Mode: " + str(config.get("portfolio_mode", "off")))
     lines.append("Portfolio API Preference: " + ("v1 first" if bool_from_form(config.get("portfolio_prefer_api_v1", True)) else "legacy first"))
@@ -3377,6 +3120,9 @@ def build_support_report_text():
     lines.append("Portfolio API Version: " + str(last_portfolio_api_status.get("api_version", "unknown")))
     lines.append("Portfolio Schema: " + str(last_portfolio_api_status.get("schema_version", "unknown")))
     lines.append("Bridge Version: " + str(last_portfolio_api_status.get("bridge_version", "unknown")))
+    lines.append("Portfolio Processing Location: " + PORTFOLIO_PROCESSING_LOCATION)
+    lines.append("Ticker Portfolio Role: " + PORTFOLIO_TICKER_ROLE)
+    lines.append("Direct Schwab Processing on Ticker: No")
     lines.append("Bridge Key Saved: " + yes_no(bool(str(config.get("portfolio_bridge_key", "")).strip())))
     wifi_details = current_wifi_details()
     wifi_state = wifi_state_load()
@@ -3526,7 +3272,6 @@ h1 { margin-top:0; }
 <div class="card"><h2>Demo Mode</h2><p>Demo Mode shows sample prices for display/testing. It is not real market data and should be turned off for normal use.</p></div>
 <div class="card"><h2>Colors and labels</h2><p>Green means up, red means down, purple can indicate pre-market/after-hours. OLD means cached or stale data.</p></div>
 <div class="card"><h2>Portfolio bridge</h2><p>Portfolio mode is optional. Enter the local Raspberry Pi bridge URL and display key, then use Test Portfolio Bridge. API v1 is preferred automatically and the legacy endpoint remains available as a fallback.</p></div>
-<div class="card"><h2>Pi Hub quote source</h2><p>After the Raspberry Pi hub is set up, the ticker can pull quotes from the local hub instead of directly from Finnhub. Keep direct Finnhub fallback on during testing.</p></div>
 <div class="card"><h2>Privacy mode</h2><p>Portfolio Privacy Mode hides portfolio value, daily money change, cash, buying power, and mover amounts from the LED display. It does not disconnect Schwab or delete data from the local bridge.</p></div>
 <div class="card"><h2>Software updates</h2><p>Read Release Notes, then use Check for Update and Install Update. Rollback restores the previous app if an update has problems. WiFi, API keys, symbols, portfolio settings, and bridge keys remain in their separate settings files.</p></div>
 <div class="card"><h2>Sleep Display</h2><p>Sleep Display blanks the LED panels without unplugging the device. The dashboard, WiFi, OTA, and settings continue to work.</p></div>
@@ -4387,6 +4132,8 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <h2>Portfolio & Bridge</h2>
 <div class="status-line"><span>Portfolio status</span><b>{portfolio_status_short}</b></div>
 <div class="status-line"><span>Bridge API</span><b>{portfolio_api_mode_short}</b></div>
+<div class="status-line"><span>Processing host</span><b>Raspberry Pi</b></div>
+<div class="status-line"><span>Ticker role</span><b>Read-only display client</b></div>
 <p class="section-note">The Raspberry Pi keeps Schwab credentials local. The ticker receives only sanitized display data.</p>
 <div>{portfolio_bridge_links_html}</div>
 <div class="button-row">
@@ -4533,34 +4280,6 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <p>{portfolio_test_message}</p>
 <p class="small"><b>Bridge API Status</b><br>{portfolio_api_status_message}</p>
 </div>
-<div>
-<div class="card-kicker">Local Data Source</div>
-<h2>Pi Hub Quote Source</h2>
-<p class="section-note">Use this after the Raspberry Pi hub is confirmed healthy. The ticker can pull all quotes in one local request and fall back to direct Finnhub if the hub is offline.</p>
-<form method="POST" action="/save-config">
-<label>Quote Source</label>
-<select name="quote_source">
-<option value="direct_finnhub" {quote_source_direct_selected}>Direct Finnhub from S3</option>
-<option value="pi_hub" {quote_source_pi_selected}>Raspberry Pi Hub</option>
-</select>
-<label>Pi Hub Ticker URL</label>
-<input name="pi_hub_ticker_url" value="{pi_hub_ticker_url}" placeholder="http://192.168.2.85:8787/ticker">
-<label>Pi Hub Display Key</label>
-<input name="pi_hub_display_key" type="password" value="" placeholder="{pi_hub_display_key_placeholder}">
-<p class="small">The saved Pi Hub display key is hidden. Leave blank to keep it. The portfolio bridge display key is reused if this is blank.</p>
-<label>Fallback to Direct Finnhub if Pi Hub Fails</label>
-<select name="pi_hub_fallback_direct">
-<option value="true" {pi_hub_fallback_true_selected}>True</option>
-<option value="false" {pi_hub_fallback_false_selected}>False</option>
-</select>
-<label>Pi Hub Quote Stale Minutes</label>
-<input name="pi_hub_quote_stale_minutes" value="{pi_hub_quote_stale_minutes}">
-<button class="green" type="submit">Save Pi Hub Quote Settings</button>
-</form>
-<form method="POST" action="/test-pi-hub"><button type="submit">Test Pi Hub</button></form>
-<p>{pi_hub_test_message}</p>
-<p class="small"><b>Pi Hub Status</b><br>{pi_hub_status_message}</p>
-</div>
 </div>
 </details>
 
@@ -4576,11 +4295,6 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <h2>Quote Freshness</h2>
 <p>{quote_freshness_message}</p>
 <p class="small">STALE means the panel is using cached or older data.</p>
-</div>
-<div class="card">
-<h2>Pi Hub Quote Source</h2>
-<p>{pi_hub_status_message}</p>
-<form method="POST" action="/test-pi-hub"><button type="submit">Test Pi Hub</button></form>
 </div>
 <div class="card">
 <h2>Portfolio Status</h2>
@@ -5407,8 +5121,6 @@ def index(request: Request):
             last_error_message=last_error_message,
             test_quote_message=test_quote_message,
             portfolio_test_message=portfolio_test_message,
-            pi_hub_test_message=pi_hub_test_message,
-            pi_hub_status_message=build_pi_hub_status_html(),
             cloud_status_message=cloud_status_message,
             night_brightness=config["night_brightness"],
             night_start_hour=config["night_start_hour"],
@@ -5463,44 +5175,9 @@ def index(request: Request):
             portfolio_api_status_message=build_portfolio_api_status_html(),
             portfolio_api_mode_short=portfolio_api_mode_short(),
             portfolio_bridge_links_html=build_portfolio_bridge_links_html(),
-            quote_source_direct_selected=selected("direct_finnhub", config.get("quote_source", "direct_finnhub")),
-            quote_source_pi_selected=selected("pi_hub", config.get("quote_source", "direct_finnhub")),
-            pi_hub_ticker_url=safe_html(config.get("pi_hub_ticker_url", "")),
-            pi_hub_display_key_placeholder="Saved key hidden. Leave blank to keep it." if str(get_pi_hub_display_key()).strip() else "Paste Pi Hub display key here",
-            pi_hub_fallback_true_selected=selected("true", str(config.get("pi_hub_fallback_direct", True)).lower()),
-            pi_hub_fallback_false_selected=selected("false", str(config.get("pi_hub_fallback_direct", True)).lower()),
-            pi_hub_quote_stale_minutes=config.get("pi_hub_quote_stale_minutes", 10),
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
         ),
-        content_type="text/html"
-    )
-
-
-
-@server.route("/test-pi-hub", methods=["POST"])
-def test_pi_hub_route(request: Request):
-    global pi_hub_test_message
-
-    try:
-        data = fetch_pi_hub_ticker_payload()
-        quotes = data.get("quotes", {})
-        portfolio = data.get("portfolio", {})
-        pi_hub_test_message = (
-            "Pi Hub works: {} quotes, portfolio source {}."
-        ).format(
-            len(quotes),
-            portfolio.get("source", "unknown")
-        )
-        set_web_message(pi_hub_test_message)
-
-    except Exception as e:
-        pi_hub_test_message = "Pi Hub test failed: " + repr(e)
-        set_error_message(pi_hub_test_message)
-
-    return Response(
-        request,
-        clean_page("Pi Hub Test Complete", pi_hub_test_message),
         content_type="text/html"
     )
 
@@ -5521,18 +5198,6 @@ def test_quote_route(request: Request):
             test_quote_message = "{} demo works: {} {}".format(sym, e.get("price_line", ""), e.get("change_line", ""))
             set_web_message("Demo quote tested for {}.".format(sym))
             return Response(request, clean_page("Demo Quote Complete", test_quote_message), content_type="text/html")
-
-        if is_pi_hub_quote_source() and not is_demo_mode():
-            data = fetch_pi_hub_ticker_payload()
-            quote = data.get("quotes", {}).get(sym)
-            if not quote:
-                test_quote_message = "{} was not found in the Pi Hub quote cache. Refresh quotes on the Pi hub and try again.".format(sym)
-                set_error_message(test_quote_message)
-            else:
-                e = make_quote_entry_from_hub(sym, quote)
-                test_quote_message = "{} Pi Hub works: {} {}".format(sym, e.get("price_line", ""), e.get("change_line", ""))
-                set_web_message(test_quote_message)
-            return Response(request, clean_page("Pi Hub Quote Test Complete", test_quote_message), content_type="text/html")
 
         api_key = get_finnhub_api_key()
         if not api_key:
@@ -5612,15 +5277,6 @@ def validate_symbols_route(request: Request):
         try:
             if is_demo_mode():
                 valid.append("{} DEMO".format(sym))
-                continue
-
-            if is_pi_hub_quote_source():
-                data = fetch_pi_hub_ticker_payload()
-                q = data.get("quotes", {}).get(sym)
-                if q and float(q.get("price", q.get("c", 0)) or 0) > 0:
-                    valid.append("{} ${:.2f}".format(sym, float(q.get("price", q.get("c", 0)) or 0)))
-                else:
-                    invalid.append(sym)
                 continue
 
             api_key = get_finnhub_api_key()
@@ -5771,15 +5427,6 @@ def save_cfg(request: Request):
         config["portfolio_privacy_mode"] = bool_from_form(form.get("portfolio_privacy_mode", config.get("portfolio_privacy_mode", False)))
         config["portfolio_stale_minutes"] = clamp_int(form.get("portfolio_stale_minutes", config.get("portfolio_stale_minutes", 15)), 1, 1440, DEFAULT_CONFIG["portfolio_stale_minutes"])
         config["portfolio_capabilities_refresh_minutes"] = clamp_int(form.get("portfolio_capabilities_refresh_minutes", config.get("portfolio_capabilities_refresh_minutes", 60)), 5, 1440, DEFAULT_CONFIG["portfolio_capabilities_refresh_minutes"])
-
-        quote_source = url_decode(str(form.get("quote_source", config.get("quote_source", "direct_finnhub")))).strip().lower()
-        config["quote_source"] = quote_source if quote_source in ("direct_finnhub", "pi_hub") else "direct_finnhub"
-        config["pi_hub_ticker_url"] = url_decode(str(form.get("pi_hub_ticker_url", config.get("pi_hub_ticker_url", "")))).strip()
-        new_pi_hub_key = url_decode(str(form.get("pi_hub_display_key", ""))).strip()
-        if new_pi_hub_key:
-            config["pi_hub_display_key"] = new_pi_hub_key
-        config["pi_hub_fallback_direct"] = bool_from_form(form.get("pi_hub_fallback_direct", config.get("pi_hub_fallback_direct", True)))
-        config["pi_hub_quote_stale_minutes"] = clamp_int(form.get("pi_hub_quote_stale_minutes", config.get("pi_hub_quote_stale_minutes", 10)), 1, 1440, DEFAULT_CONFIG["pi_hub_quote_stale_minutes"])
 
         channel = url_decode(str(form.get("update_channel", config["update_channel"]))).strip().lower()
         config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
@@ -7602,25 +7249,6 @@ def finalize_quote_batch(entries, success_message):
 
 
 def fetch_entries():
-    if is_pi_hub_quote_source() and not is_demo_mode():
-        hub_entries = fetch_entries_from_pi_hub()
-        if hub_entries is not None:
-            return hub_entries
-
-        if not bool_from_form(config.get("pi_hub_fallback_direct", True)):
-            entries = []
-            for sym in SYMBOLS:
-                e = cached_or_error_quote(sym, "Pi Hub unavailable")
-                entries.append(e)
-                last_good[sym] = e
-            portfolio_entry = fetch_portfolio_entry()
-            if portfolio_entry:
-                entries.append(portfolio_entry)
-            finalize_quote_batch(entries, "Pi Hub unavailable")
-            return entries
-
-        add_event("Pi Hub unavailable; falling back to direct Finnhub.")
-
     entries = []
 
     for sym in SYMBOLS:
@@ -7644,21 +7272,11 @@ def fetch_entries():
 
 
 def start_smooth_quote_refresh(reason):
-    global smooth_refresh_active, smooth_refresh_index, refresh_requested, pending_entries
-
-    refresh_requested = False
-
-    if is_pi_hub_quote_source() and not is_demo_mode():
-        new_entries = fetch_entries()
-        if new_entries:
-            pending_entries = new_entries[:]
-            add_event("Pi Hub batch refresh queued: " + reason)
-        smooth_refresh_active = False
-        smooth_refresh_index = 0
-        return
+    global smooth_refresh_active, smooth_refresh_index, refresh_requested
 
     smooth_refresh_active = True
     smooth_refresh_index = 0
+    refresh_requested = False
     add_event("Smooth quote refresh started: " + reason)
 
 
