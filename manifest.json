@@ -5,15 +5,13 @@
     "notes": "Stable customer-ready ticker release."
   },
   "beta": {
-    "version": "1.1.23-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1123-final-crlf-1",
-    "notes": "Final SHA-verified 1.1.23-beta using the exact CRLF bytes served through the current GitHub/Cloudflare workflow.",
+    "version": "1.1.24-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1124-progress-1",
+    "notes": "Adds cooperative OTA processing with a live progress page, streaming download and SHA verification, responsive dashboard polling, duplicate-install protection, rollback backup, and an eight-second restart countdown.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 2,
-    "size": 166100,
-    "sha256": "25e87e389f491c35e7f331a623e1ea5dd6efdb2c8b3fcb818e25368e9ac8c4c7",
     "mandatory": false
   }
 }
