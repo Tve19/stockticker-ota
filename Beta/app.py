@@ -972,8 +972,15 @@ BACKUP_APP_PATH = "/app_backup.py"
 OTA_TEMP_PATH = "/app_update.tmp"
 OTA_BACKUP_TEMP_PATH = "/app_backup_new.tmp"
 OTA_BACKUP_PREVIOUS_PATH = "/app_backup_previous.py"
-OTA_STREAM_CHUNK_SIZE = 256
+OTA_STREAM_CHUNK_SIZE = 2048
+OTA_HASH_CHUNK_SIZE = 2048
 OTA_COPY_CHUNK_SIZE = 1024
+OTA_DOWNLOAD_TIMEOUT_SECONDS = 120
+OTA_DOWNLOAD_MAX_ATTEMPTS = 3
+OTA_DOWNLOAD_RETRY_DELAY_SECONDS = 3
+OTA_RETRYABLE_NETWORK_ERRNOS = (
+    116, -116, 110, -110, 104, -104, 113, -113
+)
 
 
 def file_exists(path):
@@ -1489,7 +1496,12 @@ ota_job = {
     "protected_before": None,
     "payload_message": "",
     "error": "",
-    "restart_seconds": 0
+    "restart_seconds": 0,
+    "download_attempt": 0,
+    "download_max_attempts": OTA_DOWNLOAD_MAX_ATTEMPTS,
+    "retry_at": 0,
+    "network_error": "",
+    "hash_done": 0
 }
 last_web_message = "System ready."
 last_error_message = "None yet."
@@ -6195,7 +6207,13 @@ def ota_job_public_status():
         "bytes_total": int(ota_job.get("bytes_total", 0) or 0),
         "elapsed_seconds": ota_job_elapsed(),
         "restart_seconds": int(ota_job.get("restart_seconds", 0) or 0),
-        "error": str(ota_job.get("error", ""))
+        "error": str(ota_job.get("error", "")),
+        "download_attempt": int(ota_job.get("download_attempt", 0) or 0),
+        "download_max_attempts": int(
+            ota_job.get("download_max_attempts", OTA_DOWNLOAD_MAX_ATTEMPTS)
+            or OTA_DOWNLOAD_MAX_ATTEMPTS
+        ),
+        "network_error": str(ota_job.get("network_error", ""))
     }
 
 
@@ -6233,6 +6251,103 @@ def ota_remove_file(path):
         os.remove(path)
     except Exception:
         pass
+
+
+
+def ota_exception_errno(error):
+    try:
+        return int(error.errno)
+    except Exception:
+        pass
+
+    try:
+        args = error.args
+        if args and isinstance(args[0], int):
+            return int(args[0])
+    except Exception:
+        pass
+
+    return None
+
+
+def ota_network_error_label(error):
+    number = ota_exception_errno(error)
+
+    if number in (116, -116, 110, -110):
+        return "ETIMEDOUT"
+
+    if number in (104, -104):
+        return "ECONNRESET"
+
+    if number in (113, -113):
+        return "EHOSTUNREACH"
+
+    if number is None:
+        return error.__class__.__name__
+
+    return "ERRNO {}".format(number)
+
+
+def ota_schedule_download_retry(error):
+    attempt = int(ota_job.get("download_attempt", 0) or 0)
+    maximum = int(
+        ota_job.get("download_max_attempts", OTA_DOWNLOAD_MAX_ATTEMPTS)
+        or OTA_DOWNLOAD_MAX_ATTEMPTS
+    )
+
+    number = ota_exception_errno(error)
+    label = ota_network_error_label(error)
+    detail = "{}: {}".format(label, repr(error))
+    ota_job["network_error"] = detail
+
+    retryable = (
+        number in OTA_RETRYABLE_NETWORK_ERRNOS
+        or "timeout" in str(error).lower()
+        or "timed out" in str(error).lower()
+    )
+
+    if not retryable or attempt >= maximum:
+        ota_job_fail(
+            "Firmware download failed during attempt {}/{}: {}.".format(
+                attempt,
+                maximum,
+                detail
+            )
+        )
+        return
+
+    ota_cleanup_resources()
+    ota_remove_file(OTA_TEMP_PATH)
+    ota_job["iterator"] = None
+    ota_job["hasher"] = None
+    ota_job["bytes_done"] = 0
+    ota_job["bytes_total"] = 0
+    ota_job["hash_done"] = 0
+    ota_job["retry_at"] = (
+        time.monotonic() + OTA_DOWNLOAD_RETRY_DELAY_SECONDS
+    )
+
+    ota_job_set(
+        "retry_download",
+        6,
+        "Firmware download timed out",
+        (
+            "{} Retry {}/{} begins in {} seconds. "
+            "The working firmware remains untouched."
+        ).format(
+            detail,
+            attempt + 1,
+            maximum,
+            OTA_DOWNLOAD_RETRY_DELAY_SECONDS
+        )
+    )
+    add_event(
+        "OTA network retry scheduled after {} on attempt {}/{}.".format(
+            label,
+            attempt,
+            maximum
+        )
+    )
 
 
 def ota_job_fail(message):
@@ -6608,12 +6723,69 @@ def ota_job_step():
             )
             return
 
-        if stage == "open_download":
-            ota_remove_file(OTA_TEMP_PATH)
-            response = requests.get(
-                ota_job.get("app_url", ""),
-                stream=True
+        if stage == "retry_download":
+            remaining = int(
+                max(
+                    0,
+                    float(ota_job.get("retry_at", 0) or 0)
+                    - time.monotonic()
+                )
             )
+
+            ota_job["detail"] = (
+                "Retrying the firmware download in {} seconds. "
+                "Attempt {}/{} will restart from byte zero."
+            ).format(
+                remaining,
+                int(ota_job.get("download_attempt", 0) or 0) + 1,
+                int(
+                    ota_job.get(
+                        "download_max_attempts",
+                        OTA_DOWNLOAD_MAX_ATTEMPTS
+                    )
+                    or OTA_DOWNLOAD_MAX_ATTEMPTS
+                )
+            )
+
+            if time.monotonic() >= float(
+                ota_job.get("retry_at", 0) or 0
+            ):
+                ota_job_set(
+                    "open_download",
+                    6,
+                    "Reopening firmware download",
+                    "Starting a fresh HTTPS request."
+                )
+            return
+
+        if stage == "open_download":
+            ota_cleanup_resources()
+            ota_remove_file(OTA_TEMP_PATH)
+
+            attempt = int(ota_job.get("download_attempt", 0) or 0) + 1
+            maximum = int(
+                ota_job.get(
+                    "download_max_attempts",
+                    OTA_DOWNLOAD_MAX_ATTEMPTS
+                )
+                or OTA_DOWNLOAD_MAX_ATTEMPTS
+            )
+            ota_job["download_attempt"] = attempt
+            ota_job["network_error"] = ""
+
+            try:
+                response = requests.get(
+                    ota_job.get("app_url", ""),
+                    stream=True,
+                    timeout=OTA_DOWNLOAD_TIMEOUT_SECONDS,
+                    headers={
+                        "connection": "close",
+                        "cache-control": "no-cache"
+                    }
+                )
+            except OSError as error:
+                ota_schedule_download_retry(error)
+                return
 
             try:
                 status_code = int(response.status_code)
@@ -6626,7 +6798,11 @@ def ota_job_step():
                 except Exception:
                     pass
                 ota_job_fail(
-                    "Firmware server returned HTTP {}.".format(status_code)
+                    "Firmware server returned HTTP {} on attempt {}/{}.".format(
+                        status_code,
+                        attempt,
+                        maximum
+                    )
                 )
                 return
 
@@ -6637,6 +6813,8 @@ def ota_job_step():
             )
             ota_job["file"] = open(OTA_TEMP_PATH, "wb")
             ota_job["bytes_done"] = 0
+            ota_job["hash_done"] = 0
+            ota_job["hasher"] = None
 
             total = 0
             try:
@@ -6644,20 +6822,24 @@ def ota_job_step():
                     total = int(ota_job.get("expected_size"))
             except Exception:
                 total = 0
+
             if total <= 0:
                 total = ota_read_content_length(response)
-            ota_job["bytes_total"] = total
 
-            if ota_job.get("expected_hash"):
-                hasher, mode = create_sha256_hasher()
-                ota_job["hasher"] = hasher
-                ota_job["hash_mode"] = mode
+            ota_job["bytes_total"] = total
 
             ota_job_set(
                 "downloading",
                 8,
-                "Downloading and verifying firmware",
-                "The dashboard remains available during streaming verification."
+                "Downloading firmware",
+                (
+                    "Attempt {}/{}. Network timeout is {} seconds. "
+                    "Integrity verification begins after the HTTPS socket closes."
+                ).format(
+                    attempt,
+                    maximum,
+                    OTA_DOWNLOAD_TIMEOUT_SECONDS
+                )
             )
             return
 
@@ -6669,44 +6851,112 @@ def ota_job_step():
                 chunk = next(iterator)
             except StopIteration:
                 chunk = None
+            except OSError as error:
+                ota_schedule_download_retry(error)
+                return
 
             if chunk is None:
                 ota_close_resource("file")
                 ota_close_resource("response")
                 ota_job["iterator"] = None
-                ota_job_set(
-                    "verify",
-                    72,
-                    "Finalizing integrity verification",
-                    "Checking version, hardware, schema, size, and SHA-256."
-                )
+
+                if ota_job.get("expected_hash"):
+                    hasher, mode = create_sha256_hasher()
+                    ota_job["hasher"] = hasher
+                    ota_job["hash_mode"] = mode
+                    ota_job["source"] = open(OTA_TEMP_PATH, "rb")
+                    ota_job["hash_done"] = 0
+                    ota_job_set(
+                        "hashing",
+                        70,
+                        "Verifying downloaded firmware",
+                        (
+                            "The network connection is closed. "
+                            "SHA-256 is now calculated from the local temporary file."
+                        )
+                    )
+                else:
+                    ota_job_set(
+                        "verify",
+                        78,
+                        "Finalizing update verification",
+                        "Checking version, hardware, schema, and size."
+                    )
                 return
 
             if isinstance(chunk, str):
                 chunk = chunk.encode("utf-8")
 
             if chunk:
-                target.write(chunk)
-                ota_job["bytes_done"] += len(chunk)
+                try:
+                    target.write(chunk)
+                except Exception:
+                    raise
 
-                hasher = ota_job.get("hasher")
-                if hasher is not None:
-                    hasher.update(chunk)
+                ota_job["bytes_done"] += len(chunk)
 
                 done = int(ota_job.get("bytes_done", 0))
                 total = int(ota_job.get("bytes_total", 0) or 0)
-                percent = 8
+
                 if total > 0:
-                    percent = 8 + int(min(1.0, done / total) * 62)
+                    percent = 8 + int(min(1.0, done / total) * 61)
                 else:
-                    percent = min(68, 8 + int(done / 4096))
+                    percent = min(68, 8 + int(done / 8192))
 
                 ota_job_set(
                     "downloading",
                     percent,
-                    "Downloading and verifying firmware",
-                    "{} bytes received.".format(done)
+                    "Downloading firmware",
+                    (
+                        "{} of {} bytes received on attempt {}/{}."
+                    ).format(
+                        done,
+                        total if total > 0 else "unknown",
+                        int(ota_job.get("download_attempt", 0) or 0),
+                        int(
+                            ota_job.get(
+                                "download_max_attempts",
+                                OTA_DOWNLOAD_MAX_ATTEMPTS
+                            )
+                            or OTA_DOWNLOAD_MAX_ATTEMPTS
+                        )
+                    )
                 )
+            return
+
+        if stage == "hashing":
+            source = ota_job.get("source")
+            hasher = ota_job.get("hasher")
+            chunk = source.read(OTA_HASH_CHUNK_SIZE)
+
+            if chunk:
+                hasher.update(chunk)
+                ota_job["hash_done"] += len(chunk)
+
+                done = int(ota_job.get("hash_done", 0) or 0)
+                total = int(ota_job.get("bytes_done", 0) or 0)
+
+                percent = (
+                    70 + int(min(1.0, done / total) * 8)
+                    if total > 0
+                    else 74
+                )
+
+                ota_job_set(
+                    "hashing",
+                    percent,
+                    "Verifying downloaded firmware",
+                    "{} of {} bytes hashed locally.".format(done, total)
+                )
+                return
+
+            ota_close_resource("source")
+            ota_job_set(
+                "verify",
+                78,
+                "Finalizing integrity verification",
+                "Checking version, hardware, schema, size, and SHA-256."
+            )
             return
 
         if stage == "verify":
@@ -6829,7 +7079,20 @@ def ota_job_step():
             return
 
     except Exception as e:
-        ota_job_fail("OTA job error: " + repr(e))
+        current_stage = str(ota_job.get("stage", stage))
+        attempt = int(ota_job.get("download_attempt", 0) or 0)
+        maximum = int(
+            ota_job.get("download_max_attempts", OTA_DOWNLOAD_MAX_ATTEMPTS)
+            or OTA_DOWNLOAD_MAX_ATTEMPTS
+        )
+        ota_job_fail(
+            "OTA job error during stage '{}' (download attempt {}/{}): {}.".format(
+                current_stage,
+                attempt,
+                maximum,
+                repr(e)
+            )
+        )
 
 
 @server.route("/update-status")
