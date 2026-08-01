@@ -4,8 +4,8 @@
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable customer-ready ticker release."
   },
-  "beta": {
-  "version": "1.1.18-beta",
+"beta": {
+  "version": "1.1.27-beta",
   "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
-  "notes": "S3 can now pull quotes and portfolio data from the Raspberry Pi Local Hub, with direct Finnhub fallback."
+  "notes": "Based on 1.1.26 customer WiFi build. Adds Raspberry Pi Hub quote source with direct Finnhub fallback."
 }
