@@ -3,9 +3,17 @@
     "version": "1.1.16",
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable customer-ready ticker release."
-  },
-"beta": {
-  "version": "1.1.27-beta",
-  "app_url": "https://stockticker-ota.pages.dev/Beta/app.py",
-  "notes": "Based on 1.1.26 customer WiFi build. Adds Raspberry Pi Hub quote source with direct Finnhub fallback."
+  }, 
+ "beta": {
+    "version": "1.1.26-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1126-wifi-manager-reviewed-2",
+    "notes": "Reviewed Customer WiFi Manager release. Adds current-network status, protected dashboard switching, automatic previous-network restoration, setup-hotspot recovery, unique setup code, nearby network scanning, mDNS hostname, and explicit Raspberry Pi workload separation diagnostics. Preserves 1.1.25 OTA journal, watchdog, rollback, preflight tests, safe support report, and responsive updates.",
+    "hardware": [
+      "matrix_portal_s3"
+    ],
+    "minimum_config_schema": 2,
+    "size": 259249,
+    "sha256": "97abaa70ed1f9349cde2e2496d67ff7e082705bb59f1f90d83b42421abbcc989",
+    "mandatory": false
+  }
 }
