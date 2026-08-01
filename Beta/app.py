@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.23-beta"
+APP_VERSION = "1.1.24-beta"
 CONFIG_SCHEMA_VERSION = 2
 PORTFOLIO_API_SCHEMA_SUPPORTED = 1
 DEVICE_MODEL = "matrix_portal_s3"
@@ -548,6 +548,11 @@ def mark_app_boot_success():
 
 APP_PATH = "/app.py"
 BACKUP_APP_PATH = "/app_backup.py"
+OTA_TEMP_PATH = "/app_update.tmp"
+OTA_BACKUP_TEMP_PATH = "/app_backup_new.tmp"
+OTA_BACKUP_PREVIOUS_PATH = "/app_backup_previous.py"
+OTA_STREAM_CHUNK_SIZE = 256
+OTA_COPY_CHUNK_SIZE = 1024
 
 
 def file_exists(path):
@@ -621,6 +626,36 @@ last_good = {}
 last_update_text = "--:--"
 ota_message = "No update checked yet."
 ota_status_message = "Press Check OTA Status to verify manifest, channel, and backup."
+ota_job = {
+    "active": False,
+    "stage": "idle",
+    "percent": 0,
+    "message": "No update is running.",
+    "detail": "",
+    "started": 0,
+    "updated": 0,
+    "latest": "",
+    "app_url": "",
+    "manifest": None,
+    "info": None,
+    "response": None,
+    "iterator": None,
+    "file": None,
+    "source": None,
+    "target": None,
+    "hasher": None,
+    "hash_mode": "not requested",
+    "expected_hash": "",
+    "expected_size": None,
+    "bytes_done": 0,
+    "bytes_total": 0,
+    "copy_done": 0,
+    "copy_total": 0,
+    "protected_before": None,
+    "payload_message": "",
+    "error": "",
+    "restart_seconds": 0
+}
 last_web_message = "System ready."
 last_error_message = "None yet."
 test_quote_message = "No quote tested yet."
@@ -2468,6 +2503,11 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 .button-row {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
 .button-row form {{ margin:0; }}
 .slim {{ margin-bottom:10px; }}
+.ota-progress {{ background:#07111f; border:1px solid #2a4166; border-radius:12px; padding:12px; margin:10px 0; }}
+.ota-track {{ height:12px; background:#1a2a40; border-radius:999px; overflow:hidden; margin:8px 0; }}
+.ota-fill {{ height:100%; background:linear-gradient(90deg,#2b8cff,#29bb73); border-radius:999px; }}
+.ota-active {{ color:#8edbff; }}
+.ota-error {{ color:#ff8b8b; }}
 
 /* Customer dashboard polish */
 :root {{
@@ -2996,12 +3036,13 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <div class="card">
 <h2>Software Update</h2>
 <p>{ota_message}</p>
-<form method="POST" action="/check-update"><button type="submit">Check for Update</button></form>
+{ota_job_panel}
+<form method="POST" action="/check-update"><button type="submit" {ota_controls_disabled}>Check for Update</button></form>
 <br>
-<form method="POST" action="/install-update">
+<form method="POST" action="/install-update" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Starting Update...';">
 <label>Admin PIN</label>
-<input name="admin_pin" type="password" placeholder="Enter PIN">
-<button class="green" type="submit">Install Update</button>
+<input name="admin_pin" type="password" placeholder="Enter PIN" {ota_controls_disabled}>
+<button class="green" type="submit" {ota_controls_disabled}>{ota_install_button_text}</button>
 </form>
 <br>
 <form method="POST" action="/rollback" onsubmit="return confirm('Rollback to previous app_backup.py and restart?');">
@@ -3203,6 +3244,9 @@ def index(request: Request):
             block_gap=config["block_gap"],
             ota_message=ota_message,
             ota_status_message=ota_status_message,
+            ota_job_panel=build_ota_job_panel_html(),
+            ota_controls_disabled="disabled" if ota_job_active() else "",
+            ota_install_button_text="Update In Progress" if ota_job_active() else "Install Update",
             alert_message=alert_message,
             quote_freshness_message=build_quote_freshness_html(),
             portfolio_status_message=build_portfolio_status_html(),
@@ -3982,28 +4026,309 @@ def ota_protected_settings_snapshot():
     return snapshot
 
 
-def verify_update_payload(new_code, info):
-    if len(new_code) < 1000:
+def ota_job_active():
+    return bool(ota_job.get("active", False))
+
+
+def ota_job_elapsed():
+    started = float(ota_job.get("started", 0) or 0)
+    if started <= 0:
+        return 0
+    return max(0, int(time.monotonic() - started))
+
+
+def ota_job_public_status():
+    return {
+        "active": ota_job_active(),
+        "stage": str(ota_job.get("stage", "idle")),
+        "percent": int(ota_job.get("percent", 0) or 0),
+        "message": str(ota_job.get("message", "")),
+        "detail": str(ota_job.get("detail", "")),
+        "latest": str(ota_job.get("latest", "")),
+        "bytes_done": int(ota_job.get("bytes_done", 0) or 0),
+        "bytes_total": int(ota_job.get("bytes_total", 0) or 0),
+        "elapsed_seconds": ota_job_elapsed(),
+        "restart_seconds": int(ota_job.get("restart_seconds", 0) or 0),
+        "error": str(ota_job.get("error", ""))
+    }
+
+
+def ota_job_set(stage, percent, message, detail=""):
+    ota_job["stage"] = stage
+    ota_job["percent"] = max(0, min(100, int(percent)))
+    ota_job["message"] = str(message)
+    ota_job["detail"] = str(detail)
+    ota_job["updated"] = time.monotonic()
+
+
+def ota_close_resource(name):
+    resource = ota_job.get(name)
+    if resource is not None:
+        try:
+            resource.close()
+        except Exception:
+            pass
+    ota_job[name] = None
+
+
+def ota_cleanup_resources():
+    ota_close_resource("file")
+    ota_close_resource("source")
+    ota_close_resource("target")
+    ota_close_resource("response")
+    ota_job["iterator"] = None
+
+
+def ota_remove_file(path):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
+def ota_job_fail(message):
+    global ota_message
+
+    failed_stage = str(ota_job.get("stage", ""))
+    ota_cleanup_resources()
+
+    if failed_stage == "installing" and file_exists(BACKUP_APP_PATH):
+        rollback_ok, rollback_message = rollback_to_backup()
+        if rollback_ok:
+            message = str(message) + " Previous firmware restored."
+        else:
+            message = (
+                str(message)
+                + " Automatic rollback failed: "
+                + str(rollback_message)
+            )
+
+    ota_job["active"] = False
+    ota_job["stage"] = "error"
+    ota_job["percent"] = 0
+    ota_job["message"] = "Update failed"
+    ota_job["detail"] = str(message)
+    ota_job["error"] = str(message)
+    ota_message = str(message)
+    ota_remove_file(OTA_TEMP_PATH)
+    ota_remove_file(OTA_BACKUP_TEMP_PATH)
+    set_error_message(str(message))
+
+
+def start_ota_job():
+    global ota_message
+
+    ota_cleanup_resources()
+
+    ota_job.update({
+        "active": True,
+        "stage": "queued",
+        "percent": 1,
+        "message": "Update queued",
+        "detail": "Preparing the update job.",
+        "started": time.monotonic(),
+        "updated": time.monotonic(),
+        "latest": "",
+        "app_url": "",
+        "manifest": None,
+        "info": None,
+        "response": None,
+        "iterator": None,
+        "file": None,
+        "source": None,
+        "target": None,
+        "hasher": None,
+        "hash_mode": "not requested",
+        "expected_hash": "",
+        "expected_size": None,
+        "bytes_done": 0,
+        "bytes_total": 0,
+        "copy_done": 0,
+        "copy_total": 0,
+        "protected_before": None,
+        "payload_message": "",
+        "error": "",
+        "restart_seconds": 0
+    })
+
+    ota_message = "Update processing started. Open progress to monitor it."
+    add_event("OTA update job queued.")
+
+
+def ota_processing_page():
+    return """<!DOCTYPE html>
+<html>
+<head>
+<title>StockTicker Update</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
+.wrap { max-width:720px; margin:6vh auto; }
+.card { background:#101b2e; border:1px solid #31527f; border-radius:20px; padding:22px; box-shadow:0 18px 45px rgba(0,0,0,.3); }
+.kicker { color:#79c7ff; font-size:12px; font-weight:bold; letter-spacing:1.3px; text-transform:uppercase; }
+.track { height:16px; background:#1a2a40; border-radius:999px; overflow:hidden; margin:18px 0 8px; }
+.fill { height:100%; width:0%; background:linear-gradient(90deg,#2b8cff,#29bb73); transition:width .25s ease; }
+.row { display:flex; justify-content:space-between; gap:12px; color:#a9bddb; font-size:13px; }
+.message { font-size:20px; font-weight:bold; margin-top:16px; }
+.detail { color:#b9cbe4; line-height:1.5; min-height:44px; }
+.error { color:#ff8b8b; }
+a { color:#79c7ff; }
+</style>
+</head>
+<body>
+<div class="wrap"><div class="card">
+<div class="kicker">Protected OTA Update</div>
+<h1>Update Processing</h1>
+<p>The dashboard and ticker remain available while the update advances in small steps.</p>
+<div class="track"><div class="fill" id="fill"></div></div>
+<div class="row"><span id="percent">0%</span><span id="elapsed">0s</span></div>
+<div class="message" id="message">Starting update...</div>
+<p class="detail" id="detail">Please keep the ticker powered on.</p>
+<p id="bytes"></p>
+<p><a href="/">Open Dashboard</a></p>
+</div></div>
+<script>
+let redirectScheduled=false;
+async function pollStatus(){
+  try {
+    const response=await fetch('/update-status?cb='+Date.now(),{cache:'no-store'});
+    const data=await response.json();
+    const pct=Math.max(0,Math.min(100,Number(data.percent||0)));
+    document.getElementById('fill').style.width=pct+'%';
+    document.getElementById('percent').textContent=pct+'% · '+String(data.stage||'');
+    document.getElementById('elapsed').textContent=String(data.elapsed_seconds||0)+'s';
+    document.getElementById('message').textContent=String(data.message||'');
+    document.getElementById('detail').textContent=String(data.detail||'');
+    const done=Number(data.bytes_done||0), total=Number(data.bytes_total||0);
+    document.getElementById('bytes').textContent=total>0 ? done.toLocaleString()+' / '+total.toLocaleString()+' bytes' : '';
+    if(data.stage==='error'){
+      document.getElementById('message').classList.add('error');
+      return;
+    }
+    if(data.stage==='restarting' && !redirectScheduled){
+      redirectScheduled=true;
+      const seconds=Number(data.restart_seconds||8);
+      document.getElementById('detail').textContent='Restarting in '+seconds+' seconds. This page will reconnect automatically.';
+      setTimeout(function(){ window.location.href='/'; }, (seconds+5)*1000);
+    }
+  } catch(error) {
+    if(redirectScheduled){
+      setTimeout(function(){ window.location.href='/'; }, 3000);
+    }
+  }
+}
+setInterval(pollStatus,1000);
+pollStatus();
+</script>
+</body>
+</html>"""
+
+
+def build_ota_job_panel_html():
+    stage = str(ota_job.get("stage", "idle"))
+
+    if stage == "idle":
+        return ""
+
+    percent = int(ota_job.get("percent", 0) or 0)
+    message = safe_html(ota_job.get("message", ""))
+    detail = safe_html(ota_job.get("detail", ""))
+    css_class = "ota-error" if stage == "error" else "ota-active"
+
+    return (
+        "<div class='ota-progress'>"
+        "<b class='{}'>{}</b>"
+        "<div class='ota-track'><div class='ota-fill' style='width:{}%'></div></div>"
+        "<div class='small'>{}% · {}<br>{}</div>"
+        "<a href='/update-progress'>Open Live Update Progress</a>"
+        "</div>"
+    ).format(
+        css_class,
+        message,
+        percent,
+        percent,
+        safe_html(stage),
+        detail
+    )
+
+
+def ota_read_content_length(response):
+    try:
+        headers = response.headers
+        raw = headers.get("content-length", headers.get("Content-Length", "0"))
+        return int(raw or 0)
+    except Exception:
+        return 0
+
+
+def ota_promote_backup_temp():
+    try:
+        ota_remove_file(OTA_BACKUP_PREVIOUS_PATH)
+
+        if file_exists(BACKUP_APP_PATH):
+            try:
+                os.rename(BACKUP_APP_PATH, OTA_BACKUP_PREVIOUS_PATH)
+            except Exception:
+                ota_remove_file(OTA_BACKUP_PREVIOUS_PATH)
+                ok, msg = copy_file_safe(
+                    BACKUP_APP_PATH,
+                    OTA_BACKUP_PREVIOUS_PATH
+                )
+                if not ok:
+                    return False, msg
+                ota_remove_file(BACKUP_APP_PATH)
+
+        try:
+            os.rename(OTA_BACKUP_TEMP_PATH, BACKUP_APP_PATH)
+        except Exception:
+            ok, msg = copy_file_safe(
+                OTA_BACKUP_TEMP_PATH,
+                BACKUP_APP_PATH
+            )
+            if not ok:
+                if (
+                    not file_exists(BACKUP_APP_PATH)
+                    and file_exists(OTA_BACKUP_PREVIOUS_PATH)
+                ):
+                    copy_file_safe(
+                        OTA_BACKUP_PREVIOUS_PATH,
+                        BACKUP_APP_PATH
+                    )
+                return False, msg
+            ota_remove_file(OTA_BACKUP_TEMP_PATH)
+
+        return True, "Rollback backup prepared."
+
+    except Exception as e:
+        return False, "Backup promotion failed: " + repr(e)
+
+
+def ota_verify_downloaded_file():
+    info = ota_job.get("info") or {}
+    latest = str(ota_job.get("latest", "")).strip()
+    actual_size = int(ota_job.get("bytes_done", 0) or 0)
+    expected_size = ota_job.get("expected_size")
+    expected_hash = str(ota_job.get("expected_hash", "")).lower()
+
+    if actual_size < 1000:
         return False, "Downloaded app.py was too small."
 
-    if "APP.PY STARTED" not in new_code:
+    try:
+        with open(OTA_TEMP_PATH, "rb") as f:
+            header = f.read(700).decode("utf-8")
+    except Exception as e:
+        return False, "Could not inspect downloaded app.py: " + repr(e)
+
+    if "APP.PY STARTED" not in header:
         return False, "Downloaded file does not look like app.py."
 
-    latest = str(info.get("version", "")).strip()
-
-    if not latest:
-        return False, "Manifest is missing the update version."
-
     expected_version_line = 'APP_VERSION = "{}"'.format(latest)
-
-    if expected_version_line not in new_code[:500]:
+    if expected_version_line not in header:
         return False, "Downloaded app.py version does not match the manifest."
 
     hardware = info.get("hardware", [])
-
     if isinstance(hardware, str):
         hardware = [hardware]
-
     if hardware and DEVICE_MODEL not in hardware:
         return False, "Update is not compatible with this hardware model."
 
@@ -4011,53 +4336,348 @@ def verify_update_payload(new_code, info):
         minimum_schema = int(info.get("minimum_config_schema", 0) or 0)
     except Exception:
         minimum_schema = 0
-
     if minimum_schema > CONFIG_SCHEMA_VERSION:
         return False, "Update requires a newer configuration schema."
 
-    expected_size = info.get("size", None)
-    expected_hash = str(info.get("sha256", "")).strip().lower()
+    if expected_size is not None:
+        try:
+            if actual_size != int(expected_size):
+                return False, "Downloaded app.py size does not match the manifest."
+        except Exception:
+            return False, "Manifest contains an invalid firmware size."
+
+    if expected_hash:
+        hasher = ota_job.get("hasher")
+        if hasher is None:
+            return False, "SHA-256 was requested but the verifier was not initialized."
+
+        digest = hasher.digest()
+        actual_hash = "".join(
+            "{:02x}".format(byte)
+            for byte in digest
+        ).lower()
+
+        if actual_hash != expected_hash:
+            return False, "Downloaded app.py failed SHA-256 verification."
+
+    checks = ["version", "hardware", "schema"]
+    if expected_size is not None:
+        checks.append("size")
+    if expected_hash:
+        checks.append("SHA-256 ({})".format(ota_job.get("hash_mode", "software")))
+
+    return True, "Update payload verified: " + ", ".join(checks) + "."
+
+
+def ota_job_step():
+    global ota_message, ota_status_message
+    global restart_requested, restart_time
+
+    if not ota_job_active():
+        return
+
+    stage = str(ota_job.get("stage", "queued"))
 
     try:
-        actual_size = 0
-        hasher = None
-        hash_mode = "not requested"
+        if stage == "queued":
+            ota_job_set(
+                "manifest",
+                3,
+                "Checking update manifest",
+                "Contacting the configured OTA server."
+            )
+            return
 
-        if expected_hash:
-            hasher, hash_mode = create_sha256_hasher()
+        if stage == "manifest":
+            manifest = fetch_update_manifest()
+            if manifest is None:
+                ota_job_fail("Could not download a valid update manifest.")
+                return
 
-        for start in range(0, len(new_code), 512):
-            chunk = new_code[start:start + 512].encode("utf-8")
-            actual_size += len(chunk)
+            info = get_channel_info(manifest)
+            latest = str(info.get("version", "")).strip()
+            app_url = str(info.get("app_url", "")).strip()
 
-            if hasher is not None:
-                hasher.update(chunk)
+            if not latest:
+                ota_job_fail("Manifest is missing the update version.")
+                return
+            if latest == APP_VERSION:
+                ota_cleanup_resources()
+                ota_job["active"] = False
+                ota_job_set("complete", 100, "Already up to date", latest)
+                ota_message = "Already up to date."
+                return
+            if not app_url.startswith("http"):
+                ota_job_fail("Manifest contains a bad update file URL.")
+                return
 
-        if expected_size is not None and actual_size != int(expected_size):
-            return False, "Downloaded app.py size does not match the manifest."
+            expected_hash = str(info.get("sha256", "")).strip().lower()
+            expected_size = info.get("size", None)
 
-        if hasher is not None:
-            digest = hasher.digest()
-            actual_hash = "".join(
-                "{:02x}".format(byte)
-                for byte in digest
-            ).lower()
+            ota_job["manifest"] = manifest
+            ota_job["info"] = info
+            ota_job["latest"] = latest
+            ota_job["app_url"] = app_url
+            ota_job["expected_hash"] = expected_hash
+            ota_job["expected_size"] = expected_size
+            ota_status_message = build_ota_status_summary(manifest)
+            ota_job_set(
+                "open_download",
+                6,
+                "Opening firmware download",
+                latest
+            )
+            return
 
-            if actual_hash != expected_hash:
-                return False, "Downloaded app.py failed SHA-256 verification."
+        if stage == "open_download":
+            ota_remove_file(OTA_TEMP_PATH)
+            response = requests.get(
+                ota_job.get("app_url", ""),
+                stream=True
+            )
+
+            try:
+                status_code = int(response.status_code)
+            except Exception:
+                status_code = 200
+
+            if status_code != 200:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                ota_job_fail(
+                    "Firmware server returned HTTP {}.".format(status_code)
+                )
+                return
+
+            ota_job["response"] = response
+            ota_job["iterator"] = response.iter_content(
+                chunk_size=OTA_STREAM_CHUNK_SIZE,
+                decode_unicode=False
+            )
+            ota_job["file"] = open(OTA_TEMP_PATH, "wb")
+            ota_job["bytes_done"] = 0
+
+            total = 0
+            try:
+                if ota_job.get("expected_size") is not None:
+                    total = int(ota_job.get("expected_size"))
+            except Exception:
+                total = 0
+            if total <= 0:
+                total = ota_read_content_length(response)
+            ota_job["bytes_total"] = total
+
+            if ota_job.get("expected_hash"):
+                hasher, mode = create_sha256_hasher()
+                ota_job["hasher"] = hasher
+                ota_job["hash_mode"] = mode
+
+            ota_job_set(
+                "downloading",
+                8,
+                "Downloading and verifying firmware",
+                "The dashboard remains available during streaming verification."
+            )
+            return
+
+        if stage == "downloading":
+            iterator = ota_job.get("iterator")
+            target = ota_job.get("file")
+
+            try:
+                chunk = next(iterator)
+            except StopIteration:
+                chunk = None
+
+            if chunk is None:
+                ota_close_resource("file")
+                ota_close_resource("response")
+                ota_job["iterator"] = None
+                ota_job_set(
+                    "verify",
+                    72,
+                    "Finalizing integrity verification",
+                    "Checking version, hardware, schema, size, and SHA-256."
+                )
+                return
+
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+
+            if chunk:
+                target.write(chunk)
+                ota_job["bytes_done"] += len(chunk)
+
+                hasher = ota_job.get("hasher")
+                if hasher is not None:
+                    hasher.update(chunk)
+
+                done = int(ota_job.get("bytes_done", 0))
+                total = int(ota_job.get("bytes_total", 0) or 0)
+                percent = 8
+                if total > 0:
+                    percent = 8 + int(min(1.0, done / total) * 62)
+                else:
+                    percent = min(68, 8 + int(done / 4096))
+
+                ota_job_set(
+                    "downloading",
+                    percent,
+                    "Downloading and verifying firmware",
+                    "{} bytes received.".format(done)
+                )
+            return
+
+        if stage == "verify":
+            ok, message = ota_verify_downloaded_file()
+            if not ok:
+                ota_job_fail(message)
+                return
+
+            ota_job["payload_message"] = message
+            ota_job["protected_before"] = ota_protected_settings_snapshot()
+            ota_remove_file(OTA_BACKUP_TEMP_PATH)
+            ota_job["source"] = open(APP_PATH, "rb")
+            ota_job["target"] = open(OTA_BACKUP_TEMP_PATH, "wb")
+            try:
+                ota_job["copy_total"] = int(os.stat(APP_PATH)[6])
+            except Exception:
+                ota_job["copy_total"] = 0
+            ota_job["copy_done"] = 0
+            ota_job_set(
+                "backup",
+                74,
+                "Creating rollback backup",
+                "The current working firmware is being preserved."
+            )
+            return
+
+        if stage == "backup":
+            source = ota_job.get("source")
+            target = ota_job.get("target")
+            chunk = source.read(OTA_COPY_CHUNK_SIZE)
+
+            if chunk:
+                target.write(chunk)
+                ota_job["copy_done"] += len(chunk)
+                total = int(ota_job.get("copy_total", 0) or 0)
+                done = int(ota_job.get("copy_done", 0) or 0)
+                percent = 74 + int(min(1.0, done / total) * 10) if total else 78
+                ota_job_set(
+                    "backup",
+                    percent,
+                    "Creating rollback backup",
+                    "{} bytes copied.".format(done)
+                )
+                return
+
+            ota_close_resource("source")
+            ota_close_resource("target")
+            ok, message = ota_promote_backup_temp()
+            if not ok:
+                ota_job_fail("OTA stopped. " + message)
+                return
+
+            ota_job["source"] = open(OTA_TEMP_PATH, "rb")
+            ota_job["target"] = open(APP_PATH, "wb")
+            ota_job["copy_total"] = int(ota_job.get("bytes_done", 0) or 0)
+            ota_job["copy_done"] = 0
+            ota_job_set(
+                "installing",
+                85,
+                "Installing verified firmware",
+                "Rollback protection is ready."
+            )
+            return
+
+        if stage == "installing":
+            source = ota_job.get("source")
+            target = ota_job.get("target")
+            chunk = source.read(OTA_COPY_CHUNK_SIZE)
+
+            if chunk:
+                target.write(chunk)
+                ota_job["copy_done"] += len(chunk)
+                total = int(ota_job.get("copy_total", 0) or 0)
+                done = int(ota_job.get("copy_done", 0) or 0)
+                percent = 85 + int(min(1.0, done / total) * 11) if total else 90
+                ota_job_set(
+                    "installing",
+                    percent,
+                    "Installing verified firmware",
+                    "{} bytes written.".format(done)
+                )
+                return
+
+            ota_close_resource("source")
+            ota_close_resource("target")
+
+            protected_after = ota_protected_settings_snapshot()
+            if protected_after != ota_job.get("protected_before"):
+                ota_job_fail(
+                    "Protected settings changed unexpectedly."
+                )
+                return
+
+            ota_remove_file(OTA_TEMP_PATH)
+            ota_job_set(
+                "restarting",
+                100,
+                "Update installed successfully",
+                "Restarting into {}.".format(ota_job.get("latest", "new firmware"))
+            )
+            ota_job["restart_seconds"] = 8
+            ota_message = "Installed version {}. Restarting...".format(
+                ota_job.get("latest", "")
+            )
+            set_web_message(
+                ota_message + " " + str(ota_job.get("payload_message", ""))
+            )
+            add_event("OTA install completed; restart scheduled.")
+            restart_requested = True
+            restart_time = time.monotonic() + 8.0
+            return
+
+        if stage == "restarting":
+            remaining = max(0, int(restart_time - time.monotonic()) + 1)
+            ota_job["restart_seconds"] = remaining
+            ota_job["detail"] = "Restarting in {} seconds.".format(remaining)
+            return
 
     except Exception as e:
-        return False, "Update integrity verification failed: " + repr(e)
+        ota_job_fail("OTA job error: " + repr(e))
 
-    return True, (
-        "Update payload verified: version, hardware, schema, size, "
-        "and SHA-256 ({}).".format(hash_mode)
+
+@server.route("/update-status")
+def update_status_route(request: Request):
+    return Response(
+        request,
+        json.dumps(ota_job_public_status()),
+        content_type="application/json"
+    )
+
+
+@server.route("/update-progress")
+def update_progress_route(request: Request):
+    return Response(
+        request,
+        ota_processing_page(),
+        content_type="text/html"
     )
 
 
 @server.route("/check-update", methods=["POST"])
 def check_update(request: Request):
     global ota_message, ota_status_message
+
+    if ota_job_active():
+        return Response(
+            request,
+            ota_processing_page(),
+            content_type="text/html"
+        )
 
     manifest = fetch_update_manifest()
 
@@ -4073,117 +4693,57 @@ def check_update(request: Request):
         else:
             ota_message = "You are up to date."
 
-    if manifest is None:
-        ota_status_message = build_ota_status_summary(None)
-    else:
-        ota_status_message = build_ota_status_summary(manifest)
-
+    ota_status_message = build_ota_status_summary(manifest)
     set_web_message(ota_message)
 
-    return Response(request, clean_page("Update Check Complete", ota_message), content_type="text/html")
+    return Response(
+        request,
+        clean_page("Update Check Complete", ota_message),
+        content_type="text/html"
+    )
 
 
 @server.route("/install-update", methods=["POST"])
 def install_update(request: Request):
-    global restart_requested, restart_time, ota_message, ota_status_message
+    global ota_message
 
-    form = request.form_data
-    entered_pin = url_decode(str(form.get("admin_pin", "")))
+    if ota_job_active():
+        return Response(
+            request,
+            ota_processing_page(),
+            content_type="text/html"
+        )
+
+    entered_pin = url_decode(str(request.form_data.get("admin_pin", "")))
 
     if entered_pin != str(config["admin_pin"]):
         ota_message = "Wrong admin PIN."
         set_error_message(ota_message)
-        return Response(request, clean_page("Update Blocked", ota_message), content_type="text/html")
-
-    manifest = fetch_update_manifest()
-
-    if manifest is None:
-        ota_message = "Could not download update manifest."
-        return Response(request, clean_page("Update Failed", ota_message), content_type="text/html")
-
-    info = get_channel_info(manifest)
-    latest = str(info.get("version", ""))
-    app_url = str(info.get("app_url", ""))
-
-    if latest == APP_VERSION:
-        ota_message = "Already up to date."
-        return Response(request, clean_page("No Update Needed", ota_message), content_type="text/html")
-
-    if not app_url.startswith("http"):
-        ota_message = "Bad update file URL."
-        set_error_message(ota_message)
-        return Response(request, clean_page("Update Failed", ota_message), content_type="text/html")
-
-    try:
-        print("Downloading update:", app_url)
-
-        response = requests.get(app_url)
-        new_code = response.text
-        response.close()
-
-        payload_ok, payload_message = verify_update_payload(
-            new_code,
-            info
+        return Response(
+            request,
+            clean_page("Update Blocked", ota_message),
+            content_type="text/html"
         )
 
-        if not payload_ok:
-            ota_message = payload_message
-            set_error_message(payload_message)
-            return Response(
-                request,
-                clean_page("Update Failed", payload_message),
-                content_type="text/html"
-            )
+    start_ota_job()
 
-        protected_before = ota_protected_settings_snapshot()
-
-        backup_ok, backup_msg = backup_current_app()
-
-        if not backup_ok:
-            ota_message = "OTA stopped. Backup failed."
-            set_error_message("OTA stopped. " + backup_msg)
-            return Response(request, clean_page("Update Failed", last_error_message), content_type="text/html")
-
-        print(backup_msg)
-
-        with open(APP_PATH, "w") as app_file:
-            app_file.write(new_code)
-
-        protected_after = ota_protected_settings_snapshot()
-
-        if protected_after != protected_before:
-            rollback_ok, rollback_msg = rollback_to_backup()
-            ota_message = "OTA stopped because protected settings changed unexpectedly."
-            set_error_message(
-                ota_message + " " + str(rollback_msg)
-            )
-            return Response(
-                request,
-                clean_page("Update Reverted", last_error_message),
-                content_type="text/html"
-            )
-
-        ota_message = "Installed version {}. Restarting...".format(latest)
-        ota_status_message = build_ota_status_summary(manifest)
-        restart_requested = True
-        restart_time = time.monotonic() + 2.0
-        set_web_message(
-            ota_message + " " + payload_message
-        )
-
-        return Response(request, clean_page("Update Installed", ota_message), content_type="text/html")
-
-    except Exception as e:
-        ota_message = "Update failed."
-        set_error_message("OTA install error: " + repr(e))
-
-        return Response(request, clean_page("Update Failed", last_error_message), content_type="text/html")
-
+    return Response(
+        request,
+        ota_processing_page(),
+        content_type="text/html"
+    )
 
 
 @server.route("/rollback", methods=["POST"])
 def rollback_route(request: Request):
     global restart_requested, restart_time, ota_message, ota_status_message
+
+    if ota_job_active():
+        return Response(
+            request,
+            ota_processing_page(),
+            content_type="text/html"
+        )
 
     form = request.form_data
     entered_pin = url_decode(str(form.get("admin_pin", "")))
@@ -4703,10 +5263,13 @@ while True:
 
     now = time.monotonic()
 
+    ota_job_step()
+    now = time.monotonic()
+
     if restart_requested and now >= restart_time:
         microcontroller.reset()
 
-    if now - last_ntp_sync >= 21600:
+    if not ota_job_active() and now - last_ntp_sync >= 21600:
         sync_time()
         last_ntp_sync = now
 
@@ -4748,10 +5311,10 @@ while True:
     full_scroll_done = completed_loops >= len(blocks)
 
     if SMOOTH_QUOTE_REFRESH:
-        if smooth_refresh_active and loop_completed:
+        if smooth_refresh_active and loop_completed and not ota_job_active():
             smooth_quote_refresh_step()
 
-        if (refresh_requested or time_for_quote_fetch) and full_scroll_done and not need_reload and not smooth_refresh_active:
+        if (refresh_requested or time_for_quote_fetch) and full_scroll_done and not need_reload and not smooth_refresh_active and not ota_job_active():
             completed_loops = 0
             last_quote_fetch = now
 
@@ -4761,7 +5324,7 @@ while True:
                 start_smooth_quote_refresh("scheduled refresh")
 
     else:
-        if (refresh_requested or (time_for_quote_fetch and full_scroll_done)) and not need_reload:
+        if (refresh_requested or (time_for_quote_fetch and full_scroll_done)) and not need_reload and not ota_job_active():
             completed_loops = 0
             refresh_requested = False
             last_quote_fetch = now
