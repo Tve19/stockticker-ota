@@ -4,16 +4,17 @@
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable customer-ready ticker release."
   }, 
- "beta": {
+"beta": {
     "version": "1.1.26-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1126-wifi-manager-reviewed-2",
-    "notes": "Reviewed Customer WiFi Manager release. Adds current-network status, protected dashboard switching, automatic previous-network restoration, setup-hotspot recovery, unique setup code, nearby network scanning, mDNS hostname, and explicit Raspberry Pi workload separation diagnostics. Preserves 1.1.25 OTA journal, watchdog, rollback, preflight tests, safe support report, and responsive updates.",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1126-wifi-timeout-fix-3",
+    "notes": "Customer WiFi Manager plus OTA network-timeout hardening. Firmware now downloads in larger chunks with a 120-second socket timeout, automatic clean retries, connection-close semantics, stage-specific diagnostics, and local-file incremental SHA-256 after the HTTPS socket closes. Preserves the 1.1.25 journal, watchdog, rollback, preflight checks, safe support report, responsive update interface, and Raspberry Pi workload separation.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 2,
-    "size": 259249,
-    "sha256": "97abaa70ed1f9349cde2e2496d67ff7e082705bb59f1f90d83b42421abbcc989",
+    "size": 267456,
+    "sha256": "a900b3a475e271bc06f3045d4c505316b4dd43e3155c4da4a93e3875feb23241",
     "mandatory": false
   }
 }
+
