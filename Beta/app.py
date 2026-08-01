@@ -1,6 +1,9 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.18-beta"
+APP_VERSION = "1.1.27-beta"
+CONFIG_SCHEMA_VERSION = 4
+PORTFOLIO_API_SCHEMA_SUPPORTED = 1
+DEVICE_MODEL = "matrix_portal_s3"
 
 import time
 import ssl
@@ -18,6 +21,183 @@ import gc
 import json
 import microcontroller
 import os
+try:
+    import hashlib
+except Exception:
+    hashlib = None
+try:
+    import mdns
+except Exception:
+    mdns = None
+
+
+
+# Software SHA-256 fallback for CircuitPython builds whose native hashlib
+# module is present but does not expose the sha256 algorithm.
+class _SoftwareSHA256:
+    _K = (
+        0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5,
+        0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
+        0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3,
+        0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
+        0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC,
+        0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
+        0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7,
+        0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967,
+        0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13,
+        0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85,
+        0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3,
+        0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070,
+        0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5,
+        0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
+        0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208,
+        0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2,
+    )
+
+    def __init__(self):
+        self._state = [
+            0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+            0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+        ]
+        self._buffer = b""
+        self._length = 0
+        self._finished = False
+
+    @staticmethod
+    def _ror(value, count):
+        value &= 0xFFFFFFFF
+        return (
+            (value >> count)
+            | ((value << (32 - count)) & 0xFFFFFFFF)
+        ) & 0xFFFFFFFF
+
+    def _process(self, block):
+        words = [0] * 64
+
+        for i in range(16):
+            j = i * 4
+            words[i] = (
+                (block[j] << 24)
+                | (block[j + 1] << 16)
+                | (block[j + 2] << 8)
+                | block[j + 3]
+            )
+
+        for i in range(16, 64):
+            x = words[i - 15]
+            y = words[i - 2]
+            s0 = (
+                self._ror(x, 7)
+                ^ self._ror(x, 18)
+                ^ (x >> 3)
+            )
+            s1 = (
+                self._ror(y, 17)
+                ^ self._ror(y, 19)
+                ^ (y >> 10)
+            )
+            words[i] = (
+                words[i - 16]
+                + s0
+                + words[i - 7]
+                + s1
+            ) & 0xFFFFFFFF
+
+        a, b, c, d, e, f, g, h = self._state
+
+        for i in range(64):
+            s1 = (
+                self._ror(e, 6)
+                ^ self._ror(e, 11)
+                ^ self._ror(e, 25)
+            )
+            choose = (e & f) ^ ((~e) & g)
+            t1 = (
+                h
+                + s1
+                + choose
+                + self._K[i]
+                + words[i]
+            ) & 0xFFFFFFFF
+            s0 = (
+                self._ror(a, 2)
+                ^ self._ror(a, 13)
+                ^ self._ror(a, 22)
+            )
+            majority = (a & b) ^ (a & c) ^ (b & c)
+            t2 = (s0 + majority) & 0xFFFFFFFF
+
+            h = g
+            g = f
+            f = e
+            e = (d + t1) & 0xFFFFFFFF
+            d = c
+            c = b
+            b = a
+            a = (t1 + t2) & 0xFFFFFFFF
+
+        values = (a, b, c, d, e, f, g, h)
+
+        for i in range(8):
+            self._state[i] = (
+                self._state[i] + values[i]
+            ) & 0xFFFFFFFF
+
+    def update(self, data):
+        if self._finished:
+            raise ValueError("SHA-256 digest already finalized")
+
+        if not data:
+            return
+
+        self._length += len(data)
+
+        # CircuitPython bytearray supports vary by build. Keep the pending
+        # SHA data as immutable bytes so no item or slice deletion is needed.
+        self._buffer = self._buffer + bytes(data)
+
+        while len(self._buffer) >= 64:
+            block = self._buffer[:64]
+            self._buffer = self._buffer[64:]
+            self._process(block)
+
+    def digest(self):
+        if not self._finished:
+            bit_length = self._length * 8
+            final_data = bytearray(self._buffer)
+            final_data.append(0x80)
+
+            while len(final_data) % 64 != 56:
+                final_data.append(0)
+
+            for shift in (56, 48, 40, 32, 24, 16, 8, 0):
+                final_data.append((bit_length >> shift) & 0xFF)
+
+            for start in range(0, len(final_data), 64):
+                self._process(final_data[start:start + 64])
+
+            self._finished = True
+            self._buffer = b""
+
+        output = bytearray()
+
+        for word in self._state:
+            output.extend((
+                (word >> 24) & 0xFF,
+                (word >> 16) & 0xFF,
+                (word >> 8) & 0xFF,
+                word & 0xFF,
+            ))
+
+        return bytes(output)
+
+
+def create_sha256_hasher():
+    # MatrixPortal S3 CircuitPython builds can expose hashlib while still
+    # rejecting SHA-256 at runtime. Use the bundled implementation every time
+    # so OTA verification behaves consistently across firmware builds.
+    return _SoftwareSHA256(), "software"
+
 
 from adafruit_display_text import label
 try:
@@ -34,11 +214,26 @@ from adafruit_httpserver import Server, Request, Response
 CONFIG_FILE = "/config.json"
 SYMBOLS_FILE = "/symbols.txt"
 WIFI_FILE = "/wifi_config.json"
+WIFI_PENDING_FILE = "/wifi_pending.json"
+WIFI_BACKUP_FILE = "/wifi_config.bak"
+WIFI_STATE_FILE = "/wifi_state.json"
+WIFI_FORCE_SETUP_FILE = "/wifi_force_setup.flag"
+WIFI_CONNECT_TIMEOUT_SECONDS = 25
+WIFI_PIN_MAX_ATTEMPTS = 5
+WIFI_PIN_LOCK_SECONDS = 600
 HOLIDAYS_FILE = "/market_holidays.json"
 DEVICE_FILE = "/device.json"
 CRASH_FILE = "/crash_count.json"
+OTA_JOURNAL_FILE = "/ota_journal.json"
+OTA_JOURNAL_TEMP_FILE = "/ota_journal.tmp"
+OTA_JOURNAL_BACKUP_FILE = "/ota_journal.bak"
+OTA_WRITE_TEST_FILE = "/ota_write_test.tmp"
+OTA_JOURNAL_SCHEMA = 1
+BOOT_HEALTH_DELAY_SECONDS = 20
+BOOT_MAX_ATTEMPTS = 3
 
 DEFAULT_CONFIG = {
+    "config_schema_version": CONFIG_SCHEMA_VERSION,
     "brightness": 0.30,
     "scroll_speed_open": 1.0,
     "scroll_speed_closed": 0.6,
@@ -70,13 +265,21 @@ DEFAULT_CONFIG = {
     "customer_mode": "basic",
     "panel_sleep": False,
     "portfolio_mode": "off",
-    "portfolio_bridge_url": "http://192.168.2.85:8787/portfolio",
+    "portfolio_bridge_url": "",
     "portfolio_bridge_key": "",
+    "portfolio_prefer_api_v1": True,
     "portfolio_show_value": True,
     "portfolio_show_day_change": True,
     "portfolio_show_cash": True,
+    "portfolio_show_buying_power": True,
+    "portfolio_show_positions_count": True,
+    "portfolio_show_largest_winner": True,
+    "portfolio_show_largest_loser": True,
     "portfolio_privacy_mode": False,
     "portfolio_stale_minutes": 15,
+    "portfolio_capabilities_refresh_minutes": 60,
+    "mdns_enabled": True,
+    "wifi_customer_manager": True,
     "quote_source": "direct_finnhub",
     "pi_hub_ticker_url": "http://192.168.2.85:8787/ticker",
     "pi_hub_display_key": "",
@@ -131,6 +334,373 @@ def save_json_file(path, data):
         json.dump(data, f)
 
 
+def remove_file_quietly(path):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
+def atomic_save_json_file(path, data):
+    temp_path = path + ".tmp"
+
+    with open(temp_path, "w") as f:
+        json.dump(data, f)
+
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+    os.rename(temp_path, path)
+
+
+def valid_wifi_record(record):
+    return (
+        isinstance(record, dict)
+        and bool(str(record.get("ssid", "")).strip())
+        and "password" in record
+    )
+
+
+def wifi_password_is_valid(password, open_network=False):
+    password = str(password or "")
+
+    if open_network:
+        return password == ""
+
+    length = len(password)
+
+    if 8 <= length <= 63:
+        return True
+
+    if length == 64:
+        for ch in password:
+            if ch not in "0123456789abcdefABCDEF":
+                return False
+        return True
+
+    return False
+
+
+def wifi_ssid_validation_error(ssid):
+    ssid = str(ssid or "").strip()
+
+    if not ssid:
+        return "Enter a WiFi network name."
+
+    try:
+        byte_length = len(ssid.encode("utf-8"))
+    except Exception:
+        byte_length = len(ssid)
+
+    if byte_length > 32:
+        return "WiFi network names may not exceed 32 bytes."
+
+    for ch in ssid:
+        if ord(ch) < 32:
+            return "WiFi network name contains an unsupported control character."
+
+    return ""
+
+
+def wifi_password_validation_error(password, confirm_password, open_network):
+    password = str(password or "")
+    confirm_password = str(confirm_password or "")
+
+    if open_network:
+        if password or confirm_password:
+            return "Leave both password fields blank for an open WiFi network."
+        return ""
+
+    if password != confirm_password:
+        return "WiFi passwords do not match."
+
+    if not wifi_password_is_valid(password, False):
+        return (
+            "Secured WiFi passwords must contain 8-63 characters, "
+            "or exactly 64 hexadecimal characters."
+        )
+
+    return ""
+
+
+def save_wifi_record(path, ssid, password):
+    atomic_save_json_file(path, {
+        "ssid": str(ssid).strip(),
+        "password": str(password)
+    })
+
+
+def wifi_security_text(network):
+    try:
+        text_value = str(network.authmode).upper()
+        if "OPEN" in text_value or text_value in ("", "()", "[]"):
+            return "Open"
+    except Exception:
+        pass
+
+    return "Secured"
+
+
+def wifi_signal_quality(rssi):
+    try:
+        rssi = int(rssi)
+    except Exception:
+        return "Unknown"
+
+    if rssi >= -55:
+        return "Excellent"
+    if rssi >= -67:
+        return "Good"
+    if rssi >= -75:
+        return "Fair"
+    return "Weak"
+
+
+def scan_nearby_wifi(limit=14):
+    strongest = {}
+
+    try:
+        networks = wifi.radio.start_scanning_networks()
+
+        for network in networks:
+            ssid = str(network.ssid or "").strip()
+
+            if not ssid:
+                continue
+
+            try:
+                rssi = int(network.rssi)
+            except Exception:
+                rssi = -100
+
+            entry = {
+                "ssid": ssid,
+                "rssi": rssi,
+                "quality": wifi_signal_quality(rssi),
+                "security": wifi_security_text(network),
+                "channel": int(getattr(network, "channel", 0) or 0)
+            }
+
+            previous = strongest.get(ssid)
+
+            if previous is None or rssi > previous.get("rssi", -100):
+                strongest[ssid] = entry
+
+    except Exception as e:
+        print("WiFi scan failed:", repr(e))
+
+    finally:
+        try:
+            wifi.radio.stop_scanning_networks()
+        except Exception:
+            pass
+
+    results = list(strongest.values())
+    results.sort(key=lambda item: item.get("rssi", -100), reverse=True)
+    return results[:limit]
+
+
+def wifi_state_load():
+    state = load_json_file(WIFI_STATE_FILE, {})
+    return state if isinstance(state, dict) else {}
+
+
+def wifi_state_save(status, message="", current_ssid="", attempted_ssid=""):
+    # Passwords are intentionally never written to the status file.
+    state = {
+        "status": str(status),
+        "message": str(message)[:180],
+        "current_ssid": str(current_ssid)[:32],
+        "attempted_ssid": str(attempted_ssid)[:32],
+        "app_version": APP_VERSION
+    }
+
+    try:
+        atomic_save_json_file(WIFI_STATE_FILE, state)
+    except Exception as e:
+        print("WiFi state save failed:", repr(e))
+
+    return state
+
+
+def reset_wifi_station():
+    try:
+        wifi.radio.stop_station()
+    except Exception:
+        pass
+
+    time.sleep(0.20)
+
+    try:
+        wifi.radio.start_station()
+    except Exception:
+        pass
+
+
+def try_wifi_connection(record, label):
+    if not valid_wifi_record(record):
+        return False, "No valid credentials were available."
+
+    ssid = str(record.get("ssid", "")).strip()
+    password = str(record.get("password", ""))
+
+    try:
+        reset_wifi_station()
+        print("Connecting to WiFi profile:", label, ssid)
+        wifi.radio.connect(
+            ssid,
+            password,
+            timeout=WIFI_CONNECT_TIMEOUT_SECONDS
+        )
+
+        if wifi.radio.connected:
+            return True, ""
+
+        return False, "The radio did not report a connected state."
+
+    except Exception as e:
+        return False, repr(e)
+
+
+def candidate_key(record):
+    if not valid_wifi_record(record):
+        return ""
+    return "{}\n{}".format(record.get("ssid", ""), record.get("password", ""))
+
+
+def connect_customer_wifi():
+    pending = load_json_file(WIFI_PENDING_FILE, {})
+    current = load_json_file(WIFI_FILE, {})
+    backup = load_json_file(WIFI_BACKUP_FILE, {})
+
+    if valid_wifi_record(pending):
+        attempted_ssid = str(pending.get("ssid", "")).strip()
+
+        if valid_wifi_record(current):
+            try:
+                save_wifi_record(
+                    WIFI_BACKUP_FILE,
+                    current.get("ssid", ""),
+                    current.get("password", "")
+                )
+                backup = current
+            except Exception as e:
+                print("Could not refresh WiFi backup:", repr(e))
+
+        ok, error = try_wifi_connection(pending, "pending")
+
+        if ok:
+            save_wifi_record(
+                WIFI_FILE,
+                pending.get("ssid", ""),
+                pending.get("password", "")
+            )
+            remove_file_quietly(WIFI_PENDING_FILE)
+            wifi_state_save(
+                "switch_succeeded",
+                "New WiFi connection succeeded.",
+                attempted_ssid,
+                attempted_ssid
+            )
+            return pending
+
+        print("Pending WiFi failed:", error)
+
+        tried = set()
+
+        for label, record in (("backup", backup), ("current", current)):
+            key = candidate_key(record)
+
+            if not key or key in tried:
+                continue
+
+            tried.add(key)
+            ok, fallback_error = try_wifi_connection(record, label)
+
+            if ok:
+                restored_ssid = str(record.get("ssid", "")).strip()
+                save_wifi_record(
+                    WIFI_FILE,
+                    restored_ssid,
+                    record.get("password", "")
+                )
+                remove_file_quietly(WIFI_PENDING_FILE)
+                wifi_state_save(
+                    "switch_failed_restored",
+                    "New WiFi failed; previous network was restored.",
+                    restored_ssid,
+                    attempted_ssid
+                )
+                return record
+
+            print(label, "WiFi fallback failed:", fallback_error)
+
+        remove_file_quietly(WIFI_PENDING_FILE)
+        wifi_state_save(
+            "switch_failed_setup",
+            "New and previous WiFi networks could not be reached.",
+            "",
+            attempted_ssid
+        )
+        return None
+
+    candidates = []
+    seen = set()
+
+    for label, record in (("current", current), ("backup", backup)):
+        key = candidate_key(record)
+
+        if key and key not in seen:
+            candidates.append((label, record))
+            seen.add(key)
+
+    for label, record in candidates:
+        ok, error = try_wifi_connection(record, label)
+
+        if ok:
+            ssid = str(record.get("ssid", "")).strip()
+
+            if label == "backup":
+                try:
+                    save_wifi_record(
+                        WIFI_FILE,
+                        ssid,
+                        record.get("password", "")
+                    )
+                except Exception as e:
+                    print("Could not restore backup profile:", repr(e))
+
+                wifi_state_save(
+                    "backup_restored",
+                    "Primary WiFi failed; backup network was restored.",
+                    ssid,
+                    ""
+                )
+            else:
+                previous_state = wifi_state_load()
+                if not previous_state:
+                    wifi_state_save(
+                        "connected",
+                        "WiFi connected normally.",
+                        ssid,
+                        ""
+                    )
+
+            return record
+
+        print(label, "WiFi connection failed:", error)
+
+    wifi_state_save(
+        "setup_required",
+        "No saved WiFi network could be reached.",
+        "",
+        ""
+    )
+    return None
+
+
 def generate_device_id():
     uid = microcontroller.cpu.uid
     short_id = ""
@@ -141,13 +711,41 @@ def generate_device_id():
     return "ST-" + short_id
 
 
+def generate_setup_password(extra_seed=""):
+    # A unique setup credential is created from the board UID. It is stored
+    # in device.json so a sold unit keeps the same printed setup code.
+    hasher, _ = create_sha256_hasher()
+    hasher.update(bytes(microcontroller.cpu.uid))
+    hasher.update(b"StockTicker-Setup-v1")
+    hasher.update(str(extra_seed).encode("utf-8"))
+    digest = hasher.digest()
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    chars = []
+
+    for index in range(12):
+        chars.append(alphabet[digest[index] % len(alphabet)])
+
+    return "{}-{}-{}".format(
+        "".join(chars[0:4]),
+        "".join(chars[4:8]),
+        "".join(chars[8:12])
+    )
+
+
 def load_device_info():
     info = load_json_file(DEVICE_FILE, {})
+    changed = False
 
     if "device_id" not in info:
         info["device_id"] = generate_device_id()
         info["created_version"] = APP_VERSION
+        changed = True
 
+    if not str(info.get("setup_password", "")).strip():
+        info["setup_password"] = generate_setup_password(info.get("device_id", ""))
+        changed = True
+
+    if changed:
         try:
             save_json_file(DEVICE_FILE, info)
         except OSError as e:
@@ -160,10 +758,30 @@ def load_device_info():
 
 def load_config():
     cfg = load_json_file(CONFIG_FILE, {})
+    changed = False
 
     for key in DEFAULT_CONFIG:
         if key not in cfg:
             cfg[key] = DEFAULT_CONFIG[key]
+            changed = True
+
+    try:
+        current_schema = int(cfg.get("config_schema_version", 0) or 0)
+    except Exception:
+        current_schema = 0
+
+    if current_schema < CONFIG_SCHEMA_VERSION:
+        cfg["config_schema_version"] = CONFIG_SCHEMA_VERSION
+        changed = True
+
+    if changed:
+        try:
+            save_json_file(CONFIG_FILE, cfg)
+            print("Config migrated to schema", CONFIG_SCHEMA_VERSION)
+        except OSError as e:
+            print("Config migration could not save:", repr(e))
+        except Exception as e:
+            print("Config migration failed:", repr(e))
 
     return cfg
 
@@ -328,6 +946,14 @@ def get_api_key_status():
     if saved_key:
         return "Saved in device settings: " + mask_secret(saved_key)
 
+    try:
+        if is_pi_hub_quote_source():
+            if bool_from_form(config.get("pi_hub_fallback_direct", True)):
+                return "Pi Hub quote source selected. S3 Finnhub key is missing, so direct fallback will not work until a key is saved."
+            return "Pi Hub quote source selected. S3 Finnhub key is not required."
+    except Exception:
+        pass
+
     if customer_api_required():
         return "Required mode ON - missing customer API key. Quotes will not load until setup is completed."
 
@@ -343,13 +969,22 @@ def get_api_key_status():
 
 def mark_app_boot_success():
     try:
-        save_json_file(CRASH_FILE, {"count": 0, "last_good_version": APP_VERSION})
+        save_json_file(CRASH_FILE, {
+            "count": 0,
+            "last_good_version": APP_VERSION,
+            "boot_confirmed": True
+        })
     except Exception as e:
         print("Could not reset crash counter:", repr(e))
 
 
 APP_PATH = "/app.py"
 BACKUP_APP_PATH = "/app_backup.py"
+OTA_TEMP_PATH = "/app_update.tmp"
+OTA_BACKUP_TEMP_PATH = "/app_backup_new.tmp"
+OTA_BACKUP_PREVIOUS_PATH = "/app_backup_previous.py"
+OTA_STREAM_CHUNK_SIZE = 256
+OTA_COPY_CHUNK_SIZE = 1024
 
 
 def file_exists(path):
@@ -363,16 +998,24 @@ def file_exists(path):
 
 def copy_file_safe(src, dst):
     try:
+        total = 0
         with open(src, "rb") as source:
-            data = source.read()
+            with open(dst, "wb") as target:
+                while True:
+                    chunk = source.read(1024)
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                    total += len(chunk)
 
-        if not data:
+        if total <= 0:
+            try:
+                os.remove(dst)
+            except Exception:
+                pass
             return False, "{} was empty.".format(src)
 
-        with open(dst, "wb") as target:
-            target.write(data)
-
-        return True, "Copied {} to {}".format(src, dst)
+        return True, "Copied {} bytes from {} to {}".format(total, src, dst)
 
     except Exception as e:
         return False, "Copy failed: {}".format(repr(e))
@@ -388,16 +1031,423 @@ def rollback_to_backup():
 
     return copy_file_safe(BACKUP_APP_PATH, APP_PATH)
 
+
+def safe_journal_time():
+    try:
+        return format_12h(eastern_time_now())
+    except Exception:
+        try:
+            return "uptime-{}s".format(int(time.monotonic()))
+        except Exception:
+            return "unknown"
+
+
+def default_ota_journal():
+    return {
+        "schema": OTA_JOURNAL_SCHEMA,
+        "last_update": {},
+        "boot": {
+            "pending": False,
+            "pending_version": "",
+            "attempts": 0,
+            "max_attempts": BOOT_MAX_ATTEMPTS,
+            "health": "not_pending",
+            "last_good_version": ""
+        }
+    }
+
+
+def load_ota_journal():
+    journal = load_json_file(OTA_JOURNAL_FILE, {})
+    if not isinstance(journal, dict) or not journal:
+        journal = load_json_file(OTA_JOURNAL_BACKUP_FILE, {})
+    if not isinstance(journal, dict):
+        journal = {}
+
+    defaults = default_ota_journal()
+    if not isinstance(journal.get("last_update"), dict):
+        journal["last_update"] = {}
+    if not isinstance(journal.get("boot"), dict):
+        journal["boot"] = defaults["boot"]
+
+    boot = journal["boot"]
+    for key, value in defaults["boot"].items():
+        if key not in boot:
+            boot[key] = value
+
+    journal["schema"] = OTA_JOURNAL_SCHEMA
+    return journal
+
+
+def save_ota_journal(journal=None):
+    data = journal if isinstance(journal, dict) else ota_journal
+    try:
+        with open(OTA_JOURNAL_TEMP_FILE, "w") as f:
+            json.dump(data, f)
+
+        try:
+            os.remove(OTA_JOURNAL_BACKUP_FILE)
+        except Exception:
+            pass
+
+        if file_exists(OTA_JOURNAL_FILE):
+            try:
+                os.rename(OTA_JOURNAL_FILE, OTA_JOURNAL_BACKUP_FILE)
+            except Exception:
+                ok, message = copy_file_safe(
+                    OTA_JOURNAL_FILE,
+                    OTA_JOURNAL_BACKUP_FILE
+                )
+                if not ok:
+                    raise OSError(message)
+
+        try:
+            os.rename(OTA_JOURNAL_TEMP_FILE, OTA_JOURNAL_FILE)
+        except Exception:
+            ok, message = copy_file_safe(
+                OTA_JOURNAL_TEMP_FILE,
+                OTA_JOURNAL_FILE
+            )
+            if not ok:
+                raise OSError(message)
+            try:
+                os.remove(OTA_JOURNAL_TEMP_FILE)
+            except Exception:
+                pass
+
+        return True
+    except Exception as e:
+        print("Could not save OTA journal:", repr(e))
+        if not file_exists(OTA_JOURNAL_FILE) and file_exists(OTA_JOURNAL_BACKUP_FILE):
+            try:
+                copy_file_safe(OTA_JOURNAL_BACKUP_FILE, OTA_JOURNAL_FILE)
+            except Exception:
+                pass
+        return False
+
+
+def ota_journal_start(target_version="", app_url=""):
+    update = {
+        "from_version": APP_VERSION,
+        "to_version": str(target_version or "unknown"),
+        "channel": str(config.get("update_channel", "stable")),
+        "app_url": strip_url_query(app_url),
+        "started_at": safe_journal_time(),
+        "finished_at": "",
+        "stage": "queued",
+        "result": "in_progress",
+        "verification": "pending",
+        "backup": "pending",
+        "installation": "pending",
+        "restart": "pending",
+        "boot_validation": "pending",
+        "rollback": "not_needed",
+        "error": ""
+    }
+    ota_journal["last_update"] = update
+    save_ota_journal()
+
+
+def ota_journal_set_stage(stage, message=""):
+    update = ota_journal.get("last_update", {})
+    if not isinstance(update, dict) or not update:
+        return
+
+    changed = str(update.get("stage", "")) != str(stage)
+    update["stage"] = str(stage)
+    if message:
+        update["stage_message"] = str(message)[:180]
+    if changed:
+        save_ota_journal()
+
+
+def ota_journal_set_fields(**fields):
+    update = ota_journal.get("last_update", {})
+    if not isinstance(update, dict):
+        update = {}
+        ota_journal["last_update"] = update
+
+    for key, value in fields.items():
+        update[str(key)] = value
+    save_ota_journal()
+
+
+def ota_journal_mark_pending_boot(target_version):
+    boot = ota_journal.get("boot", {})
+    boot["pending"] = True
+    boot["pending_version"] = str(target_version)
+    boot["attempts"] = 0
+    boot["max_attempts"] = BOOT_MAX_ATTEMPTS
+    boot["health"] = "awaiting_first_boot"
+    boot["installed_from_version"] = APP_VERSION
+    ota_journal["boot"] = boot
+
+    ota_journal_set_fields(
+        stage="awaiting_boot",
+        result="installed_pending_boot",
+        installation="written",
+        restart="scheduled",
+        boot_validation="pending"
+    )
+
+
+def ota_journal_fail(message, rollback_state="not_needed"):
+    ota_journal_set_fields(
+        stage="failed",
+        result="failed",
+        finished_at=safe_journal_time(),
+        error=str(message)[:240],
+        rollback=str(rollback_state)
+    )
+
+
+def strip_url_query(value):
+    value = str(value or "").strip()
+    if "?" in value:
+        value = value.split("?", 1)[0]
+    if "#" in value:
+        value = value.split("#", 1)[0]
+    return value
+
+
+def safe_network_label(value):
+    value = strip_url_query(value)
+    if not value:
+        return "not configured"
+
+    if "://" in value:
+        scheme, rest = value.split("://", 1)
+        host = rest.split("/", 1)[0]
+        if ":" in host:
+            host = host.split(":", 1)[0] + ":port"
+        if host.count(".") == 3:
+            parts = host.split(".")
+            host = ".".join(parts[:3] + ["x"])
+        return scheme + "://" + host
+
+    if value.count(".") == 3:
+        parts = value.split(".")
+        return ".".join(parts[:3] + ["x"])
+    return value[:80]
+
+
+def redact_sensitive_text(value):
+    text = str(value or "")
+    secrets_to_hide = []
+
+    for candidate in (
+        config.get("finnhub_api_key", "") if "config" in globals() else "",
+        config.get("portfolio_bridge_key", "") if "config" in globals() else "",
+        config.get("pi_hub_display_key", "") if "config" in globals() else "",
+        config.get("admin_pin", "") if "config" in globals() else "",
+    ):
+        candidate = str(candidate or "").strip()
+        if candidate and len(candidate) >= 3:
+            secrets_to_hide.append(candidate)
+
+    for wifi_path in (WIFI_FILE, WIFI_PENDING_FILE, WIFI_BACKUP_FILE):
+        try:
+            wifi_data = load_json_file(wifi_path, {})
+            for key in ("password", "wifi_password", "passphrase", "ssid"):
+                candidate = str(wifi_data.get(key, "") or "").strip()
+                if candidate:
+                    secrets_to_hide.append(candidate)
+        except Exception:
+            pass
+
+    try:
+        for key in ("password", "finnhub_api_key"):
+            candidate = str(secrets.get(key, "") or "").strip()
+            if candidate:
+                secrets_to_hide.append(candidate)
+    except Exception:
+        pass
+
+    for candidate in secrets_to_hide:
+        text = text.replace(candidate, "[REDACTED]")
+
+    return text
+
+
+def boot_watchdog_begin():
+    global boot_watchdog_pending, boot_watchdog_message
+
+    boot = ota_journal.get("boot", {})
+    pending = bool(boot.get("pending", False))
+    pending_version = str(boot.get("pending_version", ""))
+
+    if not pending:
+        crash_info = load_json_file(CRASH_FILE, {})
+        previous_good = str(crash_info.get("last_good_version", "")).strip()
+
+        if previous_good and previous_good != APP_VERSION:
+            ota_journal["last_update"] = {
+                "from_version": previous_good,
+                "to_version": APP_VERSION,
+                "channel": str(config.get("update_channel", "stable")),
+                "app_url": "not_recorded_by_previous_version",
+                "started_at": "detected_on_first_boot",
+                "finished_at": "",
+                "stage": "awaiting_boot",
+                "result": "installed_pending_boot",
+                "verification": "not_recorded_by_previous_version",
+                "backup": (
+                    "found" if file_exists(BACKUP_APP_PATH) else "missing"
+                ),
+                "installation": "detected",
+                "restart": "completed",
+                "boot_validation": "pending",
+                "rollback": "not_needed",
+                "error": ""
+            }
+            boot["pending"] = True
+            boot["pending_version"] = APP_VERSION
+            boot["attempts"] = 0
+            boot["max_attempts"] = BOOT_MAX_ATTEMPTS
+            boot["health"] = "detected_upgrade"
+            boot["installed_from_version"] = previous_good
+            ota_journal["boot"] = boot
+            save_ota_journal()
+            pending = True
+            pending_version = APP_VERSION
+        else:
+            boot_watchdog_message = "No firmware boot validation is pending."
+            return
+
+    if pending_version != APP_VERSION:
+        update = ota_journal.get("last_update", {})
+        from_version = str(update.get("from_version", ""))
+        if APP_VERSION == from_version:
+            boot["pending"] = False
+            boot["health"] = "rollback_detected"
+            update["result"] = "rolled_back"
+            update["rollback"] = "detected_on_boot"
+            update["restart"] = "completed"
+            update["boot_validation"] = "failed"
+            update["finished_at"] = safe_journal_time()
+            save_ota_journal()
+            boot_watchdog_message = "Rollback detected and recorded."
+        else:
+            boot_watchdog_message = (
+                "Pending version {} does not match running version {}."
+            ).format(pending_version, APP_VERSION)
+        return
+
+    attempts = int(boot.get("attempts", 0) or 0) + 1
+    boot["attempts"] = attempts
+    boot["health"] = "checking"
+    boot["last_start_version"] = APP_VERSION
+    boot["last_start_at"] = safe_journal_time()
+    ota_journal["boot"] = boot
+    save_ota_journal()
+
+    boot_watchdog_pending = True
+    boot_watchdog_message = "Validating boot attempt {} of {}.".format(
+        attempts,
+        BOOT_MAX_ATTEMPTS
+    )
+
+    if attempts >= BOOT_MAX_ATTEMPTS and file_exists(BACKUP_APP_PATH):
+        ok, message = rollback_to_backup()
+        update = ota_journal.get("last_update", {})
+        if ok:
+            boot["pending"] = False
+            boot["health"] = "automatic_rollback"
+            update["result"] = "rolled_back"
+            update["rollback"] = "automatic_watchdog"
+            update["boot_validation"] = "failed"
+            update["restart"] = "rollback_restart"
+            update["finished_at"] = safe_journal_time()
+            update["error"] = (
+                "New firmware did not confirm a healthy boot after {} attempts."
+            ).format(attempts)
+            save_ota_journal()
+            time.sleep(1)
+            microcontroller.reset()
+        else:
+            update["rollback"] = "automatic_rollback_failed"
+            update["error"] = str(message)[:240]
+            save_ota_journal()
+
+
+def boot_watchdog_confirm_healthy():
+    global boot_watchdog_pending, boot_health_confirmed
+    global boot_watchdog_message
+
+    if boot_health_confirmed:
+        return
+
+    mark_app_boot_success()
+    boot = ota_journal.get("boot", {})
+    update = ota_journal.get("last_update", {})
+
+    if bool(boot.get("pending", False)) and str(
+        boot.get("pending_version", "")
+    ) == APP_VERSION:
+        boot["pending"] = False
+        boot["health"] = "confirmed"
+        boot["last_good_version"] = APP_VERSION
+        boot["confirmed_at"] = safe_journal_time()
+        update["stage"] = "complete"
+        update["result"] = "successful"
+        update["restart"] = "completed"
+        update["boot_validation"] = "passed"
+        update["finished_at"] = safe_journal_time()
+        update["error"] = ""
+        ota_journal["last_update"] = update
+    else:
+        boot["last_good_version"] = APP_VERSION
+        boot["health"] = "confirmed"
+        boot["confirmed_at"] = safe_journal_time()
+
+    ota_journal["boot"] = boot
+    save_ota_journal()
+    boot_watchdog_pending = False
+    boot_health_confirmed = True
+    boot_watchdog_message = "Healthy boot confirmed for {}.".format(APP_VERSION)
+
+    try:
+        add_event(boot_watchdog_message)
+    except Exception:
+        print(boot_watchdog_message)
+
+    try:
+        upgrade_managed_launcher_if_needed()
+    except Exception as e:
+        print("Managed launcher upgrade skipped:", repr(e))
+
+
+def boot_watchdog_step():
+    if boot_health_confirmed:
+        return
+    if time.monotonic() < boot_health_due:
+        return
+    boot_watchdog_confirm_healthy()
+
+
 config = load_config()
+ota_journal = load_ota_journal()
+boot_watchdog_pending = False
+boot_health_confirmed = False
+boot_watchdog_message = "Boot validation has not started."
+boot_health_due = time.monotonic() + BOOT_HEALTH_DELAY_SECONDS
+boot_watchdog_begin()
 
 # DEV SAFE DEVICE ID
 # This avoids OSError(30) when CIRCUITPY is mounted on your laptop.
 try:
     device_info = load_device_info()
     DEVICE_ID = device_info["device_id"]
+    SETUP_PASSWORD = str(device_info.get("setup_password", "")).strip()
 except Exception as e:
     print("Device ID disabled:", repr(e))
     DEVICE_ID = "DEV-MODE"
+    SETUP_PASSWORD = "DEMO-SETUP-26"
+
+DEVICE_SUFFIX = str(DEVICE_ID).replace("ST-", "")[-6:]
+SETUP_SSID = "StockTicker-" + DEVICE_SUFFIX
+MDNS_HOSTNAME = "stockticker-" + DEVICE_SUFFIX.lower()
+mdns_server = None
 
 holidays = load_holidays()
 SYMBOLS = read_symbols_file() or DEFAULT_SYMBOLS
@@ -423,6 +1473,36 @@ last_good = {}
 last_update_text = "--:--"
 ota_message = "No update checked yet."
 ota_status_message = "Press Check OTA Status to verify manifest, channel, and backup."
+ota_job = {
+    "active": False,
+    "stage": "idle",
+    "percent": 0,
+    "message": "No update is running.",
+    "detail": "",
+    "started": 0,
+    "updated": 0,
+    "latest": "",
+    "app_url": "",
+    "manifest": None,
+    "info": None,
+    "response": None,
+    "iterator": None,
+    "file": None,
+    "source": None,
+    "target": None,
+    "hasher": None,
+    "hash_mode": "not requested",
+    "expected_hash": "",
+    "expected_size": None,
+    "bytes_done": 0,
+    "bytes_total": 0,
+    "copy_done": 0,
+    "copy_total": 0,
+    "protected_before": None,
+    "payload_message": "",
+    "error": "",
+    "restart_seconds": 0
+}
 last_web_message = "System ready."
 last_error_message = "None yet."
 test_quote_message = "No quote tested yet."
@@ -432,14 +1512,29 @@ cloud_status_message = "Cloud status not checked yet."
 alert_message = "No price alerts yet."
 quote_freshness_message = "No quote freshness checked yet."
 system_health_message = "Press Check System Health to refresh memory and disk stats."
+preflight_message = "Pre-installation checks have not been run yet."
 release_notes_message = "Press Check Release Notes to load stable/beta notes from your OTA manifest."
 auto_recovery_message = "Auto-recovery launcher not checked yet."
 last_portfolio_entry = None
 last_pi_hub_payload = None
+last_portfolio_capabilities = {}
+last_portfolio_capabilities_check = 0
+last_portfolio_api_status = {
+    "mode": "not_checked",
+    "api_version": "unknown",
+    "schema_version": "unknown",
+    "bridge_version": "unknown",
+    "capabilities": False,
+    "last_error": ""
+}
 time_sync_ok = False
 boot_time = time.monotonic()
 event_log = []
 MAX_EVENT_LOG = 20
+last_wifi_scan = []
+last_wifi_scan_message = "Nearby networks have not been scanned yet."
+wifi_pin_failures = 0
+wifi_pin_lock_until = 0
 
 def safe_html(text):
     text = str(text)
@@ -447,6 +1542,298 @@ def safe_html(text):
     text = text.replace("<", "&lt;")
     text = text.replace(">", "&gt;")
     return text
+
+
+def safe_attr(text):
+    text = safe_html(text)
+    text = text.replace('"', "&quot;")
+    text = text.replace("'", "&#39;")
+    return text
+
+
+def current_wifi_details():
+    details = {
+        "ssid": "",
+        "rssi": None,
+        "quality": "Unknown",
+        "channel": 0,
+        "ip": "",
+        "gateway": ""
+    }
+
+    try:
+        details["ip"] = str(wifi.radio.ipv4_address or "")
+    except Exception:
+        pass
+
+    try:
+        details["gateway"] = str(wifi.radio.ipv4_gateway or "")
+    except Exception:
+        pass
+
+    try:
+        info = wifi.radio.ap_info
+
+        if info is not None:
+            details["ssid"] = str(info.ssid or "")
+            details["rssi"] = int(info.rssi)
+            details["quality"] = wifi_signal_quality(info.rssi)
+            details["channel"] = int(getattr(info, "channel", 0) or 0)
+    except Exception:
+        pass
+
+    if not details["ssid"]:
+        saved = load_json_file(WIFI_FILE, {})
+        details["ssid"] = str(saved.get("ssid", "") or "")
+
+    return details
+
+
+def wifi_network_short():
+    details = current_wifi_details()
+    ssid = details.get("ssid", "")
+
+    if not wifi.radio.connected:
+        return "Offline"
+
+    if len(ssid) > 18:
+        return ssid[:15] + "..."
+
+    return ssid or "Connected"
+
+
+def wifi_scan_options_html():
+    if not last_wifi_scan:
+        return ""
+
+    options = []
+
+    for item in last_wifi_scan:
+        ssid = safe_attr(item.get("ssid", ""))
+        label = "{} · {} · {} dBm".format(
+            item.get("security", "Unknown"),
+            item.get("quality", "Unknown"),
+            item.get("rssi", "")
+        )
+        options.append(
+            '<option value="{}">{}</option>'.format(
+                ssid,
+                safe_html(label)
+            )
+        )
+
+    return "".join(options)
+
+
+def wifi_scan_results_html():
+    if not last_wifi_scan:
+        return "<p class='small'>{}</p>".format(
+            safe_html(last_wifi_scan_message)
+        )
+
+    rows = []
+
+    for item in last_wifi_scan:
+        rows.append(
+            "<div class='status-line'>"
+            "<span>{}</span><b>{} · {} dBm · {}</b>"
+            "</div>".format(
+                safe_html(item.get("ssid", "")),
+                safe_html(item.get("quality", "Unknown")),
+                safe_html(item.get("rssi", "")),
+                safe_html(item.get("security", "Unknown"))
+            )
+        )
+
+    return "".join(rows)
+
+
+def wifi_change_status_html():
+    state = wifi_state_load()
+    status = str(state.get("status", "not_recorded"))
+    message = str(state.get("message", "No WiFi change has been recorded yet."))
+
+    class_name = "good"
+
+    if "failed" in status or "required" in status:
+        class_name = "warning"
+
+    return "<p class='{}'><b>Last WiFi action:</b> {}</p>".format(
+        class_name,
+        safe_html(message)
+    )
+
+
+def wifi_setup_code_hint():
+    code = str(SETUP_PASSWORD or "")
+
+    if len(code) >= 4:
+        return "ends in " + code[-4:]
+
+    return "configured"
+
+
+def verify_wifi_admin_pin(entered_pin):
+    global wifi_pin_failures, wifi_pin_lock_until
+
+    now = time.monotonic()
+
+    if now < wifi_pin_lock_until:
+        remaining = int(wifi_pin_lock_until - now)
+        return False, "WiFi controls are temporarily locked. Try again in {} seconds.".format(remaining)
+
+    if str(entered_pin) == str(config.get("admin_pin", "1234")):
+        wifi_pin_failures = 0
+        wifi_pin_lock_until = 0
+        return True, ""
+
+    wifi_pin_failures += 1
+
+    if wifi_pin_failures >= WIFI_PIN_MAX_ATTEMPTS:
+        wifi_pin_failures = 0
+        wifi_pin_lock_until = now + WIFI_PIN_LOCK_SECONDS
+        return False, "Too many incorrect PIN attempts. WiFi controls are locked for 10 minutes."
+
+    remaining = WIFI_PIN_MAX_ATTEMPTS - wifi_pin_failures
+    return False, "Incorrect admin PIN. {} attempt(s) remain.".format(remaining)
+
+
+def build_wifi_manager_html():
+    details = current_wifi_details()
+    state_html = wifi_change_status_html()
+    local_url = "http://{}.local/".format(MDNS_HOSTNAME)
+    backup_available = valid_wifi_record(
+        load_json_file(WIFI_BACKUP_FILE, {})
+    )
+
+    if backup_available:
+        backup_controls = """\
+<div class="button-row">
+<form method="POST" action="/restore-wifi-backup">
+<input name="admin_pin" type="password" placeholder="Admin PIN" required autocomplete="current-password">
+<button class="orange" type="submit">Restore Previous Network</button>
+</form>
+<form method="POST" action="/forget-wifi-backup">
+<input name="admin_pin" type="password" placeholder="Admin PIN" required autocomplete="current-password">
+<button class="red" type="submit">Forget Previous Network</button>
+</form>
+</div>
+"""
+    else:
+        backup_controls = "<p class='small'>No previous WiFi profile is stored.</p>"
+
+    return """\
+<div class="card" id="wifi-network">
+<div class="card-kicker">Customer Network Management</div>
+<h2>WiFi & Network</h2>
+<div class="grid">
+<div>
+<div class="status-line"><span>Connection</span><b>{connection}</b></div>
+<div class="status-line"><span>Current network</span><b>{ssid}</b></div>
+<div class="status-line"><span>Signal</span><b>{quality}{rssi}</b></div>
+<div class="status-line"><span>Device IP</span><b>{device_ip}</b></div>
+<div class="status-line"><span>Local address</span><b>{local_url}</b></div>
+<div class="status-line"><span>Setup hotspot</span><b>{setup_ssid}</b></div>
+<div class="status-line"><span>Setup code</span><b>{setup_hint}</b></div>
+<div class="status-line"><span>Previous network backup</span><b>{backup_status}</b></div>
+{state_html}
+<p class="section-note">Changing the ticker WiFi does not change the Raspberry Pi bridge WiFi. For portfolio mode, both devices must be reachable on the same local network.</p>
+<p class="small">Security note: the dashboard is intended for a trusted home or business LAN. Do not expose ticker port 80 directly to the public internet.</p>
+<div class="button-row">
+<form method="POST" action="/scan-wifi">
+<input name="admin_pin" type="password" placeholder="Admin PIN" autocomplete="current-password">
+<button type="submit">Scan Nearby Networks</button>
+</form>
+<form method="POST" action="/show-wifi-setup-code">
+<input name="admin_pin" type="password" placeholder="Admin PIN" autocomplete="current-password">
+<button class="orange" type="submit">Show Setup Code</button>
+</form>
+</div>
+<details class="slim"><summary>Nearby Networks</summary>{scan_results}</details>
+</div>
+<div>
+<h3>Safely Change WiFi</h3>
+<p class="small">The new network is tested after restart. If it fails, the ticker restores the previous network automatically. If neither network works, the customer setup hotspot opens.</p>
+<p class="small">Use a 2.4 GHz personal/home WiFi network. Hotel sign-in pages and enterprise username/password networks are not supported by this setup form.</p>
+<form method="POST" action="/change-wifi">
+<label>New WiFi Network</label>
+<input name="ssid" list="nearby-wifi-networks" maxlength="32" required autocomplete="off">
+<datalist id="nearby-wifi-networks">{scan_options}</datalist>
+<label>Network Security</label>
+<select name="open_network">
+<option value="false">Secured WiFi</option>
+<option value="true">Open WiFi — no password (not recommended)</option>
+</select>
+<label>New WiFi Password</label>
+<input name="password" type="password" autocomplete="new-password">
+<label>Confirm WiFi Password</label>
+<input name="confirm_password" type="password" autocomplete="new-password">
+<label>Admin PIN</label>
+<input name="admin_pin" type="password" required autocomplete="current-password">
+<button class="green" type="submit">Save and Switch Network</button>
+</form>
+<hr>
+<h3>Recovery Setup Mode</h3>
+<p class="small">Use this when moving the ticker or replacing the router. The working WiFi profile is preserved while the setup hotspot opens for one boot.</p>
+<form method="POST" action="/start-wifi-setup">
+<input name="admin_pin" type="password" placeholder="Admin PIN" required autocomplete="current-password">
+<button class="orange" type="submit">Restart into WiFi Setup</button>
+</form>
+{backup_controls}
+</div>
+</div>
+</div>
+""".format(
+        connection="Connected" if wifi.radio.connected else "Offline",
+        ssid=safe_html(details.get("ssid", "Not configured") or "Not configured"),
+        quality=safe_html(details.get("quality", "Unknown")),
+        rssi=(
+            " ({} dBm)".format(details.get("rssi"))
+            if details.get("rssi") is not None else ""
+        ),
+        device_ip=safe_html(details.get("ip", "") or "Unavailable"),
+        local_url=safe_html(local_url),
+        setup_ssid=safe_html(SETUP_SSID),
+        setup_hint=safe_html(wifi_setup_code_hint()),
+        backup_status="Available" if backup_available else "Not stored",
+        state_html=state_html,
+        scan_results=wifi_scan_results_html(),
+        scan_options=wifi_scan_options_html(),
+        backup_controls=backup_controls
+    )
+
+
+def start_mdns_service():
+    global mdns_server
+
+    if not config.get("mdns_enabled", True):
+        return
+
+    if mdns is None:
+        print("mDNS module unavailable.")
+        return
+
+    try:
+        mdns_server = mdns.Server(wifi.radio)
+        mdns_server.hostname = MDNS_HOSTNAME
+        mdns_server.instance_name = str(
+            config.get("device_name", "StockTicker")
+        )[:32]
+
+        try:
+            mdns_server.advertise_service(
+                service_type="_http",
+                protocol="_tcp",
+                port=80
+            )
+        except Exception as advertise_error:
+            print("mDNS service advertisement unavailable:", repr(advertise_error))
+
+        print("Local address: http://{}.local/".format(MDNS_HOSTNAME))
+
+    except Exception as e:
+        mdns_server = None
+        print("mDNS setup failed:", repr(e))
 
 
 def add_event(message):
@@ -641,6 +2028,20 @@ def signed_money_text(value):
         return "+$0"
 
 
+def portfolio_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def portfolio_int(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
 def append_bridge_key(url, key):
     url = str(url).strip()
     key = str(key).strip()
@@ -655,41 +2056,391 @@ def append_bridge_key(url, key):
     return url + joiner + "key=" + key
 
 
-def make_portfolio_entry(data, stale_override=False, error_reason=""):
-    privacy = bool_from_form(config.get("portfolio_privacy_mode", False))
-    show_value = bool_from_form(config.get("portfolio_show_value", True)) and not privacy
-    show_change = bool_from_form(config.get("portfolio_show_day_change", True))
-    show_cash = bool_from_form(config.get("portfolio_show_cash", True)) and not privacy
+def portfolio_bridge_base_url():
+    url = str(config.get("portfolio_bridge_url", "")).strip()
 
-    value = float(data.get("portfolio_value", 0) or 0)
-    day_change = float(data.get("day_change", 0) or 0)
-    day_percent = float(data.get("day_percent", 0) or 0)
-    cash = float(data.get("cash", 0) or 0)
-    updated = str(data.get("updated", "unknown"))
-    age_seconds = int(float(data.get("age_seconds", 0) or 0))
+    if not url:
+        return ""
+
+    url = url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+
+    for suffix in (
+        "/api/v1/portfolio",
+        "/api/v1/capabilities",
+        "/portfolio"
+    ):
+        if url.endswith(suffix):
+            url = url[:-len(suffix)].rstrip("/")
+            break
+
+    return url
+
+
+def portfolio_bridge_dashboard_url():
+    base = portfolio_bridge_base_url()
+
+    if not base:
+        return ""
+
+    return base + "/dashboard"
+
+
+def portfolio_bridge_health_url():
+    base = portfolio_bridge_base_url()
+
+    if not base:
+        return ""
+
+    return base + "/health"
+
+
+def build_portfolio_bridge_links_html():
+    dashboard_url = portfolio_bridge_dashboard_url()
+    health_url = portfolio_bridge_health_url()
+
+    if not dashboard_url:
+        return (
+            "<span class='linkbtn disabled'>"
+            "Save Bridge URL First"
+            "</span>"
+        )
+
+    return (
+        "<a class='linkbtn portfolio-link' "
+        "href='{}' target='_blank' rel='noopener'>"
+        "Open Portfolio Dashboard"
+        "</a>"
+        "<a class='linkbtn secondary-link' "
+        "href='{}' target='_blank' rel='noopener'>"
+        "Bridge Health"
+        "</a>"
+    ).format(
+        safe_attr(dashboard_url),
+        safe_attr(health_url)
+    )
+
+
+def portfolio_legacy_url():
+    configured = str(config.get("portfolio_bridge_url", "")).strip()
+
+    if configured:
+        clean = configured.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+        if clean.endswith("/portfolio") and not clean.endswith("/api/v1/portfolio"):
+            return clean
+
+    base = portfolio_bridge_base_url()
+    if not base:
+        return ""
+
+    return base + "/portfolio"
+
+
+def portfolio_v1_url():
+    base = portfolio_bridge_base_url()
+    if not base:
+        return ""
+
+    return base + "/api/v1/portfolio"
+
+
+def portfolio_capabilities_url():
+    base = portfolio_bridge_base_url()
+    if not base:
+        return ""
+
+    return base + "/api/v1/capabilities"
+
+
+def bridge_request_json(url, key="", use_header=True):
+    response = None
 
     try:
-        stale_limit = int(config.get("portfolio_stale_minutes", 15)) * 60
+        if use_header and key:
+            response = requests.get(
+                url,
+                headers={"X-Bridge-Key": key}
+            )
+        else:
+            response = requests.get(
+                append_bridge_key(url, key)
+            )
+
+        data = response.json()
+
+        if not isinstance(data, dict):
+            raise Exception("Bridge returned non-object JSON.")
+
+        if data.get("error"):
+            raise Exception(str(data.get("error")))
+
+        return data
+
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
+def record_portfolio_api_status(mode, data=None, error_text=""):
+    global last_portfolio_api_status
+
+    data = data if isinstance(data, dict) else {}
+
+    last_portfolio_api_status = {
+        "mode": str(mode),
+        "api_version": str(data.get("api_version", "legacy" if mode == "legacy" else "unknown")),
+        "schema_version": str(data.get("schema_version", "legacy" if mode == "legacy" else "unknown")),
+        "bridge_version": str(data.get("bridge_version", "unknown")),
+        "capabilities": bool(last_portfolio_capabilities.get("available", False)),
+        "last_error": str(error_text)
+    }
+
+
+def fetch_bridge_capabilities(force=False):
+    global last_portfolio_capabilities
+    global last_portfolio_capabilities_check
+
+    if not is_portfolio_enabled():
+        return {}
+
+    now = time.monotonic()
+
+    try:
+        refresh_seconds = int(
+            config.get("portfolio_capabilities_refresh_minutes", 60)
+        ) * 60
+    except Exception:
+        refresh_seconds = 3600
+
+    if (
+        not force
+        and last_portfolio_capabilities
+        and now - last_portfolio_capabilities_check < refresh_seconds
+    ):
+        return last_portfolio_capabilities
+
+    url = portfolio_capabilities_url()
+    key = str(config.get("portfolio_bridge_key", "")).strip()
+
+    if not url:
+        return {}
+
+    try:
+        data = bridge_request_json(url, key, True)
+        schema = portfolio_int(data.get("schema_version", 0), 0)
+        data["available"] = True
+        data["compatible"] = (
+            schema <= PORTFOLIO_API_SCHEMA_SUPPORTED
+            if schema > 0 else True
+        )
+
+        last_portfolio_capabilities = data
+        last_portfolio_capabilities_check = now
+        add_event(
+            "Bridge capabilities loaded: API {} schema {}.".format(
+                data.get("api_version", "unknown"),
+                data.get("schema_version", "unknown")
+            )
+        )
+        return data
+
+    except Exception as e:
+        last_portfolio_capabilities = {
+            "available": False,
+            "compatible": True,
+            "error": repr(e)
+        }
+        last_portfolio_capabilities_check = now
+        add_event(
+            "Bridge capabilities unavailable; legacy fallback remains enabled."
+        )
+        return last_portfolio_capabilities
+
+
+def fetch_portfolio_payload():
+    key = str(config.get("portfolio_bridge_key", "")).strip()
+    prefer_v1 = bool_from_form(
+        config.get("portfolio_prefer_api_v1", True)
+    )
+
+    v1_url = portfolio_v1_url()
+    legacy_url = portfolio_legacy_url()
+    attempts = []
+
+    if prefer_v1:
+        if v1_url:
+            attempts.append(("v1", v1_url, True))
+        if legacy_url:
+            attempts.append(("legacy", legacy_url, True))
+    else:
+        if legacy_url:
+            attempts.append(("legacy", legacy_url, True))
+        if v1_url:
+            attempts.append(("v1", v1_url, True))
+
+    if not attempts:
+        raise Exception("Missing portfolio bridge URL.")
+
+    errors = []
+
+    for mode, url, use_header in attempts:
+        try:
+            data = bridge_request_json(url, key, use_header)
+
+            if mode == "v1":
+                schema = portfolio_int(data.get("schema_version", 0), 0)
+
+                if (
+                    schema > 0
+                    and schema > PORTFOLIO_API_SCHEMA_SUPPORTED
+                ):
+                    raise Exception(
+                        "Unsupported bridge schema {}.".format(schema)
+                    )
+
+            record_portfolio_api_status(mode, data)
+            return data, mode
+
+        except Exception as e:
+            errors.append("{}: {}".format(mode, repr(e)))
+
+    record_portfolio_api_status(
+        "failed",
+        {},
+        "; ".join(errors)
+    )
+    raise Exception("; ".join(errors))
+
+
+def mover_text(value, prefix, privacy=False):
+    if not isinstance(value, dict):
+        return ""
+
+    symbol = clean_symbol(value.get("symbol", ""))
+
+    if not symbol:
+        return ""
+
+    if privacy:
+        return "{} {}".format(prefix, symbol)
+
+    change = portfolio_float(value.get("day_change", 0), 0)
+    return "{} {} {}".format(
+        prefix,
+        symbol,
+        signed_money_text(change)
+    )
+
+
+def make_portfolio_entry(data, stale_override=False, error_reason=""):
+    privacy = bool_from_form(
+        config.get("portfolio_privacy_mode", False)
+    )
+    show_value = bool_from_form(
+        config.get("portfolio_show_value", True)
+    ) and not privacy
+    show_change = bool_from_form(
+        config.get("portfolio_show_day_change", True)
+    )
+    show_cash = bool_from_form(
+        config.get("portfolio_show_cash", True)
+    ) and not privacy
+    show_buying_power = bool_from_form(
+        config.get("portfolio_show_buying_power", True)
+    ) and not privacy
+    show_positions = bool_from_form(
+        config.get("portfolio_show_positions_count", True)
+    )
+    show_winner = bool_from_form(
+        config.get("portfolio_show_largest_winner", True)
+    )
+    show_loser = bool_from_form(
+        config.get("portfolio_show_largest_loser", True)
+    )
+
+    value = portfolio_float(data.get("portfolio_value", 0), 0)
+    day_change = portfolio_float(data.get("day_change", 0), 0)
+    day_percent = portfolio_float(data.get("day_percent", 0), 0)
+    cash = portfolio_float(data.get("cash", 0), 0)
+    buying_power = portfolio_float(data.get("buying_power", 0), 0)
+    positions_count = portfolio_int(
+        data.get("positions_count", 0),
+        0
+    )
+    updated = str(
+        data.get(
+            "last_successful_sync",
+            data.get("updated", "unknown")
+        )
+    )
+    age_seconds = portfolio_int(data.get("age_seconds", 0), 0)
+
+    try:
+        stale_limit = int(
+            config.get("portfolio_stale_minutes", 15)
+        ) * 60
     except Exception:
         stale_limit = 900
 
-    stale = bool(data.get("stale", False)) or stale_override or age_seconds > stale_limit
+    stale = (
+        bool(data.get("stale", False))
+        or bool(data.get("data_stale", False))
+        or stale_override
+        or age_seconds > stale_limit
+    )
     color = 0x00FF00 if day_change >= 0 else 0xFF0000
 
-    if show_value:
+    if privacy:
+        top = "PORTFOLIO PRIVATE"
+    elif show_value:
         top = "PORTFOLIO " + money_text(value)
     else:
         top = "PORTFOLIO"
 
     parts = []
-    if show_change:
-        parts.append("{} ({:+.2f}%)".format(signed_money_text(day_change), day_percent))
-    if show_cash:
-        parts.append("CASH " + money_text(cash))
+
+    if privacy:
+        if show_positions:
+            parts.append("POS " + str(positions_count))
+        parts.append("PRIVATE")
+    else:
+        if show_change:
+            parts.append(
+                "{} ({:+.2f}%)".format(
+                    signed_money_text(day_change),
+                    day_percent
+                )
+            )
+        if show_cash:
+            parts.append("CASH " + money_text(cash))
+        if show_buying_power:
+            parts.append("BP " + money_text(buying_power))
+        if show_positions:
+            parts.append("POS " + str(positions_count))
+        if show_winner:
+            winner_text = mover_text(
+                data.get("largest_winner"),
+                "WIN",
+                False
+            )
+            if winner_text:
+                parts.append(winner_text)
+        if show_loser:
+            loser_text = mover_text(
+                data.get("largest_loser"),
+                "LOSS",
+                False
+            )
+            if loser_text:
+                parts.append(loser_text)
+
     if not parts:
         parts.append("UPDATED " + updated)
 
     bottom = " ".join(parts)
+
     if stale:
         bottom = bottom + " OLD " + updated
 
@@ -708,7 +2459,11 @@ def make_portfolio_entry(data, stale_override=False, error_reason=""):
         "updated_mono": time.monotonic(),
         "stale": stale,
         "used_cached": stale_override,
-        "error_reason": error_reason
+        "error_reason": error_reason,
+        "bridge_api_mode": str(last_portfolio_api_status.get("mode", "unknown")),
+        "bridge_api_version": str(last_portfolio_api_status.get("api_version", "unknown")),
+        "bridge_schema_version": str(last_portfolio_api_status.get("schema_version", "unknown")),
+        "bridge_version": str(last_portfolio_api_status.get("bridge_version", "unknown"))
     }
 
 
@@ -718,42 +2473,51 @@ def fetch_portfolio_entry():
     if not is_portfolio_enabled():
         return None
 
-    bridge_url = str(config.get("portfolio_bridge_url", "")).strip()
-    bridge_key = str(config.get("portfolio_bridge_key", "")).strip()
-
-    if not bridge_url:
-        return make_portfolio_entry({"updated": "never"}, True, "missing bridge url")
+    if not str(config.get("portfolio_bridge_url", "")).strip():
+        return make_portfolio_entry(
+            {"updated": "never"},
+            True,
+            "missing bridge url"
+        )
 
     try:
-        url = append_bridge_key(bridge_url, bridge_key)
-        r = requests.get(url)
-        data = r.json()
-        r.close()
-
-        if data.get("error"):
-            raise Exception(str(data.get("error")))
-
+        fetch_bridge_capabilities(False)
+        data, mode = fetch_portfolio_payload()
         entry = make_portfolio_entry(data)
         last_portfolio_entry = entry
-        add_event("Portfolio bridge refreshed.")
+        add_event(
+            "Portfolio bridge refreshed via {}.".format(mode)
+        )
         return entry
 
     except Exception as e:
         reason = repr(e)
-        set_error_message("Portfolio bridge fetch failed: " + reason)
+        set_error_message(
+            "Portfolio bridge fetch failed: " + reason
+        )
 
         if last_portfolio_entry:
             old = {}
+
             for key in last_portfolio_entry:
                 old[key] = last_portfolio_entry[key]
+
             old["stale"] = True
             old["used_cached"] = True
             old["error_reason"] = reason
-            if "OLD" not in str(old.get("change_line", "")):
-                old["change_line"] = str(old.get("change_line", "")) + " OLD"
+
+            old["change_line"] = (
+                "OFFLINE OLD "
+                + str(old.get("updated_text", "unknown"))
+            )
+
             return old
 
-        return make_portfolio_entry({"updated": "never"}, True, reason)
+        return make_portfolio_entry(
+            {"updated": "never"},
+            True,
+            reason
+        )
 
 
 def portfolio_status_short():
@@ -769,7 +2533,65 @@ def portfolio_status_short():
     if last_portfolio_entry.get("stale"):
         return "Stale"
 
-    return "OK " + str(last_portfolio_entry.get("updated_text", ""))
+    mode = str(
+        last_portfolio_entry.get("bridge_api_mode", "")
+    )
+
+    if mode == "v1":
+        return "OK API v1"
+    if mode == "legacy":
+        return "OK Legacy"
+
+    return "OK " + str(
+        last_portfolio_entry.get("updated_text", "")
+    )
+
+
+def portfolio_api_mode_short():
+    mode = str(
+        last_portfolio_api_status.get("mode", "not_checked")
+    )
+
+    if mode == "v1":
+        return "API v1"
+    if mode == "legacy":
+        return "Legacy"
+    if mode == "failed":
+        return "Offline"
+
+    return "Not checked"
+
+
+def build_portfolio_api_status_html():
+    status = last_portfolio_api_status
+
+    lines = []
+    lines.append(
+        "Mode: " + safe_html(status.get("mode", "not_checked"))
+    )
+    lines.append(
+        "API: " + safe_html(status.get("api_version", "unknown"))
+    )
+    lines.append(
+        "Schema: " + safe_html(status.get("schema_version", "unknown"))
+    )
+    lines.append(
+        "Bridge Version: "
+        + safe_html(status.get("bridge_version", "unknown"))
+    )
+    lines.append(
+        "Capabilities: "
+        + ("Available" if status.get("capabilities") else "Not loaded")
+    )
+
+    error_text = str(status.get("last_error", "")).strip()
+
+    if error_text:
+        lines.append(
+            "Last API Error: " + safe_html(error_text)
+        )
+
+    return "<br>".join(lines)
 
 
 def build_portfolio_status_html():
@@ -777,14 +2599,48 @@ def build_portfolio_status_html():
         return "Portfolio Module is off."
 
     if last_portfolio_entry is None:
-        return "Portfolio bridge not loaded yet. Press Test Portfolio Bridge or Refresh Quotes."
+        return (
+            "Portfolio bridge not loaded yet. "
+            "Press Test Portfolio Bridge or Refresh Quotes."
+        )
 
     lines = []
-    lines.append("Status: " + safe_html(portfolio_status_short()))
-    lines.append("Top Line: " + safe_html(last_portfolio_entry.get("price_line", "")))
-    lines.append("Bottom Line: " + safe_html(last_portfolio_entry.get("change_line", "")))
+    lines.append(
+        "Status: " + safe_html(portfolio_status_short())
+    )
+    lines.append(
+        "API Mode: "
+        + safe_html(
+            last_portfolio_entry.get(
+                "bridge_api_mode",
+                "unknown"
+            )
+        )
+    )
+    lines.append(
+        "Bridge Version: "
+        + safe_html(
+            last_portfolio_entry.get(
+                "bridge_version",
+                "unknown"
+            )
+        )
+    )
+    lines.append(
+        "Top Line: "
+        + safe_html(
+            last_portfolio_entry.get("price_line", "")
+        )
+    )
+    lines.append(
+        "Bottom Line: "
+        + safe_html(
+            last_portfolio_entry.get("change_line", "")
+        )
+    )
 
     err = last_portfolio_entry.get("error_reason", "")
+
     if err:
         lines.append("Last Error: " + safe_html(err))
 
@@ -792,23 +2648,31 @@ def build_portfolio_status_html():
 
 
 
-
 def is_pi_hub_quote_source():
-    return str(config.get("quote_source", "direct_finnhub")).strip().lower() == "pi_hub"
+    return str(
+        config.get("quote_source", "direct_finnhub")
+    ).strip().lower() == "pi_hub"
 
 
 def get_pi_hub_display_key():
     key = str(config.get("pi_hub_display_key", "")).strip()
+
     if key:
         return key
+
+    # Convenience fallback: if the same Raspberry Pi bridge key is already
+    # saved for portfolio display, reuse it for /ticker unless a separate
+    # Pi Hub key is entered.
     return str(config.get("portfolio_bridge_key", "")).strip()
 
 
 def pi_hub_status_short():
     if not is_pi_hub_quote_source():
         return "Direct Finnhub"
+
     if last_pi_hub_payload is None:
         return "Pi Hub selected; not loaded yet"
+
     try:
         quotes = last_pi_hub_payload.get("quotes", {})
         return "Pi Hub OK - {} quotes".format(len(quotes))
@@ -818,10 +2682,21 @@ def pi_hub_status_short():
 
 def build_pi_hub_status_html():
     lines = []
-    lines.append("Quote Source: " + safe_html(str(config.get("quote_source", "direct_finnhub"))))
-    lines.append("Pi Hub URL: " + safe_html(str(config.get("pi_hub_ticker_url", ""))))
-    lines.append("Pi Hub Key Saved: " + yes_no(bool(get_pi_hub_display_key())))
-    lines.append("Fallback to Direct Finnhub: " + yes_no(bool_from_form(config.get("pi_hub_fallback_direct", True))))
+    lines.append(
+        "Quote Source: "
+        + safe_html(str(config.get("quote_source", "direct_finnhub")))
+    )
+    lines.append(
+        "Pi Hub URL: "
+        + safe_html(str(config.get("pi_hub_ticker_url", "")))
+    )
+    lines.append(
+        "Pi Hub Key Saved: " + yes_no(bool(get_pi_hub_display_key()))
+    )
+    lines.append(
+        "Fallback to Direct Finnhub: "
+        + yes_no(bool_from_form(config.get("pi_hub_fallback_direct", True)))
+    )
     lines.append("Status: " + safe_html(pi_hub_status_short()))
     lines.append("Last Test: " + safe_html(str(pi_hub_test_message)))
     return "<br>".join(lines)
@@ -829,22 +2704,41 @@ def build_pi_hub_status_html():
 
 def fetch_pi_hub_ticker_payload():
     global last_pi_hub_payload
+
     hub_url = str(config.get("pi_hub_ticker_url", "")).strip()
     hub_key = get_pi_hub_display_key()
+
     if not hub_url:
-        raise Exception("Pi hub ticker URL is missing.")
+        raise Exception("Pi Hub ticker URL is missing.")
+
     url = append_bridge_key(hub_url, hub_key)
-    r = requests.get(url)
-    data = r.json()
-    r.close()
-    if data.get("error"):
-        raise Exception(str(data.get("error")))
-    if data.get("ok") is False:
-        raise Exception("Pi hub returned ok=false")
-    if "quotes" not in data:
-        raise Exception("Pi hub response missing quotes.")
-    last_pi_hub_payload = data
-    return data
+    response = None
+
+    try:
+        response = requests.get(url)
+        data = response.json()
+
+        if not isinstance(data, dict):
+            raise Exception("Pi Hub returned non-object JSON.")
+
+        if data.get("error"):
+            raise Exception(str(data.get("error")))
+
+        if data.get("ok") is False:
+            raise Exception("Pi Hub returned ok=false.")
+
+        if "quotes" not in data:
+            raise Exception("Pi Hub response missing quotes.")
+
+        last_pi_hub_payload = data
+        return data
+
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def hub_updated_text(quote):
@@ -864,6 +2758,7 @@ def quote_stale_from_hub(quote):
     except Exception:
         age = 0
         limit = 600
+
     return bool(quote.get("stale", False)) or age > limit
 
 
@@ -872,23 +2767,37 @@ def make_quote_entry_from_hub(sym, quote):
     price = float(quote.get("price", quote.get("c", 0)) or 0)
     dollar_change = float(quote.get("change", quote.get("d", 0)) or 0)
     pct = float(quote.get("percent_change", quote.get("dp", 0)) or 0)
+
     if price <= 0:
-        raise Exception("Pi hub returned no valid price for {}.".format(sym))
+        raise Exception("Pi Hub returned no valid price for {}.".format(sym))
+
     color = 0x00FF00 if dollar_change >= 0 else 0xFF0000
     sign = "+" if dollar_change >= 0 else "-"
+
     alert = ""
-    if ALERT_ENABLED and ALERT_PERCENT_MOVE > 0 and abs(pct) >= ALERT_PERCENT_MOVE:
+    if (
+        ALERT_ENABLED
+        and ALERT_PERCENT_MOVE > 0
+        and abs(pct) >= ALERT_PERCENT_MOVE
+    ):
         alert = "*" if pct > 0 else "!"
+
     change_parts = []
+
     if config.get("show_dollar_change", True):
         change_parts.append("{}${:.2f}".format(sign, abs(dollar_change)))
+
     if config.get("show_percent_change", True):
         change_parts.append("({:+.2f}%{})".format(pct, alert))
+
     if not change_parts:
         change_parts.append("{:+.2f}%{}".format(pct, alert))
+
     stale = quote_stale_from_hub(quote)
+
     if stale and config.get("show_stale_marker", True):
         change_parts.append("OLD")
+
     return {
         "symbol": sym,
         "price_line": "${} ${:.2f}".format(sym, price),
@@ -905,24 +2814,30 @@ def make_quote_entry_from_hub(sym, quote):
 
 def fetch_entries_from_pi_hub():
     global last_portfolio_entry
+
     try:
         data = fetch_pi_hub_ticker_payload()
         quote_map = data.get("quotes", {})
         entries = []
+
         for sym in SYMBOLS:
             q = quote_map.get(sym) or quote_map.get(str(sym).upper())
+
             if not q:
-                e = cached_or_error_quote(sym, "not in Pi hub cache")
+                e = cached_or_error_quote(sym, "not in Pi Hub cache")
             else:
                 try:
                     e = make_quote_entry_from_hub(sym, q)
                 except Exception as quote_error:
                     e = cached_or_error_quote(sym, repr(quote_error))
+
             entries.append(e)
             last_good[sym] = e
             gc.collect()
+
         if is_portfolio_enabled():
             portfolio_data = data.get("portfolio")
+
             if portfolio_data:
                 p_entry = make_portfolio_entry(portfolio_data)
                 last_portfolio_entry = p_entry
@@ -931,12 +2846,14 @@ def fetch_entries_from_pi_hub():
                 p_entry = fetch_portfolio_entry()
                 if p_entry:
                     entries.append(p_entry)
-        finalize_quote_batch(entries, "Pi hub ticker refreshed")
+
+        finalize_quote_batch(entries, "Pi Hub ticker refreshed")
         return entries
+
     except Exception as e:
         reason = repr(e)
-        set_error_message("Pi hub ticker fetch failed: " + reason)
-        add_event("Pi hub ticker fetch failed: " + reason)
+        set_error_message("Pi Hub ticker fetch failed: " + reason)
+        add_event("Pi Hub ticker fetch failed: " + reason)
         return None
 
 def logo_status_for_symbol(sym):
@@ -974,9 +2891,11 @@ def launcher_status_text():
     try:
         with open("/code.py", "r") as f:
             text = f.read()
+        if "AUTO_RECOVERY_LAUNCHER_V2" in text:
+            return "Installed (V2 watchdog)"
         if "AUTO_RECOVERY_LAUNCHER_V1" in text:
-            return "Installed"
-        return "Not installed or older launcher"
+            return "Installed (V1 - upgrade pending)"
+        return "Not installed or custom launcher"
     except Exception:
         return "Unable to read code.py"
 
@@ -1031,7 +2950,10 @@ def api_ready_for_quotes():
         return True
 
     if is_pi_hub_quote_source():
-        return bool(str(config.get("pi_hub_ticker_url", "")).strip() and get_pi_hub_display_key())
+        return bool(
+            str(config.get("pi_hub_ticker_url", "")).strip()
+            and get_pi_hub_display_key()
+        )
 
     return bool(get_finnhub_api_key())
 
@@ -1070,6 +2992,9 @@ def setup_completion_counts():
     checks.append((wifi.radio.connected, "WiFi connected"))
     checks.append((api_ready_for_quotes(), "API key or demo mode ready"))
     checks.append((len(SYMBOLS) > 0, "Symbols saved"))
+    if is_portfolio_enabled():
+        checks.append((bool(str(config.get("portfolio_bridge_url", "")).strip()), "Portfolio bridge URL saved"))
+        checks.append((bool(str(config.get("portfolio_bridge_key", "")).strip()), "Portfolio bridge key saved"))
     checks.append((str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed"))
     checks.append((file_exists(BACKUP_APP_PATH), "OTA backup available"))
     return checks
@@ -1101,14 +3026,27 @@ def build_setup_checklist_html():
     if is_demo_mode():
         items.append(setup_checklist_item(True, "Demo mode enabled", "Device is using sample prices."))
     elif is_pi_hub_quote_source():
-        items.append(setup_checklist_item(api_ready_for_quotes(), "Pi Hub quote source ready", "Set Pi Hub Ticker URL and display key."))
+        items.append(
+            setup_checklist_item(
+                api_ready_for_quotes(),
+                "Pi Hub quote source ready",
+                "Set Pi Hub Ticker URL and display key."
+            )
+        )
     else:
         items.append(setup_checklist_item(bool(get_saved_customer_api_key()), "Finnhub API key saved", "Open Setup Wizard and paste a Finnhub API key."))
 
     items.append(setup_checklist_item(len(SYMBOLS) > 0, "Stock symbols saved", "Add symbols in the Tickers section."))
+
+    if is_portfolio_enabled():
+        items.append(setup_checklist_item(bool(str(config.get("portfolio_bridge_url", "")).strip()), "Portfolio bridge URL saved", "Enter the Raspberry Pi bridge URL in Portfolio Module."))
+        items.append(setup_checklist_item(bool(str(config.get("portfolio_bridge_key", "")).strip()), "Portfolio bridge key saved", "Enter the display key from the local bridge."))
+        bridge_ready = bool(last_portfolio_entry and not last_portfolio_entry.get("error_reason"))
+        items.append(setup_checklist_item(bridge_ready, "Portfolio bridge reachable", "Use Test Portfolio Bridge after saving the URL and key."))
+
     items.append(setup_checklist_item(str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed", "For sold units, change the default 1234 PIN."))
     items.append(setup_checklist_item(file_exists(BACKUP_APP_PATH), "Rollback backup available", "Install an OTA update once to create app_backup.py."))
-    items.append(setup_checklist_item(launcher_status_text() == "Installed", "Auto-recovery launcher installed", "Install it from Software Update."))
+    items.append(setup_checklist_item(launcher_status_text().startswith("Installed"), "Auto-recovery launcher installed", "Install it from Software Update."))
 
     found, missing = count_missing_logos()
     if config.get("show_logos", True):
@@ -1129,8 +3067,23 @@ def system_health_state():
         return "SETUP", "Setup Needed", "warnbadge"
     if is_demo_mode():
         return "DEMO", "Demo Mode", "warnbadge"
+    if is_pi_hub_quote_source():
+        if not str(config.get("pi_hub_ticker_url", "")).strip():
+            return "SETUP", "Pi Hub URL Needed", "warnbadge"
+        if not get_pi_hub_display_key():
+            return "SETUP", "Pi Hub Key Needed", "warnbadge"
     if bool_from_form(config.get("panel_sleep", False)):
         return "SLEEP", "Display Sleeping", "infobadge"
+
+    if is_portfolio_enabled():
+        if not str(config.get("portfolio_bridge_url", "")).strip():
+            return "SETUP", "Bridge URL Needed", "warnbadge"
+        if not str(config.get("portfolio_bridge_key", "")).strip():
+            return "SETUP", "Bridge Key Needed", "warnbadge"
+        if last_portfolio_entry and last_portfolio_entry.get("error_reason"):
+            return "WARNING", "Bridge Offline", "warnbadge"
+        if last_portfolio_entry and last_portfolio_entry.get("stale"):
+            return "WARNING", "Portfolio Stale", "warnbadge"
 
     stale_count = 0
     for sym in SYMBOLS:
@@ -1166,11 +3119,11 @@ def last_error_panel_html():
 def quote_status_short():
     if is_demo_mode():
         return "Demo Data"
-
     if is_pi_hub_quote_source():
         if not api_ready_for_quotes():
             return "Pi Hub Setup Needed"
-    elif not get_finnhub_api_key():
+        return pi_hub_status_short()
+    if not get_finnhub_api_key():
         return "API Key Needed"
 
     stale_count = 0
@@ -1185,8 +3138,6 @@ def quote_status_short():
         return "Waiting"
     if stale_count:
         return "{} Stale".format(stale_count)
-    if is_pi_hub_quote_source():
-        return "Pi Hub OK"
     return "OK"
 
 
@@ -1212,7 +3163,9 @@ def setup_blocking_issues():
     if not is_demo_mode():
         if is_pi_hub_quote_source():
             if not api_ready_for_quotes():
-                issues.append("Set the Pi Hub Ticker URL and Pi Hub Display Key, or turn on Demo Mode.")
+                issues.append(
+                    "Set the Pi Hub Ticker URL and Pi Hub Display Key, or turn on Demo Mode."
+                )
         elif not get_saved_customer_api_key():
             issues.append("Save a Finnhub API key or turn on Demo Mode.")
 
@@ -1279,21 +3232,17 @@ def safe_config_export_dict():
         if key not in config:
             continue
 
-        if key == "finnhub_api_key":
-            if get_saved_customer_api_key():
-                export_config[key] = "__SAVED_KEY_HIDDEN__"
+        if key in ("finnhub_api_key", "portfolio_bridge_key", "pi_hub_display_key"):
+            if str(config.get(key, "")).strip():
+                export_config[key] = "__SAVED_SECRET_HIDDEN__"
             else:
                 export_config[key] = ""
-        elif key == "portfolio_bridge_key":
-            if str(config.get("portfolio_bridge_key", "")).strip():
-                export_config[key] = "__SAVED_KEY_HIDDEN__"
-            else:
-                export_config[key] = ""
-        elif key == "pi_hub_display_key":
-            if str(config.get("pi_hub_display_key", "")).strip():
-                export_config[key] = "__SAVED_KEY_HIDDEN__"
-            else:
-                export_config[key] = ""
+        elif key == "admin_pin":
+            export_config[key] = "__ADMIN_PIN_HIDDEN__"
+        elif key in ("portfolio_bridge_url", "pi_hub_ticker_url"):
+            export_config[key] = safe_network_label(config.get(key, ""))
+        elif key == "update_manifest_url":
+            export_config[key] = strip_url_query(config.get(key, ""))
         else:
             export_config[key] = config[key]
 
@@ -1301,7 +3250,7 @@ def safe_config_export_dict():
         "backup_type": "StockTicker safe config backup",
         "app_version": APP_VERSION,
         "device_id": DEVICE_ID,
-        "ip": ip,
+        "local_network": safe_network_label(ip),
         "api_key_saved": bool(get_saved_customer_api_key()),
         "wifi_password_included": False,
         "symbols": SYMBOLS,
@@ -1323,6 +3272,86 @@ def build_symbols_backup_text():
     return "\n".join(SYMBOLS) + "\n"
 
 
+def update_result_dict():
+    update = ota_journal.get("last_update", {})
+    if not isinstance(update, dict):
+        return {}
+    return update
+
+
+def update_result_text():
+    update = update_result_dict()
+    if not update:
+        return "No OTA update history recorded yet."
+
+    labels = (
+        ("Result", "result"),
+        ("From", "from_version"),
+        ("To", "to_version"),
+        ("Stage", "stage"),
+        ("Verification", "verification"),
+        ("Backup", "backup"),
+        ("Installation", "installation"),
+        ("Restart", "restart"),
+        ("Boot Validation", "boot_validation"),
+        ("Rollback", "rollback"),
+        ("Started", "started_at"),
+        ("Finished", "finished_at"),
+        ("Error", "error")
+    )
+    lines = []
+    for label_text, key in labels:
+        value = update.get(key, "")
+        if value not in (None, ""):
+            lines.append("{}: {}".format(label_text, value))
+    return "\n".join(lines)
+
+
+def build_update_recovery_html():
+    update = update_result_dict()
+    boot = ota_journal.get("boot", {})
+    if not update:
+        update_html = "No OTA update history recorded yet."
+    else:
+        rows = []
+        for label_text, key in (
+            ("Result", "result"),
+            ("From", "from_version"),
+            ("To", "to_version"),
+            ("Verification", "verification"),
+            ("Backup", "backup"),
+            ("Installation", "installation"),
+            ("Restart", "restart"),
+            ("Boot validation", "boot_validation"),
+            ("Rollback", "rollback"),
+            ("Started", "started_at"),
+            ("Finished", "finished_at"),
+            ("Error", "error")
+        ):
+            value = update.get(key, "")
+            if value not in (None, ""):
+                rows.append("<b>{}</b>: {}".format(
+                    safe_html(label_text),
+                    safe_html(value)
+                ))
+        update_html = "<br>".join(rows)
+
+    return (
+        "{}<hr>"
+        "<b>Boot watchdog</b>: {}<br>"
+        "<b>Pending version</b>: {}<br>"
+        "<b>Attempts</b>: {} / {}<br>"
+        "<b>Last good version</b>: {}"
+    ).format(
+        update_html,
+        safe_html(boot.get("health", "unknown")),
+        safe_html(boot.get("pending_version", "none") or "none"),
+        int(boot.get("attempts", 0) or 0),
+        int(boot.get("max_attempts", BOOT_MAX_ATTEMPTS) or BOOT_MAX_ATTEMPTS),
+        safe_html(boot.get("last_good_version", "unknown") or "unknown")
+    )
+
+
 def build_support_report_text():
     found, missing = count_missing_logos()
     lines = []
@@ -1332,30 +3361,60 @@ def build_support_report_text():
     lines.append("Device Name: " + str(config.get("device_name", "StockTicker")))
     lines.append("Device ID: " + str(DEVICE_ID))
     lines.append("App Version: " + str(APP_VERSION))
-    lines.append("IP Address: " + str(ip))
+    lines.append("Config Schema: " + str(config.get("config_schema_version", CONFIG_SCHEMA_VERSION)))
+    lines.append("Local Network: " + safe_network_label(ip))
     lines.append("System Health: " + system_health_state()[1])
     lines.append("Panel Display: " + panel_state_text())
     lines.append("Market Status: " + get_market_status(eastern_time_now()))
     lines.append("Quote Status: " + quote_status_short())
     lines.append("Quote Source: " + str(config.get("quote_source", "direct_finnhub")))
     lines.append("Pi Hub Status: " + pi_hub_status_short())
+    lines.append("Pi Hub Key Saved: " + yes_no(bool(get_pi_hub_display_key())))
+    lines.append("Portfolio Status: " + portfolio_status_short())
+    lines.append("Portfolio Mode: " + str(config.get("portfolio_mode", "off")))
+    lines.append("Portfolio API Preference: " + ("v1 first" if bool_from_form(config.get("portfolio_prefer_api_v1", True)) else "legacy first"))
+    lines.append("Portfolio API Mode: " + str(last_portfolio_api_status.get("mode", "not_checked")))
+    lines.append("Portfolio API Version: " + str(last_portfolio_api_status.get("api_version", "unknown")))
+    lines.append("Portfolio Schema: " + str(last_portfolio_api_status.get("schema_version", "unknown")))
+    lines.append("Bridge Version: " + str(last_portfolio_api_status.get("bridge_version", "unknown")))
+    lines.append("Bridge Key Saved: " + yes_no(bool(str(config.get("portfolio_bridge_key", "")).strip())))
+    wifi_details = current_wifi_details()
+    wifi_state = wifi_state_load()
     lines.append("WiFi Connected: " + yes_no(wifi.radio.connected))
+    lines.append("WiFi Signal: {}{}".format(
+        wifi_details.get("quality", "Unknown"),
+        (
+            " ({} dBm)".format(wifi_details.get("rssi"))
+            if wifi_details.get("rssi") is not None else ""
+        )
+    ))
+    lines.append("WiFi Change Status: " + str(wifi_state.get("status", "not_recorded")))
+    lines.append("Previous WiFi Profile Stored: " + yes_no(
+        valid_wifi_record(load_json_file(WIFI_BACKUP_FILE, {}))
+    ))
+    lines.append("Local Hostname: " + MDNS_HOSTNAME + ".local")
     lines.append("Time Sync OK: " + yes_no(time_sync_ok))
     lines.append("Demo Mode: " + yes_no(is_demo_mode()))
     lines.append("Customer API Key Required: " + yes_no(customer_api_required()))
     lines.append("API Key Saved: " + yes_no(bool(get_saved_customer_api_key())))
     lines.append("Admin PIN Changed: " + yes_no(str(config.get("admin_pin", "1234")) != "1234"))
     lines.append("Update Channel: " + str(config.get("update_channel", "stable")))
-    lines.append("Manifest URL: " + str(config.get("update_manifest_url", "")))
+    lines.append("Manifest URL: " + strip_url_query(config.get("update_manifest_url", "")))
     lines.append("Backup App Found: " + yes_no(file_exists(BACKUP_APP_PATH)))
     lines.append("Auto-Recovery Launcher: " + launcher_status_text())
+    lines.append("Boot Validation: " + str(ota_journal.get("boot", {}).get("health", "unknown")))
     lines.append("Logos: {} found / {} text fallback".format(found, missing))
     lines.append("Brightness: " + str(config.get("brightness", "")))
     lines.append("Scroll Speed Open: " + str(config.get("scroll_speed_open", "")))
     lines.append("Scroll Speed Closed: " + str(config.get("scroll_speed_closed", "")))
     lines.append("Scroll Delay: " + str(config.get("scroll_delay", "")))
     lines.append("Block Gap: " + str(config.get("block_gap", "")))
-    lines.append("Last Error: " + str(last_error_message))
+    lines.append("Last Error: " + redact_sensitive_text(last_error_message))
+    lines.append("Boot Watchdog: " + str(boot_watchdog_message))
+    lines.append("")
+    lines.append("Last Update Result")
+    lines.append("------------------")
+    lines.append(update_result_text())
     lines.append("")
     lines.append("Symbols")
     lines.append("-------")
@@ -1371,11 +3430,11 @@ def build_support_report_text():
     lines.append("---------")
     if event_log:
         for item in event_log:
-            lines.append(str(item))
+            lines.append(redact_sensitive_text(item))
     else:
         lines.append("No events yet.")
 
-    return "\n".join(lines)
+    return redact_sensitive_text("\n".join(lines))
 
 
 def export_page(title, body):
@@ -1396,7 +3455,7 @@ a {{ color:#79c7ff; }}
 </head>
 <body>
 <div class="wrap">
-<div class="card"><h1>{}</h1><p class="small">This page is safe to screenshot or copy. API keys and WiFi passwords are not shown.</p><pre>{}</pre><p><a href="/">Back to Dashboard</a></p></div>
+<div class="card"><h1>{}</h1><p class="small">This page is safe to screenshot or copy. API keys, WiFi names and passwords, bridge keys, admin PINs, setup codes, tokens, and portfolio values are not shown.</p><pre>{}</pre><p><a href="/">Back to Dashboard</a></p></div>
 </div>
 </body>
 </html>
@@ -1459,12 +3518,17 @@ h1 { margin-top:0; }
 <body>
 <div class="wrap">
 <div class="card"><h1>StockTicker Help</h1><p class="small">Quick customer guide.</p></div>
-<div class="card"><h2>First-time setup</h2><p>Connect to the setup WiFi, enter home WiFi, stock symbols, Finnhub API key, and admin PIN. After saving, the device restarts and joins the home network.</p></div>
+<div class="card"><h2>First-time setup</h2><p>Connect to the unique StockTicker setup WiFi using the code printed on the device setup card. Open http://192.168.4.1, choose the home network, enter the password, and save. The ticker tests the new network after restart.</p></div>
+<div class="card"><h2>Changing WiFi</h2><p>Open Dashboard &rarr; WiFi &amp; Network. The ticker preserves the working network while it tests the new credentials. A failed change restores the previous network automatically. If neither network is reachable, the setup hotspot opens.</p></div>
+<div class="card"><h2>Portfolio bridge network</h2><p>The Matrix Portal ticker and Raspberry Pi are separate network devices. Changing ticker WiFi does not change the Pi. Portfolio mode requires both devices to remain reachable on the same local network.</p></div>
 <div class="card"><h2>Adding stocks</h2><p>Use the Tickers section. Enter one symbol per line, such as SOFI, RKLB, HIMS, SPY, or AAPL.</p></div>
 <div class="card"><h2>API key</h2><p>Stock quotes require a Finnhub API key unless Demo Mode is enabled. The saved key is hidden for security.</p></div>
 <div class="card"><h2>Demo Mode</h2><p>Demo Mode shows sample prices for display/testing. It is not real market data and should be turned off for normal use.</p></div>
 <div class="card"><h2>Colors and labels</h2><p>Green means up, red means down, purple can indicate pre-market/after-hours. OLD means cached or stale data.</p></div>
-<div class="card"><h2>Software updates</h2><p>Read Release Notes, then use Check for Update and Install Update. Rollback restores the previous app if an update has problems.</p></div>
+<div class="card"><h2>Portfolio bridge</h2><p>Portfolio mode is optional. Enter the local Raspberry Pi bridge URL and display key, then use Test Portfolio Bridge. API v1 is preferred automatically and the legacy endpoint remains available as a fallback.</p></div>
+<div class="card"><h2>Pi Hub quote source</h2><p>After the Raspberry Pi hub is set up, the ticker can pull quotes from the local hub instead of directly from Finnhub. Keep direct Finnhub fallback on during testing.</p></div>
+<div class="card"><h2>Privacy mode</h2><p>Portfolio Privacy Mode hides portfolio value, daily money change, cash, buying power, and mover amounts from the LED display. It does not disconnect Schwab or delete data from the local bridge.</p></div>
+<div class="card"><h2>Software updates</h2><p>Read Release Notes, then use Check for Update and Install Update. Rollback restores the previous app if an update has problems. WiFi, API keys, symbols, portfolio settings, and bridge keys remain in their separate settings files.</p></div>
 <div class="card"><h2>Sleep Display</h2><p>Sleep Display blanks the LED panels without unplugging the device. The dashboard, WiFi, OTA, and settings continue to work.</p></div>
 <div class="card"><h2>Logos</h2><p>BMP logos go in /logos/SYMBOL.bmp. Missing logos are harmless; the ticker automatically uses a clean text fallback.</p></div>
 <p><a href="/">Back to Dashboard</a></p>
@@ -1495,7 +3559,7 @@ a {{ color:#79c7ff; }}
 <div class="wrap">
 <div class="card">
 <h1>StockTicker Setup Wizard</h1>
-<p class="small">Use this page for first-time customer setup or to reconfigure the device.</p>
+<p class="small">Use this page to configure ticker settings. To change the network, use the dedicated WiFi &amp; Network card on the dashboard.</p>
 <p>{message}</p>
 <form method="POST" action="/save-customer-setup">
 <label>Device Name</label>
@@ -1573,46 +3637,97 @@ def set_error_message(message):
     print("WEB ERROR:", message)
 
 
-add_event("Booted " + APP_VERSION)
-mark_app_boot_success()
+add_event("Boot sequence started " + APP_VERSION)
+add_event(boot_watchdog_message)
+
+wifi_boot_state = wifi_state_load()
+if wifi_boot_state.get("message"):
+    add_event("WiFi: " + str(wifi_boot_state.get("message", "")))
 
 
 def start_setup_mode(reason):
     print("SETUP MODE:", reason)
+    remove_file_quietly(WIFI_FORCE_SETUP_FILE)
 
-    setup_suffix = str(DEVICE_ID).replace("ST-", "")[-6:]
-    setup_ssid = "StockTicker-" + setup_suffix
-    setup_password = "12345678"
+    nearby_networks = scan_nearby_wifi(16)
 
-    wifi.radio.start_ap(setup_ssid, setup_password)
+    try:
+        wifi.radio.stop_station()
+    except Exception:
+        pass
+
+    try:
+        wifi.radio.start_ap(SETUP_SSID, SETUP_PASSWORD)
+    except Exception as e:
+        print("Could not start setup hotspot:", repr(e))
+        raise
+
     setup_ip = str(wifi.radio.ipv4_address_ap)
-
     setup_pool = socketpool.SocketPool(wifi.radio)
     setup_server = Server(setup_pool, "/")
+    restart_holder = {"at": 0}
 
-    setup_html = """\
+    network_options = []
+
+    for item in nearby_networks:
+        label_text = "{} · {} · {} dBm".format(
+            item.get("security", "Unknown"),
+            item.get("quality", "Unknown"),
+            item.get("rssi", "")
+        )
+        network_options.append(
+            '<option value="{}">{}</option>'.format(
+                safe_attr(item.get("ssid", "")),
+                safe_html(label_text)
+            )
+        )
+
+    def setup_page(message="", error=False):
+        message_class = "bad" if error else "good"
+
+        return """\
 <!DOCTYPE html>
 <html>
 <head>
-<title>StockTicker First-Time Setup</title>
+<title>StockTicker WiFi Setup</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
-.card {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; }}
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+.wrap {{ max-width:760px; margin:0 auto; }}
+.card {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }}
 textarea, input, select {{ width:100%; box-sizing:border-box; padding:10px; margin:8px 0 14px; border-radius:10px; border:1px solid #33486d; background:#07111f; color:#eef6ff; }}
 button {{ padding:12px 16px; border:0; border-radius:10px; background:#22aa66; color:white; font-weight:bold; }}
-.small {{ color:#a9bddb; font-size:13px; line-height:1.4; }}
+.small {{ color:#a9bddb; font-size:13px; line-height:1.5; }}
+.good {{ color:#55ff88; }}
+.bad {{ color:#ff8b8b; }}
+.note {{ border-left:3px solid #3994ff; padding:10px 12px; background:#0b223d; border-radius:0 10px 10px 0; }}
 </style>
 </head>
 <body>
+<div class="wrap">
 <div class="card">
-<h1>StockTicker First-Time Setup</h1>
-<p class="small">Connect this device to WiFi and enter customer basics. This setup WiFi uses the device ID so customers can identify the correct unit. You can edit these later from the dashboard.</p>
+<h1>StockTicker WiFi Setup</h1>
+<p class="small">Setup reason: {reason}</p>
+<p class="{message_class}">{message}</p>
+<div class="note">
+<b>Setup hotspot:</b> {setup_ssid}<br>
+<b>Setup address:</b> http://{setup_ip}/<br>
+The setup code is unique to this ticker and should be printed on the device setup card.
+</div>
 <form method="POST" action="/save-wifi">
-<label>Home WiFi Name</label>
-<input name="ssid">
+<label>Home WiFi Network</label>
+<input name="ssid" list="setup-networks" maxlength="32" required autocomplete="off">
+<datalist id="setup-networks">{network_options}</datalist>
+<p class="small">Choose a nearby 2.4 GHz personal/home network or type a hidden network name manually. Networks that require a browser sign-in or enterprise username are not supported.</p>
+<label>Network Security</label>
+<select name="open_network">
+<option value="false">Secured WiFi</option>
+<option value="true">Open WiFi — no password (not recommended)</option>
+</select>
 <label>Home WiFi Password</label>
-<input name="password" type="password">
+<input name="password" type="password" autocomplete="new-password">
+<label>Confirm WiFi Password</label>
+<input name="confirm_password" type="password" autocomplete="new-password">
 <label>Stock Symbols</label>
 <textarea name="symbols" rows="6">SOFI
 RKLB
@@ -1623,15 +3738,14 @@ AMZN
 SPY</textarea>
 <label>Finnhub API Key</label>
 <input name="finnhub_api_key" type="password" placeholder="Customer API key">
-<p class="small">Required for live stock quotes. The key is saved on this device and hidden after setup.</p>
+<p class="small">Required for live stock quotes. The saved key remains hidden afterward.</p>
 <label>Demo Mode</label>
 <select name="demo_mode">
-<option value="false">False - use live market data</option>
-<option value="true">True - show sample demo prices</option>
+<option value="false">False — use live market data</option>
+<option value="true">True — show sample demo prices</option>
 </select>
-<p class="small">Use Demo Mode only for testing or showing the display before entering an API key.</p>
 <label>Admin PIN</label>
-<input name="admin_pin" value="1234">
+<input name="admin_pin" type="password" value="" placeholder="Create a 4-12 digit PIN" inputmode="numeric">
 <label>Brightness 0.00-1.00</label>
 <input name="brightness" value="0.30">
 <label>Update Channel</label>
@@ -1639,44 +3753,150 @@ SPY</textarea>
 <option value="stable">Stable</option>
 <option value="beta">Beta</option>
 </select>
-<button type="submit">Save Setup and Restart</button>
+<button type="submit">Save, Test, and Restart</button>
 </form>
+<p class="small">The ticker tests the new network after restarting. If it fails, it restores the previous network. If no saved network works, this setup hotspot returns automatically.</p>
+</div>
 </div>
 </body>
 </html>
-"""
+""".format(
+            reason=safe_html(reason),
+            message=safe_html(message),
+            message_class=message_class,
+            setup_ssid=safe_html(SETUP_SSID),
+            setup_ip=safe_html(setup_ip),
+            network_options="".join(network_options)
+        )
+
     @setup_server.route("/")
     def setup_index(request: Request):
-        return Response(request, setup_html, content_type="text/html")
+        return Response(request, setup_page(), content_type="text/html")
+
+    @setup_server.route("/generate_204")
+    def android_setup_probe(request: Request):
+        return Response(request, setup_page(), content_type="text/html")
+
+    @setup_server.route("/hotspot-detect.html")
+    def apple_setup_probe(request: Request):
+        return Response(request, setup_page(), content_type="text/html")
+
+    @setup_server.route("/connecttest.txt")
+    def windows_setup_probe(request: Request):
+        return Response(request, setup_page(), content_type="text/html")
+
+    @setup_server.route("/ncsi.txt")
+    def windows_ncsi_probe(request: Request):
+        return Response(request, setup_page(), content_type="text/html")
 
     @setup_server.route("/save-wifi", methods=["POST"])
     def save_wifi(request: Request):
         form = request.form_data
-        ssid = url_decode(str(form.get("ssid", ""))).strip()
-        password = url_decode(str(form.get("password", ""))).strip()
+        ssid = str(form.get("ssid", "")).strip()
+        password = str(form.get("password", ""))
+        confirm_password = str(form.get("confirm_password", ""))
+        open_network = bool_from_form(form.get("open_network", False))
 
-        save_json_file(WIFI_FILE, {
-            "ssid": ssid,
-            "password": password
-        })
+        error = wifi_ssid_validation_error(ssid)
+
+        if not error:
+            error = wifi_password_validation_error(
+                password,
+                confirm_password,
+                open_network
+            )
+
+        if error:
+            return Response(
+                request,
+                setup_page(error, True),
+                content_type="text/html"
+            )
 
         setup_cfg = load_config()
-        setup_cfg["finnhub_api_key"] = url_decode(str(form.get("finnhub_api_key", setup_cfg.get("finnhub_api_key", "")))).strip()
+        new_pin = str(form.get("admin_pin", "")).strip()
+
+        if not new_pin and str(setup_cfg.get("admin_pin", "1234")) == "1234":
+            return Response(
+                request,
+                setup_page("Create a new 4-12 digit admin PIN for this ticker.", True),
+                content_type="text/html"
+            )
+
+        if new_pin and (
+            not new_pin.isdigit()
+            or not (4 <= len(new_pin) <= 12)
+        ):
+            return Response(
+                request,
+                setup_page("Admin PIN must contain 4-12 digits.", True),
+                content_type="text/html"
+            )
+
+        current = load_json_file(WIFI_FILE, {})
+
+        try:
+            if valid_wifi_record(current):
+                save_wifi_record(
+                    WIFI_BACKUP_FILE,
+                    current.get("ssid", ""),
+                    current.get("password", "")
+                )
+
+            save_wifi_record(
+                WIFI_PENDING_FILE,
+                ssid,
+                "" if open_network else password
+            )
+            wifi_state_save(
+                "switch_pending",
+                "New WiFi saved and awaiting connection test.",
+                str(current.get("ssid", "")),
+                ssid
+            )
+
+        except Exception as e:
+            return Response(
+                request,
+                setup_page("Could not safely save WiFi settings: " + repr(e), True),
+                content_type="text/html"
+            )
+
+        new_api_key = str(form.get("finnhub_api_key", "")).strip()
+
+        if new_api_key:
+            setup_cfg["finnhub_api_key"] = new_api_key
+
         setup_cfg["require_customer_api_key"] = True
-        setup_cfg["demo_mode"] = bool_from_form(form.get("demo_mode", setup_cfg.get("demo_mode", False)))
-        setup_cfg["admin_pin"] = url_decode(str(form.get("admin_pin", setup_cfg.get("admin_pin", "1234")))).strip() or "1234"
-        setup_cfg["brightness"] = clamp_float(form.get("brightness", setup_cfg.get("brightness", 0.30)), 0.0, 1.0, 0.30)
+        setup_cfg["demo_mode"] = bool_from_form(
+            form.get("demo_mode", setup_cfg.get("demo_mode", False))
+        )
 
-        channel = url_decode(str(form.get("update_channel", setup_cfg.get("update_channel", "stable")))).strip().lower()
-        setup_cfg["update_channel"] = channel if channel in ("stable", "beta") else "stable"
+        if new_pin:
+            setup_cfg["admin_pin"] = new_pin
 
+        setup_cfg["brightness"] = clamp_float(
+            form.get("brightness", setup_cfg.get("brightness", 0.30)),
+            0.0,
+            1.0,
+            0.30
+        )
+
+        channel = str(
+            form.get("update_channel", setup_cfg.get("update_channel", "stable"))
+        ).strip().lower()
+        setup_cfg["update_channel"] = (
+            channel if channel in ("stable", "beta") else "stable"
+        )
         save_config(setup_cfg)
 
-        raw_symbols = url_decode(str(form.get("symbols", "")))
+        raw_symbols = str(form.get("symbols", ""))
         new_symbols = []
         seen = set()
+
         for line in raw_symbols.replace(",", "\n").replace("\r", "\n").split("\n"):
             sym = clean_symbol(line)
+
             if sym and sym not in seen:
                 new_symbols.append(sym)
                 seen.add(sym)
@@ -1684,19 +3904,39 @@ SPY</textarea>
         if new_symbols:
             save_symbol_list(new_symbols)
 
+        restart_holder["at"] = time.monotonic() + 4.0
+
+        response_html = """\
+<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:24px; }}
+.card {{ max-width:680px; margin:auto; background:#101b2e; border:1px solid #243657; border-radius:18px; padding:20px; }}
+</style></head><body>
+<div class="card">
+<h1>WiFi Saved</h1>
+<p>The ticker will restart and test <b>{ssid}</b>.</p>
+<p>Your phone will disconnect from the StockTicker setup hotspot. Reconnect the phone to the home network afterward.</p>
+<p>Then open <b>http://{hostname}.local/</b> or locate the new ticker IP in the router.</p>
+<p>If the new credentials fail, the ticker restores the previous network or reopens setup mode.</p>
+</div></body></html>
+""".format(
+            ssid=safe_html(ssid),
+            hostname=safe_html(MDNS_HOSTNAME)
+        )
+
         return Response(
             request,
-            "<html><body><h1>Setup Saved</h1><p>Restarting and connecting to WiFi...</p></body></html>",
+            response_html,
             content_type="text/html"
         )
 
     setup_server.start(setup_ip, 80)
 
-    print("Connect phone/laptop to WiFi:", setup_ssid)
-    print("Password:", setup_password)
+    print("Connect phone/laptop to WiFi:", SETUP_SSID)
+    print("Use the unique setup code printed on the device card.")
     print("Setup page: http://" + setup_ip + ":80/")
-
-    saved_restart_time = 0
 
     while True:
         try:
@@ -1704,49 +3944,29 @@ SPY</textarea>
         except Exception as e:
             print("Setup server error:", repr(e))
 
-        if saved_restart_time == 0:
-            try:
-                wifi_cfg = load_json_file(WIFI_FILE, {})
-                if wifi_cfg.get("ssid"):
-                    saved_restart_time = time.monotonic() + 2
-            except Exception:
-                pass
+        boot_watchdog_step()
 
-        if saved_restart_time and time.monotonic() >= saved_restart_time:
+        if restart_holder["at"] and time.monotonic() >= restart_holder["at"]:
             microcontroller.reset()
 
         time.sleep(0.05)
 
 
-def get_wifi_credentials():
-    wifi_cfg = load_json_file(WIFI_FILE, {})
+if file_exists(WIFI_FORCE_SETUP_FILE):
+    start_setup_mode("WiFi setup was requested from the dashboard.")
 
-    if wifi_cfg.get("ssid"):
-        return wifi_cfg["ssid"], wifi_cfg.get("password", "")
+print("Connecting to WiFi...")
 
-    try:
-        ssid = str(secrets.get("ssid", "")).strip()
-        password = str(secrets.get("password", ""))
-        if ssid:
-            return ssid, password
-    except Exception:
-        pass
+connected_wifi_record = connect_customer_wifi()
 
-    start_setup_mode("WiFi is not configured.")
-
-
-print("Connecting to Wi-Fi...")
-
-try:
-    ssid, password = get_wifi_credentials()
-    wifi.radio.connect(ssid, password)
-except Exception as e:
-    start_setup_mode("WiFi failed: " + repr(e))
+if connected_wifi_record is None or not wifi.radio.connected:
+    start_setup_mode("No saved WiFi profile could connect.")
 
 ip = str(wifi.radio.ipv4_address)
 print("Connected:", ip)
 
 pool = socketpool.SocketPool(wifi.radio)
+start_mdns_service()
 requests = adafruit_requests.Session(pool, ssl.create_default_context())
 
 
@@ -1927,36 +4147,216 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 .button-row {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
 .button-row form {{ margin:0; }}
 .slim {{ margin-bottom:10px; }}
+.ota-progress {{ background:#07111f; border:1px solid #2a4166; border-radius:12px; padding:12px; margin:10px 0; }}
+.ota-track {{ height:12px; background:#1a2a40; border-radius:999px; overflow:hidden; margin:8px 0; }}
+.ota-fill {{ height:100%; background:linear-gradient(90deg,#2b8cff,#29bb73); border-radius:999px; }}
+.ota-active {{ color:#8edbff; }}
+.ota-error {{ color:#ff8b8b; }}
+
+/* Customer dashboard polish */
+:root {{
+  --bg:#06101d;
+  --panel:#101d31;
+  --panel2:#0a1627;
+  --line:#263b5d;
+  --text:#f4f8ff;
+  --muted:#a9bddb;
+  --blue:#3994ff;
+  --green:#29bb73;
+  --orange:#dc8b16;
+  --red:#d34b4b;
+}}
+body {{
+  background:
+    radial-gradient(circle at top right, #132c4c 0, #07111f 38%, #050b14 100%);
+  color:var(--text);
+  min-height:100vh;
+}}
+.wrap {{ max-width:1080px; }}
+.hero {{
+  background:
+    linear-gradient(135deg, rgba(31,140,255,.18), rgba(16,27,46,.96) 46%, rgba(11,22,39,.98));
+  border-color:#31527f;
+  box-shadow:0 18px 45px rgba(0,0,0,.28);
+  padding:22px;
+}}
+.hero h1 {{ font-size:29px; letter-spacing:-.5px; }}
+.eyebrow {{
+  color:#79c7ff;
+  font-size:12px;
+  font-weight:bold;
+  letter-spacing:1.4px;
+  text-transform:uppercase;
+  margin-bottom:7px;
+}}
+.hero-subtitle {{
+  color:var(--muted);
+  margin:0;
+  line-height:1.5;
+}}
+.card {{
+  background:linear-gradient(180deg, rgba(16,29,49,.98), rgba(12,23,40,.98));
+  border-color:var(--line);
+  box-shadow:0 10px 25px rgba(0,0,0,.16);
+}}
+.stat {{
+  background:rgba(5,15,27,.72);
+  border-color:#2a4166;
+  min-height:48px;
+}}
+.stat-value {{
+  font-size:17px;
+  font-weight:bold;
+  margin-top:4px;
+}}
+.quicknav {{
+  position:sticky;
+  top:8px;
+  z-index:10;
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  padding:10px;
+  margin:0 0 14px;
+  border:1px solid var(--line);
+  border-radius:15px;
+  background:rgba(7,17,31,.94);
+  backdrop-filter:blur(9px);
+  box-shadow:0 8px 25px rgba(0,0,0,.22);
+}}
+.quicknav a {{
+  color:#dcecff;
+  text-decoration:none;
+  font-size:13px;
+  font-weight:bold;
+  padding:8px 11px;
+  border-radius:9px;
+  background:#10233c;
+  border:1px solid #284a72;
+}}
+.quicknav a:hover {{ background:#18365c; }}
+.linkbtn {{
+  display:inline-block;
+  margin:7px 8px 0 0;
+  padding:10px 13px;
+  border-radius:10px;
+  color:white;
+  text-decoration:none;
+  font-weight:bold;
+  background:var(--blue);
+  border:1px solid rgba(255,255,255,.12);
+}}
+.portfolio-link {{
+  background:linear-gradient(135deg, #7a4cff, #2b8cff);
+}}
+.secondary-link {{ background:#1a334f; }}
+.linkbtn.disabled {{
+  background:#28374a;
+  color:#9badc4;
+  cursor:not-allowed;
+}}
+.feature-card {{
+  position:relative;
+  overflow:hidden;
+}}
+.feature-card:after {{
+  content:"";
+  position:absolute;
+  width:130px;
+  height:130px;
+  border-radius:50%;
+  right:-75px;
+  top:-75px;
+  background:rgba(57,148,255,.10);
+}}
+.card-kicker {{
+  color:#79c7ff;
+  font-size:11px;
+  font-weight:bold;
+  letter-spacing:1.1px;
+  text-transform:uppercase;
+  margin-bottom:7px;
+}}
+.status-line {{
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  padding:9px 0;
+  border-bottom:1px solid rgba(64,90,126,.45);
+}}
+.status-line:last-child {{ border-bottom:0; }}
+.status-line span:first-child {{ color:var(--muted); }}
+.status-line b {{ text-align:right; }}
+.section-note {{
+  border-left:3px solid #3994ff;
+  padding:9px 11px;
+  background:rgba(31,140,255,.08);
+  border-radius:0 9px 9px 0;
+  color:#bdd4ef;
+  font-size:13px;
+  line-height:1.45;
+}}
+summary {{
+  padding:4px 0;
+  font-size:16px;
+}}
+button, .linkbtn, .quicknav a {{
+  transition:transform .12s ease, filter .12s ease;
+}}
+button:hover, .linkbtn:hover, .quicknav a:hover {{
+  filter:brightness(1.1);
+  transform:translateY(-1px);
+}}
+@media (max-width:620px) {{
+  body {{ padding:10px; }}
+  .hero {{ padding:17px; }}
+  .hero h1 {{ font-size:24px; }}
+  .quicknav {{ position:static; }}
+  .grid {{ grid-template-columns:1fr; }}
+}}
 </style>
 </head>
 <body>
 <div class="wrap">
-<div class="hero">
+<div class="hero" id="overview">
 <div class="topline">
 <div>
+<div class="eyebrow">StockTicker Control Center</div>
 <h1>{device_name}</h1>
-<p class="small">Professional LED market display · {device_id}</p>
+<p class="hero-subtitle">Professional LED market display · {device_id}</p>
 </div>
 <div>{system_health_badge}</div>
 </div>
 <div class="grid">
-<div class="stat"><b>Version</b><br>{version}</div>
-<div class="stat"><b>Market</b><br>{market_status}</div>
-<div class="stat"><b>Quotes</b><br>{quote_status_short}</div>
-<div class="stat"><b>Portfolio</b><br>{portfolio_status_short}</div>
-<div class="stat"><b>Panel</b><br>{panel_state}</div>
-<div class="stat"><b>Setup</b><br>{setup_progress}</div>
-<div class="stat"><b>IP</b><br>{ip}</div>
+<div class="stat"><b>Firmware</b><div class="stat-value">{version}</div></div>
+<div class="stat"><b>Market</b><div class="stat-value">{market_status}</div></div>
+<div class="stat"><b>Quotes</b><div class="stat-value">{quote_status_short}</div></div>
+<div class="stat"><b>Portfolio</b><div class="stat-value">{portfolio_status_short}</div></div>
+<div class="stat"><b>Panel</b><div class="stat-value">{panel_state}</div></div>
+<div class="stat"><b>Setup</b><div class="stat-value">{setup_progress}</div></div>
+<div class="stat"><b>Device IP</b><div class="stat-value">{ip}</div></div>
+<div class="stat"><b>WiFi</b><div class="stat-value">{wifi_network_short}</div></div>
 </div>
-<p class="good">Status: {last_web_message}</p>
+<p class="good"><b>Latest activity:</b> {last_web_message}</p>
 {last_error_panel}
 {onboarding_message}
 </div>
 
+<div class="quicknav">
+<a href="#overview">Overview</a>
+<a href="#wifi-network">WiFi</a>
+<a href="#portfolio">Portfolio</a>
+<a href="#display-settings">Display</a>
+<a href="#status-details">Status</a>
+<a href="#diagnostics">Diagnostics</a>
+<a href="#software-updates">Updates</a>
+</div>
+
 <div class="grid">
-<div class="card">
+<div class="card feature-card">
+<div class="card-kicker">Start Here</div>
 <h2>Customer Setup</h2>
-<p class="small">Use this for normal customer setup: device name, symbols, API key, demo mode, PIN, brightness, update channel, and logos.</p>
+<p class="small">Configure the device name, stock list, market-data key, display preferences, PIN, and update channel.</p>
 <div class="button-row">
 <form method="GET" action="/setup-wizard"><button type="submit">Open Setup Wizard</button></form>
 <form method="GET" action="/help"><button type="submit">Help / Quick Guide</button></form>
@@ -1965,9 +4365,10 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <details class="slim"><summary>Setup Checklist</summary>{setup_checklist_message}</details>
 </div>
 
-<div class="card">
+<div class="card feature-card">
+<div class="card-kicker">Daily Controls</div>
 <h2>Quick Controls</h2>
-<p class="small"><b>Panel Display:</b> {panel_state}</p>
+<div class="status-line"><span>LED panel</span><b>{panel_state}</b></div>
 <div class="button-row">
 <form method="POST" action="/panel-sleep"><button class="orange" type="submit">Sleep Display</button></form>
 <form method="POST" action="/panel-wake"><button class="green" type="submit">Wake Display</button></form>
@@ -1978,9 +4379,24 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </div>
 <p class="small">Sleep turns the LED panels black but keeps WiFi, dashboard, settings, and updates running.</p>
 </div>
+
+{wifi_manager_html}
+
+<div class="card feature-card" id="portfolio">
+<div class="card-kicker">Private Local Integration</div>
+<h2>Portfolio & Bridge</h2>
+<div class="status-line"><span>Portfolio status</span><b>{portfolio_status_short}</b></div>
+<div class="status-line"><span>Bridge API</span><b>{portfolio_api_mode_short}</b></div>
+<p class="section-note">The Raspberry Pi keeps Schwab credentials local. The ticker receives only sanitized display data.</p>
+<div>{portfolio_bridge_links_html}</div>
+<div class="button-row">
+<form method="POST" action="/test-portfolio"><button type="submit">Test Bridge</button></form>
+<form method="POST" action="/refresh-now"><button class="green" type="submit">Refresh Display</button></form>
+</div>
+</div>
 </div>
 
-<details class="card">
+<details class="card" id="display-settings">
 <summary>Display & Ticker Settings</summary>
 <p class="small">Common customer-facing controls. Changes save to the device and update the board after the current scroll cycle.</p>
 <div class="grid">
@@ -2045,8 +4461,11 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <button class="green" type="submit">Save Night / Demo Settings</button>
 </form>
 </div>
-<div>
+<div id="portfolio-settings">
+<div class="card-kicker">Brokerage Display</div>
 <h2>Portfolio Module</h2>
+<p class="section-note">Configure what appears on the LED display. Portfolio values stay on your home network.</p>
+<div>{portfolio_bridge_links_html}</div>
 <form method="POST" action="/save-config">
 <label>Portfolio Display</label>
 <select name="portfolio_mode">
@@ -2054,14 +4473,20 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <option value="local_bridge" {portfolio_bridge_selected}>Local Bridge / Raspberry Pi</option>
 </select>
 <label>Bridge URL</label>
-<input name="portfolio_bridge_url" value="{portfolio_bridge_url}" placeholder="http://192.168.2.85:8787/portfolio">
+<input name="portfolio_bridge_url" value="{portfolio_bridge_url}" placeholder="http://192.168.2.85:8787">
+<p class="small">You may enter the bridge base URL, the legacy /portfolio URL, or the API v1 URL. The ticker will normalize it automatically.</p>
 <label>Bridge Display Key</label>
 <input name="portfolio_bridge_key" type="password" value="" placeholder="{portfolio_bridge_key_placeholder}">
-<p class="small">The saved bridge key is hidden. Leave blank to keep it. The S3 only receives portfolio summary data.</p>
+<p class="small">The saved bridge key is hidden. Leave blank to keep it. API v1 sends this key in a request header instead of the URL.</p>
+<label>Prefer API v1</label>
+<select name="portfolio_prefer_api_v1">
+<option value="true" {portfolio_prefer_v1_true_selected}>True - API v1 with legacy fallback</option>
+<option value="false" {portfolio_prefer_v1_false_selected}>False - legacy first</option>
+</select>
 <label>Privacy Mode</label>
 <select name="portfolio_privacy_mode">
-<option value="false" {portfolio_privacy_false_selected}>False - show portfolio value</option>
-<option value="true" {portfolio_privacy_true_selected}>True - hide portfolio value/cash</option>
+<option value="false" {portfolio_privacy_false_selected}>False - show enabled portfolio fields</option>
+<option value="true" {portfolio_privacy_true_selected}>True - hide all monetary portfolio values</option>
 </select>
 <label>Show Portfolio Value</label>
 <select name="portfolio_show_value">
@@ -2078,15 +4503,40 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <option value="true" {portfolio_cash_true_selected}>True</option>
 <option value="false" {portfolio_cash_false_selected}>False</option>
 </select>
+<label>Show Buying Power</label>
+<select name="portfolio_show_buying_power">
+<option value="true" {portfolio_buying_power_true_selected}>True</option>
+<option value="false" {portfolio_buying_power_false_selected}>False</option>
+</select>
+<label>Show Position Count</label>
+<select name="portfolio_show_positions_count">
+<option value="true" {portfolio_positions_true_selected}>True</option>
+<option value="false" {portfolio_positions_false_selected}>False</option>
+</select>
+<label>Show Largest Winner</label>
+<select name="portfolio_show_largest_winner">
+<option value="true" {portfolio_winner_true_selected}>True</option>
+<option value="false" {portfolio_winner_false_selected}>False</option>
+</select>
+<label>Show Largest Loser</label>
+<select name="portfolio_show_largest_loser">
+<option value="true" {portfolio_loser_true_selected}>True</option>
+<option value="false" {portfolio_loser_false_selected}>False</option>
+</select>
 <label>Portfolio Stale Minutes</label>
 <input name="portfolio_stale_minutes" value="{portfolio_stale_minutes}">
+<label>Capabilities Refresh Minutes</label>
+<input name="portfolio_capabilities_refresh_minutes" value="{portfolio_capabilities_refresh_minutes}">
 <button class="green" type="submit">Save Portfolio Settings</button>
 </form>
 <form method="POST" action="/test-portfolio"><button type="submit">Test Portfolio Bridge</button></form>
 <p>{portfolio_test_message}</p>
+<p class="small"><b>Bridge API Status</b><br>{portfolio_api_status_message}</p>
 </div>
 <div>
+<div class="card-kicker">Local Data Source</div>
 <h2>Pi Hub Quote Source</h2>
+<p class="section-note">Use this after the Raspberry Pi hub is confirmed healthy. The ticker can pull all quotes in one local request and fall back to direct Finnhub if the hub is offline.</p>
 <form method="POST" action="/save-config">
 <label>Quote Source</label>
 <select name="quote_source">
@@ -2097,7 +4547,7 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <input name="pi_hub_ticker_url" value="{pi_hub_ticker_url}" placeholder="http://192.168.2.85:8787/ticker">
 <label>Pi Hub Display Key</label>
 <input name="pi_hub_display_key" type="password" value="" placeholder="{pi_hub_display_key_placeholder}">
-<p class="small">The saved Pi hub display key is hidden. Leave blank to keep it. Paste a new key only when changing it.</p>
+<p class="small">The saved Pi Hub display key is hidden. Leave blank to keep it. The portfolio bridge display key is reused if this is blank.</p>
 <label>Fallback to Direct Finnhub if Pi Hub Fails</label>
 <select name="pi_hub_fallback_direct">
 <option value="true" {pi_hub_fallback_true_selected}>True</option>
@@ -2109,11 +4559,12 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </form>
 <form method="POST" action="/test-pi-hub"><button type="submit">Test Pi Hub</button></form>
 <p>{pi_hub_test_message}</p>
+<p class="small"><b>Pi Hub Status</b><br>{pi_hub_status_message}</p>
 </div>
 </div>
 </details>
 
-<details class="card">
+<details class="card" id="status-details">
 <summary>Status Details</summary>
 <div class="grid">
 <div class="card">
@@ -2127,14 +4578,14 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <p class="small">STALE means the panel is using cached or older data.</p>
 </div>
 <div class="card">
-<h2>Portfolio Status</h2>
-<p>{portfolio_status_message}</p>
-<form method="POST" action="/test-portfolio"><button type="submit">Test Portfolio Bridge</button></form>
-</div>
-<div class="card">
 <h2>Pi Hub Quote Source</h2>
 <p>{pi_hub_status_message}</p>
 <form method="POST" action="/test-pi-hub"><button type="submit">Test Pi Hub</button></form>
+</div>
+<div class="card">
+<h2>Portfolio Status</h2>
+<p>{portfolio_status_message}</p>
+<form method="POST" action="/test-portfolio"><button type="submit">Test Portfolio Bridge</button></form>
 </div>
 <div class="card">
 <h2>Logo Status</h2>
@@ -2144,7 +4595,7 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </div>
 </details>
 
-<details class="card">
+<details class="card" id="diagnostics">
 <summary>Diagnostics & Maintenance</summary>
 <div class="grid">
 <div class="card">
@@ -2179,10 +4630,21 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </div>
 <div class="card">
 <h2>Backup / Export</h2>
-<p class="small">Safe exports hide API keys and WiFi passwords. Use these for troubleshooting or saving a copy of the setup.</p>
-<form method="GET" action="/support-report"><button type="submit">View Support Report</button></form>
-<form method="GET" action="/config-backup"><button type="submit">View Config Backup</button></form>
+<p class="small">Safe exports hide API keys, WiFi passwords, bridge keys, admin PINs, tokens, and portfolio values.</p>
+<form method="GET" action="/support-report"><button type="submit">View Safe Support Report</button></form>
+<form method="GET" action="/support-report.txt"><button type="submit">Open Plain-Text Support Report</button></form>
+<form method="GET" action="/config-backup"><button type="submit">View Safe Config Backup</button></form>
 <form method="GET" action="/symbols-backup"><button type="submit">View Symbols Backup</button></form>
+</div>
+<div class="card">
+<h2>Update Recovery Journal</h2>
+<p>{update_recovery_message}</p>
+<form method="POST" action="/clear-update-history"><button class="orange" type="submit">Clear Update History</button></form>
+</div>
+<div class="card">
+<h2>Pre-Installation Checks</h2>
+<p>{preflight_message}</p>
+<form method="POST" action="/run-update-preflight"><button type="submit">Run Preflight Check</button></form>
 </div>
 <div class="card">
 <h2>OTA Status</h2>
@@ -2255,7 +4717,7 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 </form>
 </details>
 
-<details class="card">
+<details class="card" id="software-updates">
 <summary>Software Update & Recovery</summary>
 <div class="grid">
 <div class="card">
@@ -2266,12 +4728,13 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <div class="card">
 <h2>Software Update</h2>
 <p>{ota_message}</p>
-<form method="POST" action="/check-update"><button type="submit">Check for Update</button></form>
+{ota_job_panel}
+<form method="POST" action="/check-update"><button type="submit" {ota_controls_disabled}>Check for Update</button></form>
 <br>
-<form method="POST" action="/install-update">
+<form method="POST" action="/install-update" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Starting Update...';">
 <label>Admin PIN</label>
-<input name="admin_pin" type="password" placeholder="Enter PIN">
-<button class="green" type="submit">Install Update</button>
+<input name="admin_pin" type="password" placeholder="Enter PIN" {ota_controls_disabled}>
+<button class="green" type="submit" {ota_controls_disabled}>{ota_install_button_text}</button>
 </form>
 <br>
 <form method="POST" action="/rollback" onsubmit="return confirm('Rollback to previous app_backup.py and restart?');">
@@ -2311,7 +4774,7 @@ summary {{ cursor:pointer; font-weight:bold; color:#79c7ff; margin:8px 0; }}
 <label>Admin PIN</label>
 <input name="admin_pin" type="password" placeholder="Enter PIN">
 <select name="reset_type">
-<option value="wifi">Reset WiFi Only</option>
+<option value="wifi">Reset WiFi Only — opens customer setup hotspot</option>
 <option value="settings">Reset Settings Only</option>
 <option value="symbols">Reset Symbols Only</option>
 <option value="all">Reset Everything</option>
@@ -2343,7 +4806,26 @@ def help_route(request: Request):
 
 @server.route("/support-report")
 def support_report_route(request: Request):
-    return Response(request, export_page("Support Report", build_support_report_text()), content_type="text/html")
+    return Response(request, export_page("Safe Support Report", build_support_report_text()), content_type="text/html")
+
+
+@server.route("/support-report.txt")
+def support_report_text_route(request: Request):
+    return Response(request, build_support_report_text(), content_type="text/plain")
+
+
+@server.route("/clear-update-history", methods=["POST"])
+def clear_update_history_route(request: Request):
+    boot = ota_journal.get("boot", {})
+    ota_journal["last_update"] = {}
+    ota_journal["boot"] = boot
+    save_ota_journal()
+    set_web_message("Update history cleared; boot watchdog state preserved.")
+    return Response(
+        request,
+        clean_page("Update History Cleared", "OTA result history was cleared."),
+        content_type="text/html"
+    )
 
 
 @server.route("/config-backup")
@@ -2369,6 +4851,428 @@ def setup_wizard_route(request: Request):
     return Response(request, setup_wizard_page(), content_type="text/html")
 
 
+@server.route("/scan-wifi", methods=["POST"])
+def scan_wifi_route(request: Request):
+    global last_wifi_scan, last_wifi_scan_message
+
+    if ota_job_active():
+        return Response(
+            request,
+            clean_page("Scan Blocked", "Wait for the software update to finish."),
+            content_type="text/html"
+        )
+
+    form = request.form_data
+    entered_pin = str(form.get("admin_pin", ""))
+    ok, message = verify_wifi_admin_pin(entered_pin)
+
+    if not ok:
+        set_error_message("WiFi scan blocked: " + message)
+        return Response(
+            request,
+            clean_page("WiFi Scan Blocked", safe_html(message)),
+            content_type="text/html"
+        )
+
+    last_wifi_scan = scan_nearby_wifi(14)
+    last_wifi_scan_message = (
+        "{} nearby network(s) found.".format(len(last_wifi_scan))
+        if last_wifi_scan
+        else "No nearby networks were found."
+    )
+    set_web_message(last_wifi_scan_message)
+
+    return Response(
+        request,
+        clean_page("WiFi Scan Complete", safe_html(last_wifi_scan_message)),
+        content_type="text/html"
+    )
+
+
+@server.route("/show-wifi-setup-code", methods=["POST"])
+def show_wifi_setup_code_route(request: Request):
+    form = request.form_data
+    entered_pin = str(form.get("admin_pin", ""))
+    ok, message = verify_wifi_admin_pin(entered_pin)
+
+    if not ok:
+        set_error_message("Setup code request blocked: " + message)
+        return Response(
+            request,
+            clean_page("Request Blocked", safe_html(message)),
+            content_type="text/html"
+        )
+
+    page = """\
+<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:20px; }}
+.card {{ max-width:680px; margin:auto; background:#101b2e; border:1px solid #243657; border-radius:18px; padding:20px; }}
+.code {{ font-size:28px; font-weight:bold; letter-spacing:2px; padding:14px; background:#07111f; border-radius:12px; text-align:center; }}
+input {{ width:100%; box-sizing:border-box; padding:10px; margin:8px 0; background:#07111f; color:white; border:1px solid #33486d; border-radius:10px; }}
+button {{ padding:11px 14px; border:0; border-radius:10px; background:#d97706; color:white; font-weight:bold; }}
+a {{ color:#79c7ff; }}
+.small {{ color:#a9bddb; line-height:1.5; }}
+</style></head><body>
+<div class="card">
+<h1>Customer Setup Credentials</h1>
+<p><b>Setup WiFi:</b> {setup_ssid}</p>
+<div class="code">{setup_code}</div>
+<p class="small">Print this code on the device setup card. It is used only when the ticker is running its temporary setup hotspot. Do not include it in support screenshots.</p>
+<form method="POST" action="/regenerate-wifi-setup-code">
+<label>Admin PIN</label>
+<input name="admin_pin" type="password" required autocomplete="current-password">
+<button type="submit">Regenerate Setup Code</button>
+</form>
+<p><a href="/#wifi-network">Back to WiFi Manager</a></p>
+</div></body></html>
+""".format(
+        setup_ssid=safe_html(SETUP_SSID),
+        setup_code=safe_html(SETUP_PASSWORD)
+    )
+
+    return Response(request, page, content_type="text/html")
+
+
+@server.route("/regenerate-wifi-setup-code", methods=["POST"])
+def regenerate_wifi_setup_code_route(request: Request):
+    global SETUP_PASSWORD, device_info
+
+    form = request.form_data
+    entered_pin = str(form.get("admin_pin", ""))
+    ok, message = verify_wifi_admin_pin(entered_pin)
+
+    if not ok:
+        set_error_message("Setup code regeneration blocked: " + message)
+        return Response(
+            request,
+            clean_page("Request Blocked", safe_html(message)),
+            content_type="text/html"
+        )
+
+    try:
+        new_code = generate_setup_password(
+            "{}-{}-{}".format(
+                DEVICE_ID,
+                time.monotonic(),
+                SETUP_PASSWORD
+            )
+        )
+        device_info["setup_password"] = new_code
+        atomic_save_json_file(DEVICE_FILE, device_info)
+        SETUP_PASSWORD = new_code
+        set_web_message("Unique customer setup code regenerated.")
+
+        page = """\
+<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:20px; }}
+.card {{ max-width:680px; margin:auto; background:#101b2e; border:1px solid #243657; border-radius:18px; padding:20px; }}
+.code {{ font-size:28px; font-weight:bold; letter-spacing:2px; padding:14px; background:#07111f; border-radius:12px; text-align:center; }}
+a {{ color:#79c7ff; }}
+</style></head><body>
+<div class="card"><h1>New Setup Code</h1>
+<p class="code">{setup_code}</p>
+<p>Replace the old code on the customer setup card. The new code becomes active the next time setup hotspot mode starts.</p>
+<p><a href="/#wifi-network">Back to WiFi Manager</a></p>
+</div></body></html>
+""".format(setup_code=safe_html(new_code))
+
+        return Response(request, page, content_type="text/html")
+
+    except Exception as e:
+        set_error_message("Setup code regeneration failed: " + repr(e))
+        return Response(
+            request,
+            clean_page("Regeneration Failed", safe_html(last_error_message)),
+            content_type="text/html"
+        )
+
+
+@server.route("/restore-wifi-backup", methods=["POST"])
+def restore_wifi_backup_route(request: Request):
+    global restart_requested, restart_time
+
+    if ota_job_active() or restart_requested:
+        return Response(
+            request,
+            clean_page("Restore Blocked", "Another update or restart is already in progress."),
+            content_type="text/html"
+        )
+
+    form = request.form_data
+    entered_pin = str(form.get("admin_pin", ""))
+    ok, message = verify_wifi_admin_pin(entered_pin)
+
+    if not ok:
+        set_error_message("Previous WiFi restore blocked: " + message)
+        return Response(
+            request,
+            clean_page("Restore Blocked", safe_html(message)),
+            content_type="text/html"
+        )
+
+    current = load_json_file(WIFI_FILE, {})
+    previous = load_json_file(WIFI_BACKUP_FILE, {})
+
+    if not valid_wifi_record(previous):
+        return Response(
+            request,
+            clean_page("No Previous Network", "No previous WiFi profile is stored."),
+            content_type="text/html"
+        )
+
+    try:
+        if valid_wifi_record(current):
+            save_wifi_record(
+                WIFI_BACKUP_FILE,
+                current.get("ssid", ""),
+                current.get("password", "")
+            )
+
+        save_wifi_record(
+            WIFI_PENDING_FILE,
+            previous.get("ssid", ""),
+            previous.get("password", "")
+        )
+        wifi_state_save(
+            "restore_pending",
+            "Previous WiFi profile is awaiting a connection test.",
+            str(current.get("ssid", "")),
+            str(previous.get("ssid", ""))
+        )
+
+    except Exception as e:
+        set_error_message("Previous WiFi restore failed to stage: " + repr(e))
+        return Response(
+            request,
+            clean_page("Restore Failed", safe_html(last_error_message)),
+            content_type="text/html"
+        )
+
+    restart_requested = True
+    restart_time = time.monotonic() + 7.0
+    set_web_message("Previous WiFi profile scheduled for connection test.")
+
+    return Response(
+        request,
+        clean_page(
+            "Previous Network Scheduled",
+            "The ticker will restart and test the previous WiFi profile."
+        ),
+        content_type="text/html"
+    )
+
+
+@server.route("/forget-wifi-backup", methods=["POST"])
+def forget_wifi_backup_route(request: Request):
+    form = request.form_data
+    entered_pin = str(form.get("admin_pin", ""))
+    ok, message = verify_wifi_admin_pin(entered_pin)
+
+    if not ok:
+        set_error_message("Forget previous WiFi blocked: " + message)
+        return Response(
+            request,
+            clean_page("Request Blocked", safe_html(message)),
+            content_type="text/html"
+        )
+
+    remove_file_quietly(WIFI_BACKUP_FILE)
+    set_web_message("Previous WiFi profile removed from device storage.")
+
+    return Response(
+        request,
+        clean_page("Previous Network Forgotten", "The stored previous WiFi profile was removed."),
+        content_type="text/html"
+    )
+
+
+@server.route("/change-wifi", methods=["POST"])
+def change_wifi_route(request: Request):
+    global restart_requested, restart_time
+
+    if ota_job_active() or restart_requested:
+        return Response(
+            request,
+            clean_page("WiFi Change Blocked", "Another update or restart is already in progress."),
+            content_type="text/html"
+        )
+
+    if valid_wifi_record(load_json_file(WIFI_PENDING_FILE, {})):
+        return Response(
+            request,
+            clean_page("WiFi Change Pending", "A WiFi change is already awaiting restart."),
+            content_type="text/html"
+        )
+
+    form = request.form_data
+    entered_pin = str(form.get("admin_pin", ""))
+    ok, message = verify_wifi_admin_pin(entered_pin)
+
+    if not ok:
+        set_error_message("WiFi change blocked: " + message)
+        return Response(
+            request,
+            clean_page("WiFi Change Blocked", safe_html(message)),
+            content_type="text/html"
+        )
+
+    ssid = str(form.get("ssid", "")).strip()
+    password = str(form.get("password", ""))
+    confirm_password = str(form.get("confirm_password", ""))
+    open_network = bool_from_form(form.get("open_network", False))
+
+    error = wifi_ssid_validation_error(ssid)
+
+    if not error:
+        error = wifi_password_validation_error(
+            password,
+            confirm_password,
+            open_network
+        )
+
+    if error:
+        set_error_message("WiFi change validation failed: " + error)
+        return Response(
+            request,
+            clean_page("WiFi Change Blocked", safe_html(error)),
+            content_type="text/html"
+        )
+
+    current = load_json_file(WIFI_FILE, {})
+
+    try:
+        if valid_wifi_record(current):
+            save_wifi_record(
+                WIFI_BACKUP_FILE,
+                current.get("ssid", ""),
+                current.get("password", "")
+            )
+
+        save_wifi_record(
+            WIFI_PENDING_FILE,
+            ssid,
+            "" if open_network else password
+        )
+        wifi_state_save(
+            "switch_pending",
+            "New WiFi saved and awaiting connection test.",
+            str(current.get("ssid", "")),
+            ssid
+        )
+
+    except Exception as e:
+        set_error_message("WiFi change could not be saved: " + repr(e))
+        return Response(
+            request,
+            clean_page("WiFi Change Failed", safe_html(last_error_message)),
+            content_type="text/html"
+        )
+
+    restart_requested = True
+    restart_time = time.monotonic() + 7.0
+    set_web_message("WiFi switch scheduled for " + ssid + ".")
+
+    page = """\
+<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:20px; }}
+.card {{ max-width:720px; margin:auto; background:#101b2e; border:1px solid #243657; border-radius:18px; padding:20px; }}
+.good {{ color:#55ff88; }}
+.small {{ color:#a9bddb; line-height:1.5; }}
+</style>
+<script>
+let remaining=7;
+function tick(){{
+  const el=document.getElementById("countdown");
+  if(el) el.textContent=remaining;
+  remaining-=1;
+  if(remaining>=0) setTimeout(tick,1000);
+}}
+window.onload=tick;
+</script></head><body>
+<div class="card">
+<h1>WiFi Change Scheduled</h1>
+<p>The ticker will restart in <b id="countdown">7</b> seconds and test <b>{ssid}</b>.</p>
+<p class="small">This browser page will disconnect. Join the new WiFi on your phone or computer, then open <b>http://{hostname}.local/</b>. The device IP may change.</p>
+<p class="good">If the new credentials fail, the ticker automatically restores the previous network. If no saved network works, the setup hotspot <b>{setup_ssid}</b> opens.</p>
+</div></body></html>
+""".format(
+        ssid=safe_html(ssid),
+        hostname=safe_html(MDNS_HOSTNAME),
+        setup_ssid=safe_html(SETUP_SSID)
+    )
+
+    return Response(request, page, content_type="text/html")
+
+
+@server.route("/start-wifi-setup", methods=["POST"])
+def start_wifi_setup_route(request: Request):
+    global restart_requested, restart_time
+
+    if ota_job_active() or restart_requested:
+        return Response(
+            request,
+            clean_page("Setup Mode Blocked", "Another update or restart is already in progress."),
+            content_type="text/html"
+        )
+
+    form = request.form_data
+    entered_pin = str(form.get("admin_pin", ""))
+    ok, message = verify_wifi_admin_pin(entered_pin)
+
+    if not ok:
+        set_error_message("WiFi setup request blocked: " + message)
+        return Response(
+            request,
+            clean_page("Setup Mode Blocked", safe_html(message)),
+            content_type="text/html"
+        )
+
+    try:
+        with open(WIFI_FORCE_SETUP_FILE, "w") as f:
+            f.write("requested")
+    except Exception as e:
+        set_error_message("Could not schedule WiFi setup mode: " + repr(e))
+        return Response(
+            request,
+            clean_page("Setup Mode Failed", safe_html(last_error_message)),
+            content_type="text/html"
+        )
+
+    restart_requested = True
+    restart_time = time.monotonic() + 7.0
+    set_web_message("WiFi setup hotspot scheduled for next restart.")
+
+    page = """\
+<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:20px; }}
+.card {{ max-width:720px; margin:auto; background:#101b2e; border:1px solid #243657; border-radius:18px; padding:20px; }}
+.code {{ font-size:24px; font-weight:bold; letter-spacing:1px; padding:12px; background:#07111f; border-radius:10px; text-align:center; }}
+</style></head><body>
+<div class="card">
+<h1>WiFi Setup Starting</h1>
+<p>The ticker will restart in about 7 seconds.</p>
+<p>On your phone or computer, connect to:</p>
+<p class="code">{setup_ssid}</p>
+<p>Use the unique setup code printed on the ticker setup card, then open <b>http://192.168.4.1/</b>.</p>
+<p>The current working WiFi profile remains saved until a replacement network connects successfully.</p>
+</div></body></html>
+""".format(setup_ssid=safe_html(SETUP_SSID))
+
+    return Response(request, page, content_type="text/html")
+
+
 @server.route("/save-customer-setup", methods=["POST"])
 def save_customer_setup(request: Request):
     global SYMBOLS, need_reload, config, BRIGHTNESS_TARGET
@@ -2385,8 +5289,17 @@ def save_customer_setup(request: Request):
         config["require_customer_api_key"] = bool_from_form(form.get("require_customer_api_key", config.get("require_customer_api_key", True)))
         config["demo_mode"] = bool_from_form(form.get("demo_mode", config.get("demo_mode", False)))
 
-        new_admin_pin = url_decode(str(form.get("admin_pin", ""))).strip()
+        new_admin_pin = str(form.get("admin_pin", "")).strip()
         if new_admin_pin:
+            if not new_admin_pin.isdigit() or not (4 <= len(new_admin_pin) <= 12):
+                return Response(
+                    request,
+                    clean_page(
+                        "Setup Blocked",
+                        "Admin PIN must contain 4-12 digits."
+                    ),
+                    content_type="text/html"
+                )
             config["admin_pin"] = new_admin_pin
 
         config["brightness"] = clamp_float(form.get("brightness", config.get("brightness", 0.30)), 0.0, 1.0, DEFAULT_CONFIG["brightness"])
@@ -2401,8 +5314,14 @@ def save_customer_setup(request: Request):
         config["portfolio_show_value"] = bool_from_form(form.get("portfolio_show_value", config.get("portfolio_show_value", True)))
         config["portfolio_show_day_change"] = bool_from_form(form.get("portfolio_show_day_change", config.get("portfolio_show_day_change", True)))
         config["portfolio_show_cash"] = bool_from_form(form.get("portfolio_show_cash", config.get("portfolio_show_cash", True)))
+        config["portfolio_show_buying_power"] = bool_from_form(form.get("portfolio_show_buying_power", config.get("portfolio_show_buying_power", True)))
+        config["portfolio_show_positions_count"] = bool_from_form(form.get("portfolio_show_positions_count", config.get("portfolio_show_positions_count", True)))
+        config["portfolio_show_largest_winner"] = bool_from_form(form.get("portfolio_show_largest_winner", config.get("portfolio_show_largest_winner", True)))
+        config["portfolio_show_largest_loser"] = bool_from_form(form.get("portfolio_show_largest_loser", config.get("portfolio_show_largest_loser", True)))
+        config["portfolio_prefer_api_v1"] = bool_from_form(form.get("portfolio_prefer_api_v1", config.get("portfolio_prefer_api_v1", True)))
         config["portfolio_privacy_mode"] = bool_from_form(form.get("portfolio_privacy_mode", config.get("portfolio_privacy_mode", False)))
         config["portfolio_stale_minutes"] = clamp_int(form.get("portfolio_stale_minutes", config.get("portfolio_stale_minutes", 15)), 1, 1440, DEFAULT_CONFIG["portfolio_stale_minutes"])
+        config["portfolio_capabilities_refresh_minutes"] = clamp_int(form.get("portfolio_capabilities_refresh_minutes", config.get("portfolio_capabilities_refresh_minutes", 60)), 5, 1440, DEFAULT_CONFIG["portfolio_capabilities_refresh_minutes"])
 
         channel = url_decode(str(form.get("update_channel", config.get("update_channel", "stable")))).strip().lower()
         config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
@@ -2443,6 +5362,8 @@ def index(request: Request):
             device_name=safe_html(config.get("device_name", "StockTicker Dashboard")),
             device_id=DEVICE_ID,
             ip=ip,
+            wifi_network_short=safe_html(wifi_network_short()),
+            wifi_manager_html=build_wifi_manager_html(),
             market_status=current_market_status,
             update_channel=config["update_channel"],
             system_health_badge=build_system_health_badge_html(),
@@ -2467,10 +5388,15 @@ def index(request: Request):
             block_gap=config["block_gap"],
             ota_message=ota_message,
             ota_status_message=ota_status_message,
+            ota_job_panel=build_ota_job_panel_html(),
+            ota_controls_disabled="disabled" if ota_job_active() else "",
+            ota_install_button_text="Update In Progress" if ota_job_active() else "Install Update",
             alert_message=alert_message,
             quote_freshness_message=build_quote_freshness_html(),
             portfolio_status_message=build_portfolio_status_html(),
             system_health_message=build_system_health_html(),
+            preflight_message=preflight_message,
+            update_recovery_message=build_update_recovery_html(),
             event_log_message=build_event_log_html(),
             logo_status_message=build_logo_status_html(),
             release_notes_message=release_notes_message,
@@ -2514,6 +5440,8 @@ def index(request: Request):
             portfolio_bridge_selected=selected("local_bridge", config.get("portfolio_mode", "off")),
             portfolio_bridge_url=safe_html(config.get("portfolio_bridge_url", "")),
             portfolio_bridge_key_placeholder="Saved key hidden. Leave blank to keep it." if str(config.get("portfolio_bridge_key", "")).strip() else "Paste display key here",
+            portfolio_prefer_v1_true_selected=selected("true", str(config.get("portfolio_prefer_api_v1", True)).lower()),
+            portfolio_prefer_v1_false_selected=selected("false", str(config.get("portfolio_prefer_api_v1", True)).lower()),
             portfolio_privacy_true_selected=selected("true", str(config.get("portfolio_privacy_mode", False)).lower()),
             portfolio_privacy_false_selected=selected("false", str(config.get("portfolio_privacy_mode", False)).lower()),
             portfolio_value_true_selected=selected("true", str(config.get("portfolio_show_value", True)).lower()),
@@ -2522,11 +5450,23 @@ def index(request: Request):
             portfolio_day_false_selected=selected("false", str(config.get("portfolio_show_day_change", True)).lower()),
             portfolio_cash_true_selected=selected("true", str(config.get("portfolio_show_cash", True)).lower()),
             portfolio_cash_false_selected=selected("false", str(config.get("portfolio_show_cash", True)).lower()),
+            portfolio_buying_power_true_selected=selected("true", str(config.get("portfolio_show_buying_power", True)).lower()),
+            portfolio_buying_power_false_selected=selected("false", str(config.get("portfolio_show_buying_power", True)).lower()),
+            portfolio_positions_true_selected=selected("true", str(config.get("portfolio_show_positions_count", True)).lower()),
+            portfolio_positions_false_selected=selected("false", str(config.get("portfolio_show_positions_count", True)).lower()),
+            portfolio_winner_true_selected=selected("true", str(config.get("portfolio_show_largest_winner", True)).lower()),
+            portfolio_winner_false_selected=selected("false", str(config.get("portfolio_show_largest_winner", True)).lower()),
+            portfolio_loser_true_selected=selected("true", str(config.get("portfolio_show_largest_loser", True)).lower()),
+            portfolio_loser_false_selected=selected("false", str(config.get("portfolio_show_largest_loser", True)).lower()),
             portfolio_stale_minutes=config.get("portfolio_stale_minutes", 15),
+            portfolio_capabilities_refresh_minutes=config.get("portfolio_capabilities_refresh_minutes", 60),
+            portfolio_api_status_message=build_portfolio_api_status_html(),
+            portfolio_api_mode_short=portfolio_api_mode_short(),
+            portfolio_bridge_links_html=build_portfolio_bridge_links_html(),
             quote_source_direct_selected=selected("direct_finnhub", config.get("quote_source", "direct_finnhub")),
             quote_source_pi_selected=selected("pi_hub", config.get("quote_source", "direct_finnhub")),
             pi_hub_ticker_url=safe_html(config.get("pi_hub_ticker_url", "")),
-            pi_hub_display_key_placeholder="Saved key hidden. Leave blank to keep it." if str(get_pi_hub_display_key()).strip() else "Paste Pi hub display key here",
+            pi_hub_display_key_placeholder="Saved key hidden. Leave blank to keep it." if str(get_pi_hub_display_key()).strip() else "Paste Pi Hub display key here",
             pi_hub_fallback_true_selected=selected("true", str(config.get("pi_hub_fallback_direct", True)).lower()),
             pi_hub_fallback_false_selected=selected("false", str(config.get("pi_hub_fallback_direct", True)).lower()),
             pi_hub_quote_stale_minutes=config.get("pi_hub_quote_stale_minutes", 10),
@@ -2537,19 +5477,32 @@ def index(request: Request):
     )
 
 
+
 @server.route("/test-pi-hub", methods=["POST"])
 def test_pi_hub_route(request: Request):
     global pi_hub_test_message
+
     try:
         data = fetch_pi_hub_ticker_payload()
         quotes = data.get("quotes", {})
         portfolio = data.get("portfolio", {})
-        pi_hub_test_message = "Pi hub works: {} quotes, portfolio source {}.".format(len(quotes), portfolio.get("source", "unknown"))
+        pi_hub_test_message = (
+            "Pi Hub works: {} quotes, portfolio source {}."
+        ).format(
+            len(quotes),
+            portfolio.get("source", "unknown")
+        )
         set_web_message(pi_hub_test_message)
+
     except Exception as e:
-        pi_hub_test_message = "Pi hub test failed: " + repr(e)
+        pi_hub_test_message = "Pi Hub test failed: " + repr(e)
         set_error_message(pi_hub_test_message)
-    return Response(request, clean_page("Pi Hub Test Complete", pi_hub_test_message), content_type="text/html")
+
+    return Response(
+        request,
+        clean_page("Pi Hub Test Complete", pi_hub_test_message),
+        content_type="text/html"
+    )
 
 
 @server.route("/test-quote", methods=["POST"])
@@ -2563,23 +5516,23 @@ def test_quote_route(request: Request):
         return Response(request, clean_page("Test Failed", test_quote_message), content_type="text/html")
 
     try:
-        if is_pi_hub_quote_source() and not is_demo_mode():
-            data = fetch_pi_hub_ticker_payload()
-            quote = data.get("quotes", {}).get(sym)
-            if not quote:
-                test_quote_message = "{} was not found in the Pi hub quote cache. Refresh quotes on the Pi hub and try again.".format(sym)
-                set_error_message(test_quote_message)
-            else:
-                e = make_quote_entry_from_hub(sym, quote)
-                test_quote_message = "{} Pi hub works: {} {}".format(sym, e.get("price_line", ""), e.get("change_line", ""))
-                set_web_message(test_quote_message)
-            return Response(request, clean_page("Pi Hub Quote Test Complete", test_quote_message), content_type="text/html")
-
         if is_demo_mode():
             e = demo_quote(sym)
             test_quote_message = "{} demo works: {} {}".format(sym, e.get("price_line", ""), e.get("change_line", ""))
             set_web_message("Demo quote tested for {}.".format(sym))
             return Response(request, clean_page("Demo Quote Complete", test_quote_message), content_type="text/html")
+
+        if is_pi_hub_quote_source() and not is_demo_mode():
+            data = fetch_pi_hub_ticker_payload()
+            quote = data.get("quotes", {}).get(sym)
+            if not quote:
+                test_quote_message = "{} was not found in the Pi Hub quote cache. Refresh quotes on the Pi hub and try again.".format(sym)
+                set_error_message(test_quote_message)
+            else:
+                e = make_quote_entry_from_hub(sym, quote)
+                test_quote_message = "{} Pi Hub works: {} {}".format(sym, e.get("price_line", ""), e.get("change_line", ""))
+                set_web_message(test_quote_message)
+            return Response(request, clean_page("Pi Hub Quote Test Complete", test_quote_message), content_type="text/html")
 
         api_key = get_finnhub_api_key()
         if not api_key:
@@ -2619,14 +5572,25 @@ def test_portfolio_route(request: Request):
         set_web_message(portfolio_test_message)
         return Response(request, clean_page("Portfolio Test", portfolio_test_message), content_type="text/html")
 
+    fetch_bridge_capabilities(True)
     entry = fetch_portfolio_entry()
     last_portfolio_entry = entry
 
     if entry and not entry.get("error_reason"):
-        portfolio_test_message = "Portfolio bridge works: {} {}".format(entry.get("price_line", ""), entry.get("change_line", ""))
+        portfolio_test_message = (
+            "Portfolio bridge works via {} (bridge {}). {} {}"
+        ).format(
+            entry.get("bridge_api_mode", "unknown"),
+            entry.get("bridge_version", "unknown"),
+            entry.get("price_line", ""),
+            entry.get("change_line", "")
+        )
         set_web_message("Portfolio bridge tested successfully.")
     else:
-        portfolio_test_message = "Portfolio bridge test failed or returned cached/offline data. Check Pi IP, bridge key, and /portfolio JSON."
+        portfolio_test_message = (
+            "Portfolio bridge test failed or returned cached/offline data. "
+            "Check Pi IP, bridge key, and bridge API status."
+        )
         set_error_message(portfolio_test_message)
 
     return Response(request, clean_page("Portfolio Test Complete", portfolio_test_message), content_type="text/html")
@@ -2639,28 +5603,6 @@ def validate_symbols_route(request: Request):
     valid = []
     invalid = []
 
-    if is_pi_hub_quote_source() and not is_demo_mode():
-        try:
-            data = fetch_pi_hub_ticker_payload()
-            quotes = data.get("quotes", {})
-            for sym in SYMBOLS:
-                q = quotes.get(sym) or quotes.get(str(sym).upper())
-                if q and float(q.get("price", 0) or 0) > 0:
-                    valid.append("{} ${:.2f}".format(sym, float(q.get("price", 0) or 0)))
-                else:
-                    invalid.append(sym)
-            if invalid:
-                test_quote_message = "Pi hub missing/no data: " + ", ".join(invalid)
-                set_error_message(test_quote_message)
-            else:
-                test_quote_message = "All saved symbols valid from Pi hub: " + ", ".join(valid)
-                set_web_message("All saved symbols validated from Pi hub.")
-            return Response(request, clean_page("Pi Hub Symbol Validation Complete", test_quote_message), content_type="text/html")
-        except Exception as e:
-            test_quote_message = "Pi hub symbol validation failed: " + repr(e)
-            set_error_message(test_quote_message)
-            return Response(request, clean_page("Pi Hub Symbol Validation Failed", test_quote_message), content_type="text/html")
-
     for sym in SYMBOLS:
         try:
             server.poll()
@@ -2670,6 +5612,15 @@ def validate_symbols_route(request: Request):
         try:
             if is_demo_mode():
                 valid.append("{} DEMO".format(sym))
+                continue
+
+            if is_pi_hub_quote_source():
+                data = fetch_pi_hub_ticker_payload()
+                q = data.get("quotes", {}).get(sym)
+                if q and float(q.get("price", q.get("c", 0)) or 0) > 0:
+                    valid.append("{} ${:.2f}".format(sym, float(q.get("price", q.get("c", 0)) or 0)))
+                else:
+                    invalid.append(sym)
                 continue
 
             api_key = get_finnhub_api_key()
@@ -2803,15 +5754,6 @@ def save_cfg(request: Request):
         config["show_stale_marker"] = bool_from_form(form.get("show_stale_marker", config.get("show_stale_marker", True)))
         config["smooth_quote_refresh"] = bool_from_form(form.get("smooth_quote_refresh", config.get("smooth_quote_refresh", True)))
 
-        quote_source = url_decode(str(form.get("quote_source", config.get("quote_source", "direct_finnhub")))).strip().lower()
-        config["quote_source"] = quote_source if quote_source in ("direct_finnhub", "pi_hub") else "direct_finnhub"
-        config["pi_hub_ticker_url"] = url_decode(str(form.get("pi_hub_ticker_url", config.get("pi_hub_ticker_url", "")))).strip()
-        new_pi_hub_key = url_decode(str(form.get("pi_hub_display_key", ""))).strip()
-        if new_pi_hub_key:
-            config["pi_hub_display_key"] = new_pi_hub_key
-        config["pi_hub_fallback_direct"] = bool_from_form(form.get("pi_hub_fallback_direct", config.get("pi_hub_fallback_direct", True)))
-        config["pi_hub_quote_stale_minutes"] = clamp_int(form.get("pi_hub_quote_stale_minutes", config.get("pi_hub_quote_stale_minutes", 10)), 1, 1440, DEFAULT_CONFIG["pi_hub_quote_stale_minutes"])
-
         portfolio_mode = url_decode(str(form.get("portfolio_mode", config.get("portfolio_mode", "off")))).strip().lower()
         config["portfolio_mode"] = portfolio_mode if portfolio_mode in ("off", "local_bridge") else "off"
         config["portfolio_bridge_url"] = url_decode(str(form.get("portfolio_bridge_url", config.get("portfolio_bridge_url", "")))).strip()
@@ -2821,8 +5763,23 @@ def save_cfg(request: Request):
         config["portfolio_show_value"] = bool_from_form(form.get("portfolio_show_value", config.get("portfolio_show_value", True)))
         config["portfolio_show_day_change"] = bool_from_form(form.get("portfolio_show_day_change", config.get("portfolio_show_day_change", True)))
         config["portfolio_show_cash"] = bool_from_form(form.get("portfolio_show_cash", config.get("portfolio_show_cash", True)))
+        config["portfolio_show_buying_power"] = bool_from_form(form.get("portfolio_show_buying_power", config.get("portfolio_show_buying_power", True)))
+        config["portfolio_show_positions_count"] = bool_from_form(form.get("portfolio_show_positions_count", config.get("portfolio_show_positions_count", True)))
+        config["portfolio_show_largest_winner"] = bool_from_form(form.get("portfolio_show_largest_winner", config.get("portfolio_show_largest_winner", True)))
+        config["portfolio_show_largest_loser"] = bool_from_form(form.get("portfolio_show_largest_loser", config.get("portfolio_show_largest_loser", True)))
+        config["portfolio_prefer_api_v1"] = bool_from_form(form.get("portfolio_prefer_api_v1", config.get("portfolio_prefer_api_v1", True)))
         config["portfolio_privacy_mode"] = bool_from_form(form.get("portfolio_privacy_mode", config.get("portfolio_privacy_mode", False)))
         config["portfolio_stale_minutes"] = clamp_int(form.get("portfolio_stale_minutes", config.get("portfolio_stale_minutes", 15)), 1, 1440, DEFAULT_CONFIG["portfolio_stale_minutes"])
+        config["portfolio_capabilities_refresh_minutes"] = clamp_int(form.get("portfolio_capabilities_refresh_minutes", config.get("portfolio_capabilities_refresh_minutes", 60)), 5, 1440, DEFAULT_CONFIG["portfolio_capabilities_refresh_minutes"])
+
+        quote_source = url_decode(str(form.get("quote_source", config.get("quote_source", "direct_finnhub")))).strip().lower()
+        config["quote_source"] = quote_source if quote_source in ("direct_finnhub", "pi_hub") else "direct_finnhub"
+        config["pi_hub_ticker_url"] = url_decode(str(form.get("pi_hub_ticker_url", config.get("pi_hub_ticker_url", "")))).strip()
+        new_pi_hub_key = url_decode(str(form.get("pi_hub_display_key", ""))).strip()
+        if new_pi_hub_key:
+            config["pi_hub_display_key"] = new_pi_hub_key
+        config["pi_hub_fallback_direct"] = bool_from_form(form.get("pi_hub_fallback_direct", config.get("pi_hub_fallback_direct", True)))
+        config["pi_hub_quote_stale_minutes"] = clamp_int(form.get("pi_hub_quote_stale_minutes", config.get("pi_hub_quote_stale_minutes", 10)), 1, 1440, DEFAULT_CONFIG["pi_hub_quote_stale_minutes"])
 
         channel = url_decode(str(form.get("update_channel", config["update_channel"]))).strip().lower()
         config["update_channel"] = channel if channel in ("stable", "beta") else "stable"
@@ -2981,6 +5938,8 @@ def build_ota_status_summary(manifest=None):
     beta_version = "unknown"
     selected_version = "unknown"
     selected_url = "unknown"
+    selected_hash = "not provided"
+    selected_hardware = "not provided"
 
     if manifest:
         manifest_state = "OK"
@@ -2995,8 +5954,14 @@ def build_ota_status_summary(manifest=None):
         selected_version = str(info.get("version", "unknown"))
         selected_url = str(info.get("app_url", "unknown"))
 
+        if str(info.get("sha256", "")).strip():
+            selected_hash = "provided"
+        selected_hardware = str(info.get("hardware", "not provided"))
+
     return (
         "Current Version: {}<br>"
+        "Device Model: {}<br>"
+        "Config Schema: {}<br>"
         "Current Channel: {}<br>"
         "Manifest URL: {}<br>"
         "Manifest Status: {}<br>"
@@ -3004,10 +5969,15 @@ def build_ota_status_summary(manifest=None):
         "Beta Online: {}<br>"
         "Selected Version: {}<br>"
         "Selected URL: {}<br>"
+        "Selected Hardware: {}<br>"
+        "SHA-256: {}<br>"
         "Backup File: {}<br>"
+        "Protected Settings: config, WiFi, symbols, holidays, device ID<br>"
         "Last OTA Message: {}"
     ).format(
         APP_VERSION,
+        DEVICE_MODEL,
+        config.get("config_schema_version", CONFIG_SCHEMA_VERSION),
         channel,
         config.get("update_manifest_url", ""),
         manifest_state,
@@ -3015,9 +5985,12 @@ def build_ota_status_summary(manifest=None):
         beta_version,
         selected_version,
         selected_url,
+        selected_hardware,
+        selected_hash,
         backup_state,
         ota_message
     )
+
 
 @server.route("/check-cloud-status", methods=["POST"])
 def check_cloud_status(request: Request):
@@ -3027,6 +6000,7 @@ def check_cloud_status(request: Request):
     quote_ok = False
     calendar_ok = False
     wifi_ok = False
+    portfolio_ok = None
 
     try:
         wifi_ok = wifi.radio.connected
@@ -3064,16 +6038,31 @@ def check_cloud_status(request: Request):
     except Exception:
         calendar_ok = False
 
+    if is_portfolio_enabled():
+        try:
+            caps = fetch_bridge_capabilities(True)
+            portfolio_ok = bool(caps.get("available", False))
+        except Exception:
+            portfolio_ok = False
+
+    portfolio_text = "OFF"
+    if portfolio_ok is True:
+        portfolio_text = "OK"
+    elif portfolio_ok is False:
+        portfolio_text = "ERROR"
+
     cloud_status_message = (
         "WiFi: {}<br>"
         "OTA Server: {}<br>"
         "Quote API: {}<br>"
+        "Portfolio Bridge: {}<br>"
         "Time Sync: {}<br>"
         "Market Calendar: {}"
     ).format(
         "OK" if wifi_ok else "ERROR",
         "OK" if ota_ok else "ERROR",
         "OK" if quote_ok else "ERROR",
+        portfolio_text,
         "OK" if time_sync_ok else "ERROR",
         "OK" if calendar_ok else "ERROR"
     )
@@ -3103,17 +6092,20 @@ def check_ota_status(request: Request):
     return Response(request, clean_page("OTA Status Checked", "OTA status section updated."), content_type="text/html")
 
 
-LAUNCHER_CODE = r'''# code.py - AUTO_RECOVERY_LAUNCHER_V1
-# Safe launcher for StockTicker. It restores app_backup.py after repeated app.py crashes.
+LAUNCHER_CODE = r'''# code.py - AUTO_RECOVERY_LAUNCHER_V2
+# StockTicker crash watchdog. It restores app_backup.py after repeated failures
+# and records the rollback in ota_journal.json.
 
 import time
 import json
 import microcontroller
 
 CRASH_FILE = "/crash_count.json"
+JOURNAL_FILE = "/ota_journal.json"
 APP_PATH = "/app.py"
 BACKUP_PATH = "/app_backup.py"
-MAX_CRASHES = 3
+MAX_NORMAL_CRASHES = 3
+MAX_PENDING_UPDATE_CRASHES = 2
 
 
 def load_json(path, default):
@@ -3142,25 +6134,61 @@ def exists(path):
 
 
 def copy_file(src, dst):
+    total = 0
     with open(src, "rb") as source:
-        data = source.read()
-    with open(dst, "wb") as target:
-        target.write(data)
+        with open(dst, "wb") as target:
+            while True:
+                chunk = source.read(1024)
+                if not chunk:
+                    break
+                target.write(chunk)
+                total += len(chunk)
+    if total <= 0:
+        raise OSError("Backup file was empty")
 
 
 def increment_crash_count(error_text):
     info = load_json(CRASH_FILE, {})
-    count = int(info.get("count", 0)) + 1
+    count = int(info.get("count", 0) or 0) + 1
     info["count"] = count
     info["last_error"] = str(error_text)[:180]
+    info["boot_confirmed"] = False
     save_json(CRASH_FILE, info)
     return count
 
 
-def restore_backup_and_reset():
+def update_journal_for_rollback(error_text):
+    journal = load_json(JOURNAL_FILE, {})
+    update = journal.get("last_update", {})
+    boot = journal.get("boot", {})
+    update["stage"] = "launcher_rollback"
+    update["result"] = "rolled_back"
+    update["rollback"] = "automatic_launcher"
+    update["boot_validation"] = "failed"
+    update["restart"] = "rollback_restart"
+    update["error"] = str(error_text)[:240]
+    boot["pending"] = False
+    boot["health"] = "automatic_launcher_rollback"
+    journal["last_update"] = update
+    journal["boot"] = boot
+    save_json(JOURNAL_FILE, journal)
+
+
+def pending_update_boot():
+    journal = load_json(JOURNAL_FILE, {})
+    boot = journal.get("boot", {})
+    return bool(boot.get("pending", False))
+
+
+def restore_backup_and_reset(error_text):
     print("AUTO RECOVERY: restoring app_backup.py to app.py")
     copy_file(BACKUP_PATH, APP_PATH)
-    save_json(CRASH_FILE, {"count": 0, "restored_backup": True})
+    update_journal_for_rollback(error_text)
+    save_json(CRASH_FILE, {
+        "count": 0,
+        "restored_backup": True,
+        "last_error": str(error_text)[:180]
+    })
     time.sleep(1)
     microcontroller.reset()
 
@@ -3178,11 +6206,16 @@ except Exception as e:
         pass
 
     crashes = increment_crash_count(repr(e))
-    print("Crash count:", crashes)
+    threshold = (
+        MAX_PENDING_UPDATE_CRASHES
+        if pending_update_boot()
+        else MAX_NORMAL_CRASHES
+    )
+    print("Crash count:", crashes, "threshold:", threshold)
 
-    if crashes >= MAX_CRASHES and exists(BACKUP_PATH):
+    if crashes >= threshold and exists(BACKUP_PATH):
         try:
-            restore_backup_and_reset()
+            restore_backup_and_reset(repr(e))
         except Exception as restore_error:
             print("AUTO RECOVERY RESTORE FAILED:", repr(restore_error))
 
@@ -3193,6 +6226,32 @@ except Exception as e:
         while True:
             time.sleep(1)
 '''
+
+
+def upgrade_managed_launcher_if_needed():
+    try:
+        existing = ""
+        try:
+            with open("/code.py", "r") as f:
+                existing = f.read()
+        except Exception:
+            return False, "No managed launcher found."
+
+        if (
+            "AUTO_RECOVERY_LAUNCHER_V1" not in existing
+            and "AUTO_RECOVERY_LAUNCHER_V2" not in existing
+        ):
+            return False, "Custom code.py preserved."
+
+        if "AUTO_RECOVERY_LAUNCHER_V2" in existing:
+            return True, "V2 launcher already installed."
+
+        with open("/code.py", "w") as f:
+            f.write(LAUNCHER_CODE)
+        return True, "Managed launcher upgraded to V2."
+    except Exception as e:
+        return False, "Managed launcher upgrade failed: " + repr(e)
+
 
 @server.route("/check-release-notes", methods=["POST"])
 def check_release_notes(request: Request):
@@ -3221,7 +6280,7 @@ def install_auto_recovery(request: Request):
         with open("/code.py", "w") as f:
             f.write(LAUNCHER_CODE)
 
-        auto_recovery_message = "Auto-recovery launcher installed to code.py. It activates on the next restart."
+        auto_recovery_message = "Auto-recovery V2 watchdog installed to code.py. It activates on the next restart."
         set_web_message(auto_recovery_message)
 
         return Response(request, clean_page("Auto-Recovery Installed", auto_recovery_message), content_type="text/html")
@@ -3232,9 +6291,928 @@ def install_auto_recovery(request: Request):
         return Response(request, clean_page("Install Failed", last_error_message), content_type="text/html")
 
 
+def ota_free_disk_bytes():
+    try:
+        stat = os.statvfs("/")
+        return int(stat[0]) * int(stat[3])
+    except Exception:
+        return -1
+
+
+def ota_free_memory_bytes():
+    try:
+        gc.collect()
+        return int(gc.mem_free())
+    except Exception:
+        return -1
+
+
+def ota_write_test():
+    try:
+        with open(OTA_WRITE_TEST_FILE, "wb") as f:
+            f.write(b"StockTicker OTA write test")
+        with open(OTA_WRITE_TEST_FILE, "rb") as f:
+            ok = f.read() == b"StockTicker OTA write test"
+        try:
+            os.remove(OTA_WRITE_TEST_FILE)
+        except Exception:
+            pass
+        if not ok:
+            return False, "Filesystem write test did not read back correctly."
+        return True, "Filesystem is writable."
+    except Exception as e:
+        try:
+            os.remove(OTA_WRITE_TEST_FILE)
+        except Exception:
+            pass
+        return False, "Filesystem is not writable: " + repr(e)
+
+
+def ota_sha_self_test():
+    try:
+        hasher, mode = create_sha256_hasher()
+        hasher.update(b"abc")
+        digest = "".join("{:02x}".format(b) for b in hasher.digest())
+        expected = (
+            "ba7816bf8f01cfea414140de5dae2223"
+            "b00361a396177a9cb410ff61f20015ad"
+        )
+        if digest != expected:
+            return False, "SHA-256 self-test failed."
+        return True, "SHA-256 verifier passed ({})".format(mode)
+    except Exception as e:
+        return False, "SHA-256 verifier unavailable: " + repr(e)
+
+
+def ota_preflight_checks(info=None):
+    checks = []
+
+    def add(ok, label_text, detail):
+        checks.append({
+            "ok": bool(ok),
+            "label": str(label_text),
+            "detail": str(detail)
+        })
+
+    add(
+        bool(wifi.radio.connected),
+        "WiFi connection",
+        "Connected" if wifi.radio.connected else "WiFi is offline"
+    )
+    add(
+        file_exists(APP_PATH),
+        "Current firmware readable",
+        file_size_text(APP_PATH)
+    )
+
+    write_ok, write_message = ota_write_test()
+    add(write_ok, "Filesystem writable", write_message)
+
+    free_memory = ota_free_memory_bytes()
+    memory_ok = free_memory < 0 or free_memory >= 18000
+    add(
+        memory_ok,
+        "Free memory",
+        "{} bytes".format(free_memory) if free_memory >= 0 else "unavailable"
+    )
+
+    expected_size = 0
+    if isinstance(info, dict):
+        try:
+            expected_size = int(info.get("size", 0) or 0)
+        except Exception:
+            expected_size = 0
+    try:
+        current_size = int(os.stat(APP_PATH)[6])
+    except Exception:
+        current_size = 0
+
+    if expected_size <= 0:
+        expected_size = max(current_size, 1000)
+
+    required_disk = expected_size + current_size + 32768
+    free_disk = ota_free_disk_bytes()
+    disk_ok = free_disk < 0 or free_disk >= required_disk
+    add(
+        disk_ok,
+        "Free storage",
+        "{} bytes free; {} required".format(free_disk, required_disk)
+        if free_disk >= 0 else "unavailable"
+    )
+
+    if isinstance(info, dict):
+        version = str(info.get("version", "")).strip()
+        app_url = str(info.get("app_url", "")).strip()
+        add(bool(version), "Manifest version", version or "missing")
+        add(app_url.startswith("http"), "Firmware URL", strip_url_query(app_url))
+
+        hardware = info.get("hardware", [])
+        if isinstance(hardware, str):
+            hardware = [hardware]
+        hardware_ok = not hardware or DEVICE_MODEL in hardware
+        add(
+            hardware_ok,
+            "Hardware compatibility",
+            str(hardware or "not restricted")
+        )
+
+        try:
+            minimum_schema = int(info.get("minimum_config_schema", 0) or 0)
+        except Exception:
+            minimum_schema = 999999
+        add(
+            minimum_schema <= CONFIG_SCHEMA_VERSION,
+            "Configuration schema",
+            "device {} / required {}".format(
+                CONFIG_SCHEMA_VERSION,
+                minimum_schema
+            )
+        )
+
+        raw_size = info.get("size", None)
+        if raw_size is not None:
+            try:
+                manifest_size = int(raw_size)
+                size_ok = manifest_size >= 1000
+            except Exception:
+                manifest_size = 0
+                size_ok = False
+            add(
+                size_ok,
+                "Manifest firmware size",
+                "{} bytes".format(manifest_size) if size_ok else "invalid"
+            )
+
+        expected_hash = str(info.get("sha256", "")).strip().lower()
+        if expected_hash:
+            hash_format_ok = len(expected_hash) == 64
+            if hash_format_ok:
+                for ch in expected_hash:
+                    if ch not in "0123456789abcdef":
+                        hash_format_ok = False
+                        break
+            add(
+                hash_format_ok,
+                "Manifest SHA-256 format",
+                "64 hexadecimal characters" if hash_format_ok else "invalid"
+            )
+            sha_ok, sha_message = ota_sha_self_test()
+            add(sha_ok, "SHA-256 verifier", sha_message)
+        else:
+            add(True, "SHA-256 verifier", "Not requested by manifest")
+    else:
+        add(False, "Manifest", "A valid manifest was not available")
+
+    add(
+        bool(file_exists(BACKUP_APP_PATH) or write_ok),
+        "Rollback path",
+        "Existing backup found" if file_exists(BACKUP_APP_PATH)
+        else "Backup will be created before installation"
+    )
+
+    return all(item["ok"] for item in checks), checks
+
+
+def ota_preflight_text(info=None):
+    ok, checks = ota_preflight_checks(info)
+    lines = ["PASS" if ok else "BLOCKED"]
+    for item in checks:
+        lines.append("{} - {}: {}".format(
+            "OK" if item["ok"] else "ERROR",
+            item["label"],
+            item["detail"]
+        ))
+    return ok, "<br>".join(safe_html(line) for line in lines)
+
+
+@server.route("/run-update-preflight", methods=["POST"])
+def run_update_preflight_route(request: Request):
+    global preflight_message
+
+    manifest = fetch_update_manifest()
+    info = get_channel_info(manifest) if manifest else None
+    ok, preflight_message = ota_preflight_text(info)
+    if ok:
+        set_web_message("OTA pre-installation checks passed.")
+    else:
+        set_error_message("OTA pre-installation checks found a blocking issue.")
+
+    return Response(
+        request,
+        clean_page(
+            "Preflight Complete",
+            "All checks passed." if ok else "One or more checks blocked installation."
+        ),
+        content_type="text/html"
+    )
+
+
+def ota_protected_settings_snapshot():
+    snapshot = {}
+
+    for path in (
+        CONFIG_FILE,
+        WIFI_FILE,
+        SYMBOLS_FILE,
+        HOLIDAYS_FILE,
+        DEVICE_FILE
+    ):
+        try:
+            snapshot[path] = os.stat(path)[6]
+        except Exception:
+            snapshot[path] = None
+
+    return snapshot
+
+
+def ota_job_active():
+    return bool(ota_job.get("active", False))
+
+
+def ota_job_elapsed():
+    started = float(ota_job.get("started", 0) or 0)
+    if started <= 0:
+        return 0
+    return max(0, int(time.monotonic() - started))
+
+
+def ota_job_public_status():
+    return {
+        "active": ota_job_active(),
+        "stage": str(ota_job.get("stage", "idle")),
+        "percent": int(ota_job.get("percent", 0) or 0),
+        "message": str(ota_job.get("message", "")),
+        "detail": str(ota_job.get("detail", "")),
+        "latest": str(ota_job.get("latest", "")),
+        "bytes_done": int(ota_job.get("bytes_done", 0) or 0),
+        "bytes_total": int(ota_job.get("bytes_total", 0) or 0),
+        "elapsed_seconds": ota_job_elapsed(),
+        "restart_seconds": int(ota_job.get("restart_seconds", 0) or 0),
+        "error": str(ota_job.get("error", ""))
+    }
+
+
+def ota_job_set(stage, percent, message, detail=""):
+    previous_stage = str(ota_job.get("stage", ""))
+    ota_job["stage"] = stage
+    ota_job["percent"] = max(0, min(100, int(percent)))
+    ota_job["message"] = str(message)
+    ota_job["detail"] = str(detail)
+    ota_job["updated"] = time.monotonic()
+    if str(stage) != previous_stage:
+        ota_journal_set_stage(stage, message)
+
+
+def ota_close_resource(name):
+    resource = ota_job.get(name)
+    if resource is not None:
+        try:
+            resource.close()
+        except Exception:
+            pass
+    ota_job[name] = None
+
+
+def ota_cleanup_resources():
+    ota_close_resource("file")
+    ota_close_resource("source")
+    ota_close_resource("target")
+    ota_close_resource("response")
+    ota_job["iterator"] = None
+
+
+def ota_remove_file(path):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
+def ota_job_fail(message):
+    global ota_message
+
+    failed_stage = str(ota_job.get("stage", ""))
+    ota_cleanup_resources()
+
+    rollback_state = "not_needed"
+    if failed_stage in ("installing", "restarting") and file_exists(BACKUP_APP_PATH):
+        rollback_ok, rollback_message = rollback_to_backup()
+        if rollback_ok:
+            rollback_state = "automatic_immediate"
+            message = str(message) + " Previous firmware restored."
+        else:
+            rollback_state = "automatic_failed"
+            message = (
+                str(message)
+                + " Automatic rollback failed: "
+                + str(rollback_message)
+            )
+
+    ota_journal_fail(message, rollback_state)
+    ota_job["active"] = False
+    ota_job["stage"] = "error"
+    ota_job["percent"] = 0
+    ota_job["message"] = "Update failed"
+    ota_job["detail"] = str(message)
+    ota_job["error"] = str(message)
+    ota_message = str(message)
+    ota_remove_file(OTA_TEMP_PATH)
+    ota_remove_file(OTA_BACKUP_TEMP_PATH)
+    set_error_message(str(message))
+
+
+def start_ota_job():
+    global ota_message
+
+    ota_cleanup_resources()
+
+    ota_job.update({
+        "active": True,
+        "stage": "queued",
+        "percent": 1,
+        "message": "Update queued",
+        "detail": "Preparing the update job.",
+        "started": time.monotonic(),
+        "updated": time.monotonic(),
+        "latest": "",
+        "app_url": "",
+        "manifest": None,
+        "info": None,
+        "response": None,
+        "iterator": None,
+        "file": None,
+        "source": None,
+        "target": None,
+        "hasher": None,
+        "hash_mode": "not requested",
+        "expected_hash": "",
+        "expected_size": None,
+        "bytes_done": 0,
+        "bytes_total": 0,
+        "copy_done": 0,
+        "copy_total": 0,
+        "protected_before": None,
+        "payload_message": "",
+        "error": "",
+        "restart_seconds": 0
+    })
+
+    ota_journal_start()
+    ota_message = "Update processing started. Open progress to monitor it."
+    add_event("OTA update job queued.")
+
+
+def ota_processing_page():
+    return """<!DOCTYPE html>
+<html>
+<head>
+<title>StockTicker Update</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }
+.wrap { max-width:720px; margin:6vh auto; }
+.card { background:#101b2e; border:1px solid #31527f; border-radius:20px; padding:22px; box-shadow:0 18px 45px rgba(0,0,0,.3); }
+.kicker { color:#79c7ff; font-size:12px; font-weight:bold; letter-spacing:1.3px; text-transform:uppercase; }
+.track { height:16px; background:#1a2a40; border-radius:999px; overflow:hidden; margin:18px 0 8px; }
+.fill { height:100%; width:0%; background:linear-gradient(90deg,#2b8cff,#29bb73); transition:width .25s ease; }
+.row { display:flex; justify-content:space-between; gap:12px; color:#a9bddb; font-size:13px; }
+.message { font-size:20px; font-weight:bold; margin-top:16px; }
+.detail { color:#b9cbe4; line-height:1.5; min-height:44px; }
+.error { color:#ff8b8b; }
+a { color:#79c7ff; }
+</style>
+</head>
+<body>
+<div class="wrap"><div class="card">
+<div class="kicker">Protected OTA Update</div>
+<h1>Update Processing</h1>
+<p>The dashboard and ticker remain available while the update advances in small steps.</p>
+<div class="track"><div class="fill" id="fill"></div></div>
+<div class="row"><span id="percent">0%</span><span id="elapsed">0s</span></div>
+<div class="message" id="message">Starting update...</div>
+<p class="detail" id="detail">Please keep the ticker powered on.</p>
+<p id="bytes"></p>
+<p><a href="/">Open Dashboard</a></p>
+</div></div>
+<script>
+let redirectScheduled=false;
+async function pollStatus(){
+  try {
+    const response=await fetch('/update-status?cb='+Date.now(),{cache:'no-store'});
+    const data=await response.json();
+    const pct=Math.max(0,Math.min(100,Number(data.percent||0)));
+    document.getElementById('fill').style.width=pct+'%';
+    document.getElementById('percent').textContent=pct+'% · '+String(data.stage||'');
+    document.getElementById('elapsed').textContent=String(data.elapsed_seconds||0)+'s';
+    document.getElementById('message').textContent=String(data.message||'');
+    document.getElementById('detail').textContent=String(data.detail||'');
+    const done=Number(data.bytes_done||0), total=Number(data.bytes_total||0);
+    document.getElementById('bytes').textContent=total>0 ? done.toLocaleString()+' / '+total.toLocaleString()+' bytes' : '';
+    if(data.stage==='error'){
+      document.getElementById('message').classList.add('error');
+      return;
+    }
+    if(data.stage==='restarting' && !redirectScheduled){
+      redirectScheduled=true;
+      const seconds=Number(data.restart_seconds||8);
+      document.getElementById('detail').textContent='Restarting in '+seconds+' seconds. This page will reconnect automatically.';
+      setTimeout(function(){ window.location.href='/'; }, (seconds+5)*1000);
+    }
+  } catch(error) {
+    if(redirectScheduled){
+      setTimeout(function(){ window.location.href='/'; }, 3000);
+    }
+  }
+}
+setInterval(pollStatus,1000);
+pollStatus();
+</script>
+</body>
+</html>"""
+
+
+def build_ota_job_panel_html():
+    stage = str(ota_job.get("stage", "idle"))
+
+    if stage == "idle":
+        return ""
+
+    percent = int(ota_job.get("percent", 0) or 0)
+    message = safe_html(ota_job.get("message", ""))
+    detail = safe_html(ota_job.get("detail", ""))
+    css_class = "ota-error" if stage == "error" else "ota-active"
+
+    return (
+        "<div class='ota-progress'>"
+        "<b class='{}'>{}</b>"
+        "<div class='ota-track'><div class='ota-fill' style='width:{}%'></div></div>"
+        "<div class='small'>{}% · {}<br>{}</div>"
+        "<a href='/update-progress'>Open Live Update Progress</a>"
+        "</div>"
+    ).format(
+        css_class,
+        message,
+        percent,
+        percent,
+        safe_html(stage),
+        detail
+    )
+
+
+def ota_read_content_length(response):
+    try:
+        headers = response.headers
+        raw = headers.get("content-length", headers.get("Content-Length", "0"))
+        return int(raw or 0)
+    except Exception:
+        return 0
+
+
+def ota_promote_backup_temp():
+    try:
+        ota_remove_file(OTA_BACKUP_PREVIOUS_PATH)
+
+        if file_exists(BACKUP_APP_PATH):
+            try:
+                os.rename(BACKUP_APP_PATH, OTA_BACKUP_PREVIOUS_PATH)
+            except Exception:
+                ota_remove_file(OTA_BACKUP_PREVIOUS_PATH)
+                ok, msg = copy_file_safe(
+                    BACKUP_APP_PATH,
+                    OTA_BACKUP_PREVIOUS_PATH
+                )
+                if not ok:
+                    return False, msg
+                ota_remove_file(BACKUP_APP_PATH)
+
+        try:
+            os.rename(OTA_BACKUP_TEMP_PATH, BACKUP_APP_PATH)
+        except Exception:
+            ok, msg = copy_file_safe(
+                OTA_BACKUP_TEMP_PATH,
+                BACKUP_APP_PATH
+            )
+            if not ok:
+                if (
+                    not file_exists(BACKUP_APP_PATH)
+                    and file_exists(OTA_BACKUP_PREVIOUS_PATH)
+                ):
+                    copy_file_safe(
+                        OTA_BACKUP_PREVIOUS_PATH,
+                        BACKUP_APP_PATH
+                    )
+                return False, msg
+            ota_remove_file(OTA_BACKUP_TEMP_PATH)
+
+        return True, "Rollback backup prepared."
+
+    except Exception as e:
+        return False, "Backup promotion failed: " + repr(e)
+
+
+def ota_verify_downloaded_file():
+    info = ota_job.get("info") or {}
+    latest = str(ota_job.get("latest", "")).strip()
+    actual_size = int(ota_job.get("bytes_done", 0) or 0)
+    expected_size = ota_job.get("expected_size")
+    expected_hash = str(ota_job.get("expected_hash", "")).lower()
+
+    if actual_size < 1000:
+        return False, "Downloaded app.py was too small."
+
+    try:
+        with open(OTA_TEMP_PATH, "rb") as f:
+            header = f.read(700).decode("utf-8")
+    except Exception as e:
+        return False, "Could not inspect downloaded app.py: " + repr(e)
+
+    if "APP.PY STARTED" not in header:
+        return False, "Downloaded file does not look like app.py."
+
+    expected_version_line = 'APP_VERSION = "{}"'.format(latest)
+    if expected_version_line not in header:
+        return False, "Downloaded app.py version does not match the manifest."
+
+    hardware = info.get("hardware", [])
+    if isinstance(hardware, str):
+        hardware = [hardware]
+    if hardware and DEVICE_MODEL not in hardware:
+        return False, "Update is not compatible with this hardware model."
+
+    try:
+        minimum_schema = int(info.get("minimum_config_schema", 0) or 0)
+    except Exception:
+        minimum_schema = 0
+    if minimum_schema > CONFIG_SCHEMA_VERSION:
+        return False, "Update requires a newer configuration schema."
+
+    if expected_size is not None:
+        try:
+            if actual_size != int(expected_size):
+                return False, "Downloaded app.py size does not match the manifest."
+        except Exception:
+            return False, "Manifest contains an invalid firmware size."
+
+    if expected_hash:
+        hasher = ota_job.get("hasher")
+        if hasher is None:
+            return False, "SHA-256 was requested but the verifier was not initialized."
+
+        digest = hasher.digest()
+        actual_hash = "".join(
+            "{:02x}".format(byte)
+            for byte in digest
+        ).lower()
+
+        if actual_hash != expected_hash:
+            return False, "Downloaded app.py failed SHA-256 verification."
+
+    checks = ["version", "hardware", "schema"]
+    if expected_size is not None:
+        checks.append("size")
+    if expected_hash:
+        checks.append("SHA-256 ({})".format(ota_job.get("hash_mode", "software")))
+
+    return True, "Update payload verified: " + ", ".join(checks) + "."
+
+
+def ota_job_step():
+    global ota_message, ota_status_message
+    global restart_requested, restart_time
+
+    if not ota_job_active():
+        return
+
+    stage = str(ota_job.get("stage", "queued"))
+
+    try:
+        if stage == "queued":
+            ota_job_set(
+                "manifest",
+                3,
+                "Checking update manifest",
+                "Contacting the configured OTA server."
+            )
+            return
+
+        if stage == "manifest":
+            manifest = fetch_update_manifest()
+            if manifest is None:
+                ota_job_fail("Could not download a valid update manifest.")
+                return
+
+            info = get_channel_info(manifest)
+            latest = str(info.get("version", "")).strip()
+            app_url = str(info.get("app_url", "")).strip()
+
+            if not latest:
+                ota_job_fail("Manifest is missing the update version.")
+                return
+            if latest == APP_VERSION:
+                ota_cleanup_resources()
+                ota_job["active"] = False
+                ota_job_set("complete", 100, "Already up to date", latest)
+                ota_message = "Already up to date."
+                return
+            if not app_url.startswith("http"):
+                ota_job_fail("Manifest contains a bad update file URL.")
+                return
+
+            expected_hash = str(info.get("sha256", "")).strip().lower()
+            expected_size = info.get("size", None)
+
+            ota_job["manifest"] = manifest
+            ota_job["info"] = info
+            ota_job["latest"] = latest
+            ota_job["app_url"] = app_url
+            ota_job["expected_hash"] = expected_hash
+            ota_job["expected_size"] = expected_size
+            ota_status_message = build_ota_status_summary(manifest)
+
+            ota_journal_set_fields(
+                to_version=latest,
+                app_url=strip_url_query(app_url),
+                verification="pending",
+                backup="pending",
+                installation="pending",
+                restart="pending",
+                boot_validation="pending"
+            )
+
+            preflight_ok, preflight_checks = ota_preflight_checks(info)
+            if not preflight_ok:
+                failures = []
+                for item in preflight_checks:
+                    if not item.get("ok"):
+                        failures.append(
+                            "{}: {}".format(item.get("label"), item.get("detail"))
+                        )
+                ota_job_fail(
+                    "Pre-installation checks failed. " + "; ".join(failures)
+                )
+                return
+
+            ota_journal_set_fields(preflight="passed")
+            ota_job_set(
+                "open_download",
+                6,
+                "Opening firmware download",
+                latest
+            )
+            return
+
+        if stage == "open_download":
+            ota_remove_file(OTA_TEMP_PATH)
+            response = requests.get(
+                ota_job.get("app_url", ""),
+                stream=True
+            )
+
+            try:
+                status_code = int(response.status_code)
+            except Exception:
+                status_code = 200
+
+            if status_code != 200:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                ota_job_fail(
+                    "Firmware server returned HTTP {}.".format(status_code)
+                )
+                return
+
+            ota_job["response"] = response
+            ota_job["iterator"] = response.iter_content(
+                chunk_size=OTA_STREAM_CHUNK_SIZE,
+                decode_unicode=False
+            )
+            ota_job["file"] = open(OTA_TEMP_PATH, "wb")
+            ota_job["bytes_done"] = 0
+
+            total = 0
+            try:
+                if ota_job.get("expected_size") is not None:
+                    total = int(ota_job.get("expected_size"))
+            except Exception:
+                total = 0
+            if total <= 0:
+                total = ota_read_content_length(response)
+            ota_job["bytes_total"] = total
+
+            if ota_job.get("expected_hash"):
+                hasher, mode = create_sha256_hasher()
+                ota_job["hasher"] = hasher
+                ota_job["hash_mode"] = mode
+
+            ota_job_set(
+                "downloading",
+                8,
+                "Downloading and verifying firmware",
+                "The dashboard remains available during streaming verification."
+            )
+            return
+
+        if stage == "downloading":
+            iterator = ota_job.get("iterator")
+            target = ota_job.get("file")
+
+            try:
+                chunk = next(iterator)
+            except StopIteration:
+                chunk = None
+
+            if chunk is None:
+                ota_close_resource("file")
+                ota_close_resource("response")
+                ota_job["iterator"] = None
+                ota_job_set(
+                    "verify",
+                    72,
+                    "Finalizing integrity verification",
+                    "Checking version, hardware, schema, size, and SHA-256."
+                )
+                return
+
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+
+            if chunk:
+                target.write(chunk)
+                ota_job["bytes_done"] += len(chunk)
+
+                hasher = ota_job.get("hasher")
+                if hasher is not None:
+                    hasher.update(chunk)
+
+                done = int(ota_job.get("bytes_done", 0))
+                total = int(ota_job.get("bytes_total", 0) or 0)
+                percent = 8
+                if total > 0:
+                    percent = 8 + int(min(1.0, done / total) * 62)
+                else:
+                    percent = min(68, 8 + int(done / 4096))
+
+                ota_job_set(
+                    "downloading",
+                    percent,
+                    "Downloading and verifying firmware",
+                    "{} bytes received.".format(done)
+                )
+            return
+
+        if stage == "verify":
+            ok, message = ota_verify_downloaded_file()
+            if not ok:
+                ota_job_fail(message)
+                return
+
+            ota_job["payload_message"] = message
+            ota_journal_set_fields(verification="passed")
+            ota_job["protected_before"] = ota_protected_settings_snapshot()
+            ota_remove_file(OTA_BACKUP_TEMP_PATH)
+            ota_job["source"] = open(APP_PATH, "rb")
+            ota_job["target"] = open(OTA_BACKUP_TEMP_PATH, "wb")
+            try:
+                ota_job["copy_total"] = int(os.stat(APP_PATH)[6])
+            except Exception:
+                ota_job["copy_total"] = 0
+            ota_job["copy_done"] = 0
+            ota_job_set(
+                "backup",
+                74,
+                "Creating rollback backup",
+                "The current working firmware is being preserved."
+            )
+            return
+
+        if stage == "backup":
+            source = ota_job.get("source")
+            target = ota_job.get("target")
+            chunk = source.read(OTA_COPY_CHUNK_SIZE)
+
+            if chunk:
+                target.write(chunk)
+                ota_job["copy_done"] += len(chunk)
+                total = int(ota_job.get("copy_total", 0) or 0)
+                done = int(ota_job.get("copy_done", 0) or 0)
+                percent = 74 + int(min(1.0, done / total) * 10) if total else 78
+                ota_job_set(
+                    "backup",
+                    percent,
+                    "Creating rollback backup",
+                    "{} bytes copied.".format(done)
+                )
+                return
+
+            ota_close_resource("source")
+            ota_close_resource("target")
+            ok, message = ota_promote_backup_temp()
+            if not ok:
+                ota_job_fail("OTA stopped. " + message)
+                return
+
+            ota_journal_set_fields(backup="created")
+            ota_job["source"] = open(OTA_TEMP_PATH, "rb")
+            ota_job["target"] = open(APP_PATH, "wb")
+            ota_job["copy_total"] = int(ota_job.get("bytes_done", 0) or 0)
+            ota_job["copy_done"] = 0
+            ota_job_set(
+                "installing",
+                85,
+                "Installing verified firmware",
+                "Rollback protection is ready."
+            )
+            return
+
+        if stage == "installing":
+            source = ota_job.get("source")
+            target = ota_job.get("target")
+            chunk = source.read(OTA_COPY_CHUNK_SIZE)
+
+            if chunk:
+                target.write(chunk)
+                ota_job["copy_done"] += len(chunk)
+                total = int(ota_job.get("copy_total", 0) or 0)
+                done = int(ota_job.get("copy_done", 0) or 0)
+                percent = 85 + int(min(1.0, done / total) * 11) if total else 90
+                ota_job_set(
+                    "installing",
+                    percent,
+                    "Installing verified firmware",
+                    "{} bytes written.".format(done)
+                )
+                return
+
+            ota_close_resource("source")
+            ota_close_resource("target")
+
+            protected_after = ota_protected_settings_snapshot()
+            if protected_after != ota_job.get("protected_before"):
+                ota_job_fail(
+                    "Protected settings changed unexpectedly."
+                )
+                return
+
+            ota_remove_file(OTA_TEMP_PATH)
+            ota_journal_mark_pending_boot(ota_job.get("latest", ""))
+            ota_job_set(
+                "restarting",
+                100,
+                "Update installed successfully",
+                "Restarting into {}.".format(ota_job.get("latest", "new firmware"))
+            )
+            ota_job["restart_seconds"] = 8
+            ota_message = "Installed version {}. Restarting...".format(
+                ota_job.get("latest", "")
+            )
+            set_web_message(
+                ota_message + " " + str(ota_job.get("payload_message", ""))
+            )
+            add_event("OTA install completed; restart scheduled.")
+            restart_requested = True
+            restart_time = time.monotonic() + 8.0
+            return
+
+        if stage == "restarting":
+            remaining = max(0, int(restart_time - time.monotonic()) + 1)
+            ota_job["restart_seconds"] = remaining
+            ota_job["detail"] = "Restarting in {} seconds.".format(remaining)
+            return
+
+    except Exception as e:
+        ota_job_fail("OTA job error: " + repr(e))
+
+
+@server.route("/update-status")
+def update_status_route(request: Request):
+    return Response(
+        request,
+        json.dumps(ota_job_public_status()),
+        content_type="application/json"
+    )
+
+
+@server.route("/update-progress")
+def update_progress_route(request: Request):
+    return Response(
+        request,
+        ota_processing_page(),
+        content_type="text/html"
+    )
+
+
 @server.route("/check-update", methods=["POST"])
 def check_update(request: Request):
     global ota_message, ota_status_message
+
+    if ota_job_active():
+        return Response(
+            request,
+            ota_processing_page(),
+            content_type="text/html"
+        )
 
     manifest = fetch_update_manifest()
 
@@ -3250,95 +7228,57 @@ def check_update(request: Request):
         else:
             ota_message = "You are up to date."
 
-    if manifest is None:
-        ota_status_message = build_ota_status_summary(None)
-    else:
-        ota_status_message = build_ota_status_summary(manifest)
-
+    ota_status_message = build_ota_status_summary(manifest)
     set_web_message(ota_message)
 
-    return Response(request, clean_page("Update Check Complete", ota_message), content_type="text/html")
+    return Response(
+        request,
+        clean_page("Update Check Complete", ota_message),
+        content_type="text/html"
+    )
 
 
 @server.route("/install-update", methods=["POST"])
 def install_update(request: Request):
-    global restart_requested, restart_time, ota_message, ota_status_message
+    global ota_message
 
-    form = request.form_data
-    entered_pin = url_decode(str(form.get("admin_pin", "")))
+    if ota_job_active():
+        return Response(
+            request,
+            ota_processing_page(),
+            content_type="text/html"
+        )
+
+    entered_pin = url_decode(str(request.form_data.get("admin_pin", "")))
 
     if entered_pin != str(config["admin_pin"]):
         ota_message = "Wrong admin PIN."
         set_error_message(ota_message)
-        return Response(request, clean_page("Update Blocked", ota_message), content_type="text/html")
+        return Response(
+            request,
+            clean_page("Update Blocked", ota_message),
+            content_type="text/html"
+        )
 
-    manifest = fetch_update_manifest()
+    start_ota_job()
 
-    if manifest is None:
-        ota_message = "Could not download update manifest."
-        return Response(request, clean_page("Update Failed", ota_message), content_type="text/html")
-
-    info = get_channel_info(manifest)
-    latest = str(info.get("version", ""))
-    app_url = str(info.get("app_url", ""))
-
-    if latest == APP_VERSION:
-        ota_message = "Already up to date."
-        return Response(request, clean_page("No Update Needed", ota_message), content_type="text/html")
-
-    if not app_url.startswith("http"):
-        ota_message = "Bad update file URL."
-        set_error_message(ota_message)
-        return Response(request, clean_page("Update Failed", ota_message), content_type="text/html")
-
-    try:
-        print("Downloading update:", app_url)
-
-        r = requests.get(app_url)
-        new_code = r.text
-        r.close()
-
-        if len(new_code) < 1000:
-            ota_message = "Downloaded app.py was too small."
-            set_error_message(ota_message)
-            return Response(request, clean_page("Update Failed", ota_message), content_type="text/html")
-
-        if "APP.PY STARTED" not in new_code:
-            ota_message = "Downloaded file does not look like app.py."
-            set_error_message(ota_message)
-            return Response(request, clean_page("Update Failed", ota_message), content_type="text/html")
-
-        backup_ok, backup_msg = backup_current_app()
-
-        if not backup_ok:
-            ota_message = "OTA stopped. Backup failed."
-            set_error_message("OTA stopped. " + backup_msg)
-            return Response(request, clean_page("Update Failed", last_error_message), content_type="text/html")
-
-        print(backup_msg)
-
-        with open(APP_PATH, "w") as app_file:
-            app_file.write(new_code)
-
-        ota_message = "Installed version {}. Restarting...".format(latest)
-        ota_status_message = build_ota_status_summary(manifest)
-        restart_requested = True
-        restart_time = time.monotonic() + 2.0
-        set_web_message(ota_message)
-
-        return Response(request, clean_page("Update Installed", ota_message), content_type="text/html")
-
-    except Exception as e:
-        ota_message = "Update failed."
-        set_error_message("OTA install error: " + repr(e))
-
-        return Response(request, clean_page("Update Failed", last_error_message), content_type="text/html")
-
+    return Response(
+        request,
+        ota_processing_page(),
+        content_type="text/html"
+    )
 
 
 @server.route("/rollback", methods=["POST"])
 def rollback_route(request: Request):
     global restart_requested, restart_time, ota_message, ota_status_message
+
+    if ota_job_active():
+        return Response(
+            request,
+            ota_processing_page(),
+            content_type="text/html"
+        )
 
     form = request.form_data
     entered_pin = url_decode(str(form.get("admin_pin", "")))
@@ -3354,6 +7294,20 @@ def rollback_route(request: Request):
         ota_message = "Rollback failed."
         set_error_message(msg)
         return Response(request, clean_page("Rollback Failed", msg), content_type="text/html")
+
+    ota_journal_set_fields(
+        stage="manual_rollback",
+        result="rolled_back",
+        rollback="manual",
+        boot_validation="not_applicable",
+        restart="scheduled",
+        finished_at=safe_journal_time()
+    )
+    boot = ota_journal.get("boot", {})
+    boot["pending"] = False
+    boot["health"] = "manual_rollback"
+    ota_journal["boot"] = boot
+    save_ota_journal()
 
     ota_message = "Rollback complete. Restarting..."
     ota_status_message = build_ota_status_summary(None)
@@ -3381,13 +7335,21 @@ def factory_reset(request: Request):
         files_to_remove = []
 
         if reset_type == "wifi":
-            files_to_remove = [WIFI_FILE]
+            files_to_remove = [
+                WIFI_FILE, WIFI_PENDING_FILE, WIFI_BACKUP_FILE,
+                WIFI_STATE_FILE, WIFI_FORCE_SETUP_FILE
+            ]
         elif reset_type == "settings":
             files_to_remove = [CONFIG_FILE]
         elif reset_type == "symbols":
             files_to_remove = [SYMBOLS_FILE]
         elif reset_type == "all":
-            files_to_remove = [WIFI_FILE, CONFIG_FILE, SYMBOLS_FILE, HOLIDAYS_FILE]
+            files_to_remove = [
+                WIFI_FILE, WIFI_PENDING_FILE, WIFI_BACKUP_FILE,
+                WIFI_STATE_FILE, WIFI_FORCE_SETUP_FILE,
+                CONFIG_FILE, SYMBOLS_FILE, HOLIDAYS_FILE,
+                OTA_JOURNAL_FILE, OTA_JOURNAL_BACKUP_FILE, CRASH_FILE
+            ]
 
         for path in files_to_remove:
             try:
@@ -3644,18 +7606,20 @@ def fetch_entries():
         hub_entries = fetch_entries_from_pi_hub()
         if hub_entries is not None:
             return hub_entries
+
         if not bool_from_form(config.get("pi_hub_fallback_direct", True)):
             entries = []
             for sym in SYMBOLS:
-                e = cached_or_error_quote(sym, "Pi hub unavailable")
+                e = cached_or_error_quote(sym, "Pi Hub unavailable")
                 entries.append(e)
                 last_good[sym] = e
             portfolio_entry = fetch_portfolio_entry()
             if portfolio_entry:
                 entries.append(portfolio_entry)
-            finalize_quote_batch(entries, "Pi hub unavailable")
+            finalize_quote_batch(entries, "Pi Hub unavailable")
             return entries
-        add_event("Pi hub unavailable; falling back to direct Finnhub.")
+
+        add_event("Pi Hub unavailable; falling back to direct Finnhub.")
 
     entries = []
 
@@ -3683,11 +7647,12 @@ def start_smooth_quote_refresh(reason):
     global smooth_refresh_active, smooth_refresh_index, refresh_requested, pending_entries
 
     refresh_requested = False
+
     if is_pi_hub_quote_source() and not is_demo_mode():
         new_entries = fetch_entries()
         if new_entries:
             pending_entries = new_entries[:]
-            add_event("Pi hub batch refresh queued: " + reason)
+            add_event("Pi Hub batch refresh queued: " + reason)
         smooth_refresh_active = False
         smooth_refresh_index = 0
         return
@@ -3884,10 +7849,14 @@ while True:
 
     now = time.monotonic()
 
+    ota_job_step()
+    boot_watchdog_step()
+    now = time.monotonic()
+
     if restart_requested and now >= restart_time:
         microcontroller.reset()
 
-    if now - last_ntp_sync >= 21600:
+    if not ota_job_active() and now - last_ntp_sync >= 21600:
         sync_time()
         last_ntp_sync = now
 
@@ -3929,10 +7898,10 @@ while True:
     full_scroll_done = completed_loops >= len(blocks)
 
     if SMOOTH_QUOTE_REFRESH:
-        if smooth_refresh_active and loop_completed:
+        if smooth_refresh_active and loop_completed and not ota_job_active():
             smooth_quote_refresh_step()
 
-        if (refresh_requested or time_for_quote_fetch) and full_scroll_done and not need_reload and not smooth_refresh_active:
+        if (refresh_requested or time_for_quote_fetch) and full_scroll_done and not need_reload and not smooth_refresh_active and not ota_job_active():
             completed_loops = 0
             last_quote_fetch = now
 
@@ -3942,7 +7911,7 @@ while True:
                 start_smooth_quote_refresh("scheduled refresh")
 
     else:
-        if (refresh_requested or (time_for_quote_fetch and full_scroll_done)) and not need_reload:
+        if (refresh_requested or (time_for_quote_fetch and full_scroll_done)) and not need_reload and not ota_job_active():
             completed_loops = 0
             refresh_requested = False
             last_quote_fetch = now
