@@ -1,7 +1,9 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.26-beta"
-CONFIG_SCHEMA_VERSION = 3
+APP_VERSION = "1.1.27-beta"
+CONFIG_SCHEMA_VERSION = 4
+# 1.1.27: fast visible startup, bounded bridge requests, API-v1 compatibility,
+# two-way health endpoint, mDNS bridge discovery, and automatic bridge URL updates.
 PORTFOLIO_API_SCHEMA_SUPPORTED = 1
 PORTFOLIO_PROCESSING_LOCATION = "Raspberry Pi bridge"
 PORTFOLIO_TICKER_ROLE = "Read-only sanitized API client"
@@ -280,6 +282,9 @@ DEFAULT_CONFIG = {
     "portfolio_privacy_mode": False,
     "portfolio_stale_minutes": 15,
     "portfolio_capabilities_refresh_minutes": 60,
+    "portfolio_auto_discover": True,
+    "portfolio_bridge_id": "",
+    "portfolio_request_timeout_seconds": 6,
     "mdns_enabled": True,
     "wifi_customer_manager": True
 }
@@ -427,6 +432,50 @@ def save_wifi_record(path, ssid, password):
         "ssid": str(ssid).strip(),
         "password": str(password)
     })
+
+
+def migrate_legacy_wifi_from_secrets():
+    """Create wifi_config.json once from an existing local secrets.py profile.
+
+    Customer operation never depends on secrets.py after migration. The WiFi
+    password is not printed, logged, or copied into support diagnostics.
+    """
+    current = load_json_file(WIFI_FILE, {})
+    pending = load_json_file(WIFI_PENDING_FILE, {})
+    backup = load_json_file(WIFI_BACKUP_FILE, {})
+
+    if (
+        valid_wifi_record(current)
+        or valid_wifi_record(pending)
+        or valid_wifi_record(backup)
+    ):
+        return False, "A managed WiFi profile already exists."
+
+    try:
+        legacy_ssid = str(secrets.get("ssid", "") or "").strip()
+        legacy_password = str(secrets.get("password", "") or "")
+    except Exception:
+        return False, "No readable legacy WiFi profile was found."
+
+    if not legacy_ssid:
+        return False, "No legacy WiFi network is configured."
+
+    if not wifi_password_is_valid(legacy_password, legacy_password == ""):
+        return False, "Legacy WiFi credentials are not valid for migration."
+
+    try:
+        save_wifi_record(WIFI_FILE, legacy_ssid, legacy_password)
+        wifi_state_save(
+            "legacy_migrated",
+            "Existing device WiFi was migrated into the managed WiFi profile.",
+            legacy_ssid,
+            ""
+        )
+        print("Legacy WiFi profile migrated to wifi_config.json.")
+        return True, "Legacy WiFi migrated."
+    except Exception as error:
+        print("Legacy WiFi migration failed:", repr(error))
+        return False, repr(error)
 
 
 def wifi_security_text(network):
@@ -1420,6 +1469,21 @@ def boot_watchdog_step():
     boot_watchdog_confirm_healthy()
 
 
+def record_startup_stage(stage, detail=""):
+    """Persist the latest startup checkpoint for post-rollback diagnosis."""
+    try:
+        boot = ota_journal.get("boot", {})
+        boot["startup_stage"] = str(stage)[:64]
+        boot["startup_detail"] = str(detail)[:180]
+        boot["startup_version"] = APP_VERSION
+        boot["startup_at"] = safe_journal_time()
+        ota_journal["boot"] = boot
+        save_ota_journal()
+        print("STARTUP STAGE:", stage, detail)
+    except Exception as error:
+        print("Startup-stage journal failed:", repr(error))
+
+
 config = load_config()
 ota_journal = load_ota_journal()
 boot_watchdog_pending = False
@@ -1427,9 +1491,11 @@ boot_health_confirmed = False
 boot_watchdog_message = "Boot validation has not started."
 boot_health_due = time.monotonic() + BOOT_HEALTH_DELAY_SECONDS
 boot_watchdog_begin()
+record_startup_stage("boot_watchdog_started", boot_watchdog_message)
 
 # DEV SAFE DEVICE ID
 # This avoids OSError(30) when CIRCUITPY is mounted on your laptop.
+record_startup_stage("loading_device_identity")
 try:
     device_info = load_device_info()
     DEVICE_ID = device_info["device_id"]
@@ -1517,6 +1583,8 @@ auto_recovery_message = "Auto-recovery launcher not checked yet."
 last_portfolio_entry = None
 last_portfolio_capabilities = {}
 last_portfolio_capabilities_check = 0
+last_bridge_discovery_check = 0
+last_bridge_discovery_message = "Bridge discovery has not run yet."
 last_portfolio_api_status = {
     "mode": "not_checked",
     "api_version": "unknown",
@@ -1821,6 +1889,11 @@ def start_mdns_service():
         try:
             mdns_server.advertise_service(
                 service_type="_http",
+                protocol="_tcp",
+                port=80
+            )
+            mdns_server.advertise_service(
+                service_type="_stockticker-s3",
                 protocol="_tcp",
                 port=80
             )
@@ -2149,30 +2222,31 @@ def portfolio_capabilities_url():
     return base + "/api/v1/capabilities"
 
 
-def bridge_request_json(url, key="", use_header=True):
+def bridge_request_json(url, key="", use_header=True, timeout_seconds=None):
     response = None
 
+    if timeout_seconds is None:
+        try:
+            timeout_seconds = int(config.get("portfolio_request_timeout_seconds", 6))
+        except Exception:
+            timeout_seconds = 6
+
+    timeout_seconds = max(2, min(20, int(timeout_seconds)))
+
     try:
+        headers = {"Connection": "close"}
         if use_header and key:
-            response = requests.get(
-                url,
-                headers={"X-Bridge-Key": key}
-            )
+            headers["X-Bridge-Key"] = key
+            response = requests.get(url, headers=headers, timeout=timeout_seconds)
         else:
-            response = requests.get(
-                append_bridge_key(url, key)
-            )
+            response = requests.get(append_bridge_key(url, key), headers=headers, timeout=timeout_seconds)
 
         data = response.json()
-
         if not isinstance(data, dict):
             raise Exception("Bridge returned non-object JSON.")
-
         if data.get("error"):
             raise Exception(str(data.get("error")))
-
         return data
-
     finally:
         if response is not None:
             try:
@@ -2180,6 +2254,76 @@ def bridge_request_json(url, key="", use_header=True):
             except Exception:
                 pass
 
+
+def bridge_schema_value(data):
+    if not isinstance(data, dict):
+        return 0
+    return portfolio_int(data.get("schema_version", data.get("api_schema", 0)), 0)
+
+
+def normalize_v1_portfolio_payload(data):
+    if not isinstance(data, dict):
+        return data
+    nested = data.get("portfolio")
+    if not isinstance(nested, dict):
+        return data
+    result = {}
+    for key in nested:
+        result[key] = nested[key]
+    for key in ("api_version", "schema_version", "api_schema", "bridge_version", "bridge_id", "service"):
+        if key in data and key not in result:
+            result[key] = data[key]
+    return result
+
+
+def discover_portfolio_bridge(force=False):
+    global last_bridge_discovery_check, last_bridge_discovery_message
+
+    if not bool_from_form(config.get("portfolio_auto_discover", True)):
+        last_bridge_discovery_message = "Automatic bridge discovery is disabled."
+        return False
+    if not wifi.radio.connected or mdns is None or mdns_server is None:
+        last_bridge_discovery_message = "Bridge discovery unavailable while WiFi or mDNS is offline."
+        return False
+
+    now = time.monotonic()
+    if not force and now - last_bridge_discovery_check < 30:
+        return False
+    last_bridge_discovery_check = now
+
+    try:
+        services = mdns_server.find(
+            "_stockticker-bridge",
+            "_tcp",
+            timeout=2
+        )
+    except Exception as e:
+        last_bridge_discovery_message = "Discovery failed: " + repr(e)
+        add_event(last_bridge_discovery_message)
+        return False
+
+    for service in services:
+        try:
+            address = getattr(service, "ipv4_address", None)
+            port = int(getattr(service, "port", 8787) or 8787)
+            if address is None:
+                continue
+            base = "http://{}:{}".format(str(address), port)
+            data = bridge_request_json(base + "/api/v1/health", "", False, 4)
+            if str(data.get("service", "")) != "stockticker-bridge":
+                continue
+            config["portfolio_bridge_url"] = base
+            config["portfolio_bridge_id"] = str(data.get("bridge_id", ""))
+            save_config(config)
+            last_bridge_discovery_message = "Bridge discovered automatically at {}.".format(base)
+            add_event(last_bridge_discovery_message)
+            return True
+        except Exception:
+            continue
+
+    last_bridge_discovery_message = "No compatible StockTicker bridge was discovered on this LAN."
+    add_event(last_bridge_discovery_message)
+    return False
 
 def record_portfolio_api_status(mode, data=None, error_text=""):
     global last_portfolio_api_status
@@ -2189,8 +2333,8 @@ def record_portfolio_api_status(mode, data=None, error_text=""):
     last_portfolio_api_status = {
         "mode": str(mode),
         "api_version": str(data.get("api_version", "legacy" if mode == "legacy" else "unknown")),
-        "schema_version": str(data.get("schema_version", "legacy" if mode == "legacy" else "unknown")),
-        "bridge_version": str(data.get("bridge_version", "unknown")),
+        "schema_version": str(data.get("schema_version", data.get("api_schema", "legacy" if mode == "legacy" else "unknown"))),
+        "bridge_version": str(data.get("bridge_version", data.get("hub_version", "unknown"))),
         "capabilities": bool(last_portfolio_capabilities.get("available", False)),
         "last_error": str(error_text)
     }
@@ -2227,7 +2371,7 @@ def fetch_bridge_capabilities(force=False):
 
     try:
         data = bridge_request_json(url, key, True)
-        schema = portfolio_int(data.get("schema_version", 0), 0)
+        schema = bridge_schema_value(data)
         data["available"] = True
         data["compatible"] = (
             schema <= PORTFOLIO_API_SCHEMA_SUPPORTED
@@ -2257,60 +2401,46 @@ def fetch_bridge_capabilities(force=False):
         return last_portfolio_capabilities
 
 
-def fetch_portfolio_payload():
+def fetch_portfolio_payload(allow_discovery=True):
     key = str(config.get("portfolio_bridge_key", "")).strip()
-    prefer_v1 = bool_from_form(
-        config.get("portfolio_prefer_api_v1", True)
-    )
+    prefer_v1 = bool_from_form(config.get("portfolio_prefer_api_v1", True))
 
     v1_url = portfolio_v1_url()
     legacy_url = portfolio_legacy_url()
     attempts = []
-
     if prefer_v1:
-        if v1_url:
-            attempts.append(("v1", v1_url, True))
-        if legacy_url:
-            attempts.append(("legacy", legacy_url, True))
+        if v1_url: attempts.append(("v1", v1_url, True))
+        if legacy_url: attempts.append(("legacy", legacy_url, True))
     else:
-        if legacy_url:
-            attempts.append(("legacy", legacy_url, True))
-        if v1_url:
-            attempts.append(("v1", v1_url, True))
-
-    if not attempts:
-        raise Exception("Missing portfolio bridge URL.")
+        if legacy_url: attempts.append(("legacy", legacy_url, True))
+        if v1_url: attempts.append(("v1", v1_url, True))
 
     errors = []
-
     for mode, url, use_header in attempts:
         try:
-            data = bridge_request_json(url, key, use_header)
-
+            raw = bridge_request_json(url, key, use_header)
             if mode == "v1":
-                schema = portfolio_int(data.get("schema_version", 0), 0)
-
-                if (
-                    schema > 0
-                    and schema > PORTFOLIO_API_SCHEMA_SUPPORTED
-                ):
-                    raise Exception(
-                        "Unsupported bridge schema {}.".format(schema)
-                    )
-
-            record_portfolio_api_status(mode, data)
+                schema = bridge_schema_value(raw)
+                if schema > 0 and schema > PORTFOLIO_API_SCHEMA_SUPPORTED:
+                    raise Exception("Unsupported bridge schema {}.".format(schema))
+                data = normalize_v1_portfolio_payload(raw)
+            else:
+                data = raw
+            record_portfolio_api_status(mode, raw)
             return data, mode
-
         except Exception as e:
             errors.append("{}: {}".format(mode, repr(e)))
 
-    record_portfolio_api_status(
-        "failed",
-        {},
-        "; ".join(errors)
-    )
-    raise Exception("; ".join(errors))
+    if allow_discovery and discover_portfolio_bridge(True):
+        return fetch_portfolio_payload(False)
 
+    if not attempts and allow_discovery:
+        if discover_portfolio_bridge(True):
+            return fetch_portfolio_payload(False)
+        errors.append("missing bridge URL and discovery found no bridge")
+
+    record_portfolio_api_status("failed", {}, "; ".join(errors))
+    raise Exception("; ".join(errors) if errors else "Missing portfolio bridge URL.")
 
 def mover_text(value, prefix, privacy=False):
     if not isinstance(value, dict):
@@ -2472,11 +2602,13 @@ def fetch_portfolio_entry():
         return None
 
     if not str(config.get("portfolio_bridge_url", "")).strip():
-        return make_portfolio_entry(
-            {"updated": "never"},
-            True,
-            "missing bridge url"
-        )
+        discover_portfolio_bridge(True)
+        if not str(config.get("portfolio_bridge_url", "")).strip():
+            return make_portfolio_entry(
+                {"updated": "never"},
+                True,
+                "bridge not discovered"
+            )
 
     try:
         fetch_bridge_capabilities(False)
@@ -3161,6 +3293,8 @@ def build_support_report_text():
     lines.append("Backup App Found: " + yes_no(file_exists(BACKUP_APP_PATH)))
     lines.append("Auto-Recovery Launcher: " + launcher_status_text())
     lines.append("Boot Validation: " + str(ota_journal.get("boot", {}).get("health", "unknown")))
+    lines.append("Startup Stage: " + str(ota_journal.get("boot", {}).get("startup_stage", "unknown")))
+    lines.append("Startup Detail: " + str(ota_journal.get("boot", {}).get("startup_detail", "")))
     lines.append("Logos: {} found / {} text fallback".format(found, missing))
     lines.append("Brightness: " + str(config.get("brightness", "")))
     lines.append("Scroll Speed Open: " + str(config.get("scroll_speed_open", "")))
@@ -3404,9 +3538,13 @@ if wifi_boot_state.get("message"):
 
 def start_setup_mode(reason):
     print("SETUP MODE:", reason)
+    record_startup_stage("starting_setup_hotspot", reason)
     remove_file_quietly(WIFI_FORCE_SETUP_FILE)
 
-    nearby_networks = scan_nearby_wifi(16)
+    # Avoid scanning immediately before AP/server startup. The setup portal
+    # accepts manual SSID entry; scanning remains available from the connected
+    # dashboard after provisioning.
+    nearby_networks = []
 
     try:
         wifi.radio.stop_station()
@@ -3690,6 +3828,13 @@ body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:24px; }}
         )
 
     setup_server.start(setup_ip, 80)
+    record_startup_stage(
+        "setup_portal_running",
+        "{} at http://{}/".format(SETUP_SSID, setup_ip)
+    )
+
+    # A functioning customer setup portal is a valid healthy boot.
+    boot_watchdog_confirm_healthy()
 
     print("Connect phone/laptop to WiFi:", SETUP_SSID)
     print("Use the unique setup code printed on the device card.")
@@ -3712,19 +3857,29 @@ body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:24px; }}
 if file_exists(WIFI_FORCE_SETUP_FILE):
     start_setup_mode("WiFi setup was requested from the dashboard.")
 
+record_startup_stage("migrating_legacy_wifi")
+migration_ok, migration_message = migrate_legacy_wifi_from_secrets()
+if migration_ok:
+    record_startup_stage("legacy_wifi_migrated", migration_message)
+
 print("Connecting to WiFi...")
+record_startup_stage("connecting_customer_wifi")
 
 connected_wifi_record = connect_customer_wifi()
 
 if connected_wifi_record is None or not wifi.radio.connected:
+    record_startup_stage("wifi_unavailable_entering_setup")
     start_setup_mode("No saved WiFi profile could connect.")
 
 ip = str(wifi.radio.ipv4_address)
 print("Connected:", ip)
+record_startup_stage("wifi_connected", ip)
 
 pool = socketpool.SocketPool(wifi.radio)
+record_startup_stage("starting_mdns")
 start_mdns_service()
 requests = adafruit_requests.Session(pool, ssl.create_default_context())
+record_startup_stage("network_services_ready")
 
 
 def sync_time():
@@ -4149,6 +4304,7 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <p class="section-note">The Raspberry Pi keeps Schwab credentials local. The ticker receives only sanitized display data.</p>
 <div>{portfolio_bridge_links_html}</div>
 <div class="button-row">
+<form method="POST" action="/discover-bridge"><button type="submit">Discover Bridge Automatically</button></form>
 <form method="POST" action="/test-portfolio"><button type="submit">Test Bridge</button></form>
 <form method="POST" action="/refresh-now"><button class="green" type="submit">Refresh Display</button></form>
 </div>
@@ -5077,6 +5233,40 @@ def save_customer_setup(request: Request):
         return Response(request, clean_page("Setup Failed", last_error_message), content_type="text/html")
 
 
+@server.route("/api/v1/device/health")
+def device_health_route(request: Request):
+    details = current_wifi_details()
+    bridge_status = portfolio_status_short()
+    payload = {
+        "ok": True,
+        "device": "stockticker-s3",
+        "model": DEVICE_MODEL,
+        "device_id": DEVICE_ID,
+        "firmware": APP_VERSION,
+        "api_version": "1",
+        "schema_version": 1,
+        "wifi_ssid": str(details.get("ssid", "")),
+        "ip": str(wifi.radio.ipv4_address or ""),
+        "gateway": str(wifi.radio.ipv4_gateway or ""),
+        "bridge_status": bridge_status,
+        "bridge_url": portfolio_bridge_base_url(),
+        "bridge_id": str(config.get("portfolio_bridge_id", "")),
+        "portfolio_mode": str(config.get("portfolio_mode", "off")),
+    }
+    return Response(request, json.dumps(payload), content_type="application/json")
+
+
+@server.route("/discover-bridge", methods=["POST"])
+def discover_bridge_route(request: Request):
+    found = discover_portfolio_bridge(True)
+    message = last_bridge_discovery_message
+    if found:
+        set_web_message(message)
+    else:
+        set_error_message(message)
+    return Response(request, clean_page("Bridge Discovery", message), content_type="text/html")
+
+
 @server.route("/")
 def index(request: Request):
     current_market_status = get_market_status(eastern_time_now())
@@ -5218,7 +5408,7 @@ def test_quote_route(request: Request):
             return Response(request, clean_page("Test Failed", friendly_error_text(test_quote_message)), content_type="text/html")
 
         url = FINNHUB_URL.format(sym, api_key)
-        r = requests.get(url)
+        r = requests.get(url, timeout=8, headers={"Connection": "close"})
         data = r.json()
         r.close()
 
@@ -5249,6 +5439,8 @@ def test_portfolio_route(request: Request):
         set_web_message(portfolio_test_message)
         return Response(request, clean_page("Portfolio Test", portfolio_test_message), content_type="text/html")
 
+    if bool_from_form(config.get("portfolio_auto_discover", True)):
+        discover_portfolio_bridge(True)
     fetch_bridge_capabilities(True)
     entry = fetch_portfolio_entry()
     last_portfolio_entry = entry
@@ -5682,7 +5874,7 @@ def check_cloud_status(request: Request):
             raise Exception("Missing Finnhub API key")
 
         url = FINNHUB_URL.format("AAPL", api_key)
-        r = requests.get(url)
+        r = requests.get(url, timeout=8, headers={"Connection": "close"})
         data = r.json()
         r.close()
 
@@ -7423,7 +7615,7 @@ def fetch_quote(sym):
 
     try:
         url = FINNHUB_URL.format(sym, api_key)
-        r = requests.get(url)
+        r = requests.get(url, timeout=8, headers={"Connection": "close"})
         data = r.json()
         r.close()
 
@@ -7709,15 +7901,53 @@ def build_blocks(entries, after_hours):
     return blocks
 
 
+def startup_placeholder_entry(sym):
+    return {
+        "symbol": sym,
+        "price_line": "${} STARTING".format(sym),
+        "change_line": "CONNECTING",
+        "color": 0x00AAFF,
+        "pct": 0,
+        "updated_text": "startup",
+        "updated_mono": time.monotonic(),
+        "stale": True,
+        "used_cached": False,
+        "error_reason": ""
+    }
+
+
+def startup_entries():
+    items = [startup_placeholder_entry(sym) for sym in SYMBOLS]
+    if is_portfolio_enabled():
+        items.append({
+            "symbol": PORTFOLIO_SYMBOL,
+            "entry_type": "portfolio",
+            "price_line": "PORTFOLIO STARTING",
+            "change_line": "DISCOVERING BRIDGE",
+            "color": 0x00AAFF,
+            "pct": 0,
+            "updated_text": "startup",
+            "updated_mono": time.monotonic(),
+            "stale": True,
+            "used_cached": False,
+            "error_reason": "",
+            "bridge_api_mode": "not_checked",
+            "bridge_version": "unknown"
+        })
+    return items
+
+
 status = update_header()
 after_hours = status != "OPN"
 
-entries = fetch_entries()
+# Draw immediately. Live network work happens after the LED is already visible.
+entries = startup_entries()
 pending_entries = entries[:]
 blocks = build_blocks(entries, after_hours)
 last_quote_fetch = time.monotonic()
-smooth_refresh_active = False
+smooth_refresh_active = True
 smooth_refresh_index = 0
+add_event("Fast startup display active; live refresh scheduled.")
 
 completed_loops = 0
 
