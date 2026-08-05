@@ -5,16 +5,15 @@
     "notes": "Stable customer-ready ticker release."
   }, 
 "beta": {
-    "version": "1.1.26-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1126-wifi-timeout-fix-3",
-    "notes": "Customer WiFi Manager plus OTA network-timeout hardening. Firmware now downloads in larger chunks with a 120-second socket timeout, automatic clean retries, connection-close semantics, stage-specific diagnostics, and local-file incremental SHA-256 after the HTTPS socket closes. Preserves the 1.1.25 journal, watchdog, rollback, preflight checks, safe support report, responsive update interface, and Raspberry Pi workload separation.",
+    "version": "1.1.27-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1127-auto-bridge-fast-boot-1",
+    "notes": "Fast visible startup, bounded bridge/quote requests, API-v1 compatibility, two-way S3 health endpoint, mDNS bridge discovery, and automatic bridge URL updates after WiFi changes.",
     "hardware": [
       "matrix_portal_s3"
     ],
-    "minimum_config_schema": 2,
-    "size": 267456,
-    "sha256": "a900b3a475e271bc06f3045d4c505316b4dd43e3155c4da4a93e3875feb23241",
+    "minimum_config_schema": 4,
+    "size": 269522,
+    "sha256": "fff434f9cd319c94a2c851ddd0f92aa3926ec9b2ea2186fe30e60d005b911db0",
     "mandatory": false
   }
 }
-
