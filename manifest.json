@@ -4,14 +4,14 @@
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable customer-ready ticker release."
   }, 
-"beta": {
+ "beta": {
     "version": "1.1.27-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1127-auto-bridge-fast-boot-1",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1127-auto-bridge-fast-boot-2",
     "notes": "Fast visible startup, bounded bridge/quote requests, API-v1 compatibility, two-way S3 health endpoint, mDNS bridge discovery, and automatic bridge URL updates after WiFi changes.",
     "hardware": [
       "matrix_portal_s3"
     ],
-    "minimum_config_schema": 4,
+    "minimum_config_schema": 3,
     "size": 269522,
     "sha256": "fff434f9cd319c94a2c851ddd0f92aa3926ec9b2ea2186fe30e60d005b911db0",
     "mandatory": false
