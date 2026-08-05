@@ -1,7 +1,9 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.28-beta"
+APP_VERSION = "1.1.29-beta"
 CONFIG_SCHEMA_VERSION = 4
+# 1.1.29: customer-facing startup states, consistent money formatting,
+# clearer recovery guidance, and unified connection-status presentation.
 # 1.1.27: fast visible startup, bounded bridge requests, API-v1 compatibility,
 # two-way health endpoint, mDNS bridge discovery, and automatic bridge URL updates.
 PORTFOLIO_API_SCHEMA_SUPPORTED = 1
@@ -2095,6 +2097,23 @@ def money_text(value):
         return "$0"
 
 
+def market_price_text(value):
+    """Format displayed market prices with commas and two decimals."""
+    try:
+        return "${:,.2f}".format(float(value))
+    except Exception:
+        return "$0.00"
+
+
+def signed_market_money_text(value):
+    try:
+        number = float(value)
+        sign = "+" if number >= 0 else "-"
+        return "{}${:,.2f}".format(sign, abs(number))
+    except Exception:
+        return "+$0.00"
+
+
 def signed_money_text(value):
     try:
         v = float(value)
@@ -2803,6 +2822,39 @@ def build_portfolio_api_status_html():
     return "<br>".join(lines)
 
 
+def connection_setup_steps():
+    wifi_ok = bool(wifi.radio.connected)
+    bridge_url_ok = bool(portfolio_bridge_base_url())
+    bridge_found = bridge_url_ok or bool(str(config.get("portfolio_bridge_id", "")).strip())
+    bridge_key_ok = bool(str(config.get("portfolio_bridge_key", "")).strip())
+    portfolio_ok = bool(
+        last_portfolio_entry
+        and not last_portfolio_entry.get("error_reason")
+        and not last_portfolio_entry.get("stale")
+    )
+
+    return (
+        (wifi_ok, "Ticker WiFi", "Connected" if wifi_ok else "Needs setup"),
+        (bridge_found, "Raspberry Pi", "Found" if bridge_found else "Searching"),
+        (bridge_key_ok, "Pairing", "Ready" if bridge_key_ok else "Approval/key needed"),
+        (portfolio_ok, "Portfolio data", "Current" if portfolio_ok else "Waiting")
+    )
+
+
+def build_connection_steps_html():
+    rows = []
+    for ok, label_text, state_text in connection_setup_steps():
+        icon = "&#10003;" if ok else "&bull;"
+        class_name = "step-ok" if ok else "step-wait"
+        rows.append(
+            "<div class='connection-step {}'><span class='step-icon'>{}</span>"
+            "<span>{}</span><b>{}</b></div>".format(
+                class_name, icon, safe_html(label_text), safe_html(state_text)
+            )
+        )
+    return "".join(rows)
+
+
 def build_portfolio_status_html():
     if not is_portfolio_enabled():
         return "Portfolio Module is off."
@@ -2924,19 +2976,28 @@ def build_release_notes_html(manifest=None):
 
 def friendly_error_text(message):
     raw = str(message)
+    lower = raw.lower()
 
-    if "Customer API key required" in raw or "missing API key" in raw:
-        return "Stock quotes are paused until a Finnhub API key is saved. Open Setup Wizard and enter the key."
-    if "OSError(30" in raw or "read-only" in raw:
-        return "Settings could not save because the device storage is read-only. Restart in normal app-write mode and try again."
-    if "Manifest" in raw or "manifest" in raw:
-        return "Software update server could not be reached or returned invalid data. Check WiFi and the manifest URL."
-    if "Fetch error" in raw or "returned no valid price" in raw or "Quote" in raw:
-        return "Stock quotes could not load. Check WiFi, ticker symbols, and the Finnhub API key."
-    if "Wrong admin PIN" in raw or "wrong admin PIN" in raw:
-        return "Action blocked because the admin PIN was incorrect."
-    if "OTA install" in raw or "Update failed" in raw:
-        return "Software update did not install. Check OTA Status and try again."
+    if "customer api key required" in lower or "missing api key" in lower:
+        return "Live stock quotes need a Finnhub API key. Open Customer Setup, save the key, then press Refresh Quotes."
+    if "wrong admin pin" in lower or "incorrect admin pin" in lower:
+        return "That admin PIN was not accepted. Check the PIN and try again."
+    if "bridge key" in lower or "unauthorized" in lower or "http 401" in lower or "http 403" in lower:
+        return "The Raspberry Pi was found, but pairing authorization failed. Confirm the display key or approve this ticker on the Pi dashboard."
+    if "no compatible stockticker bridge" in lower or "bridge not discovered" in lower:
+        return "Raspberry Pi not found. Make sure the Pi is powered on and both devices are connected to the same home WiFi, then press Find & Pair Raspberry Pi."
+    if "connectionerror" in lower or "timed out" in lower or "timeout" in lower:
+        return "The other device did not respond in time. Confirm both devices are powered on and connected to the same local network."
+    if "name or service not known" in lower or "dns" in lower or "mdns" in lower:
+        return "The local device name could not be resolved. Use Find & Pair Raspberry Pi to refresh the saved address."
+    if "oserror(30" in lower or "read-only" in lower:
+        return "Settings could not save because device storage is read-only. Restart normally and try again."
+    if "manifest" in lower:
+        return "The software-update server could not be reached or returned invalid information. Check WiFi and OTA Status."
+    if "returned no valid price" in lower or "quote" in lower or "fetch error" in lower:
+        return "A stock quote could not load. Check WiFi, the ticker symbol, and the Finnhub API key; cached data will remain visible when available."
+    if "ota install" in lower or "update failed" in lower:
+        return "The software update did not install. Open Software Update & Recovery, review OTA Status, and try again."
     return raw
 
 
@@ -3450,7 +3511,7 @@ def demo_quote(sym):
     change_parts = []
 
     if config.get("show_dollar_change", True):
-        change_parts.append("{}${:.2f}".format(sign, abs(dollar_change)))
+        change_parts.append(signed_market_money_text(dollar_change))
     if config.get("show_percent_change", True):
         change_parts.append("({:+.2f}% DEMO)".format(pct))
     if not change_parts:
@@ -3458,7 +3519,7 @@ def demo_quote(sym):
 
     return {
         "symbol": sym,
-        "price_line": "${} ${:.2f}".format(sym, price),
+        "price_line": "${} {}".format(sym, market_price_text(price)),
         "change_line": " ".join(change_parts),
         "color": color,
         "pct": pct,
@@ -4278,6 +4339,24 @@ body {{
 .status-line:last-child {{ border-bottom:0; }}
 .status-line span:first-child {{ color:var(--muted); }}
 .status-line b {{ text-align:right; }}
+.connection-steps {{
+  display:grid;
+  gap:8px;
+  margin:12px 0;
+}}
+.connection-step {{
+  display:grid;
+  grid-template-columns:24px 1fr auto;
+  gap:8px;
+  align-items:center;
+  padding:9px 10px;
+  border-radius:10px;
+  background:rgba(5,15,27,.72);
+  border:1px solid #2a4166;
+}}
+.connection-step b {{ text-align:right; }}
+.step-ok .step-icon {{ color:#74ff9e; }}
+.step-wait .step-icon {{ color:#ffd166; }}
 .section-note {{
   border-left:3px solid #3994ff;
   padding:9px 11px;
@@ -4381,11 +4460,12 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <div class="status-line"><span>Processing host</span><b>Raspberry Pi</b></div>
 <div class="status-line"><span>Ticker role</span><b>Read-only display client</b></div>
 <p class="section-note">The Raspberry Pi keeps Schwab credentials local. The ticker receives only sanitized display data.</p>
+<div class="connection-steps">{connection_steps_html}</div>
 <p class="small"><b>Automatic pairing:</b> {bridge_registration_message}</p>
 <p class="small"><b>Stable ticker address:</b> <a href="http://{ticker_local_hostname}/" target="_blank">http://{ticker_local_hostname}/</a></p>
 <div>{portfolio_bridge_links_html}</div>
 <div class="button-row">
-<form method="POST" action="/discover-bridge"><button type="submit">Discover Bridge Automatically</button></form>
+<form method="POST" action="/discover-bridge"><button type="submit">Find &amp; Pair Raspberry Pi</button></form>
 <form method="POST" action="/test-portfolio"><button type="submit">Test Bridge</button></form>
 <form method="POST" action="/refresh-now"><button class="green" type="submit">Refresh Display</button></form>
 </div>
@@ -5463,6 +5543,7 @@ def index(request: Request):
             portfolio_api_mode_short=portfolio_api_mode_short(),
             portfolio_bridge_links_html=build_portfolio_bridge_links_html(),
             bridge_registration_message=safe_html(last_bridge_registration_message),
+            connection_steps_html=build_connection_steps_html(),
             ticker_local_hostname=safe_html(MDNS_HOSTNAME + ".local"),
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
@@ -5507,7 +5588,7 @@ def test_quote_route(request: Request):
             set_error_message(test_quote_message)
         else:
             pct = ((price - prev) / prev) * 100 if prev else 0
-            test_quote_message = "{} works: ${:.2f} ({:+.2f}%)".format(sym, price, pct)
+            test_quote_message = "{} works: {} ({:+.2f}%)".format(sym, market_price_text(price), pct)
             set_web_message(test_quote_message)
 
     except Exception as e:
@@ -5544,8 +5625,8 @@ def test_portfolio_route(request: Request):
         set_web_message("Portfolio bridge tested successfully.")
     else:
         portfolio_test_message = (
-            "Portfolio bridge test failed or returned cached/offline data. "
-            "Check Pi IP, bridge key, and bridge API status."
+            "Raspberry Pi connection is not ready. Make sure both devices are on the same WiFi, "
+            "press Find & Pair Raspberry Pi, then confirm the display key or approve the ticker on the Pi dashboard."
         )
         set_error_message(portfolio_test_message)
 
@@ -5583,7 +5664,7 @@ def validate_symbols_route(request: Request):
             price = data.get("c", 0)
 
             if price:
-                valid.append("{} ${:.2f}".format(sym, price))
+                valid.append("{} {}".format(sym, market_price_text(price)))
             else:
                 invalid.append(sym)
 
@@ -7725,7 +7806,7 @@ def fetch_quote(sym):
         change_parts = []
 
         if config.get("show_dollar_change", True):
-            change_parts.append("{}${:.2f}".format(sign, abs(dollar_change)))
+            change_parts.append(signed_market_money_text(dollar_change))
 
         if config.get("show_percent_change", True):
             change_parts.append("({:+.2f}%{})".format(pct, alert))
@@ -7735,7 +7816,7 @@ def fetch_quote(sym):
 
         return {
             "symbol": sym,
-            "price_line": "${} ${:.2f}".format(sym, price),
+            "price_line": "${} {}".format(sym, market_price_text(price)),
             "change_line": " ".join(change_parts),
             "color": color,
             "pct": pct,
@@ -7991,8 +8072,8 @@ def build_blocks(entries, after_hours):
 def startup_placeholder_entry(sym):
     return {
         "symbol": sym,
-        "price_line": "${} STARTING".format(sym),
-        "change_line": "CONNECTING",
+        "price_line": "LOADING ${}".format(sym),
+        "change_line": "WIFI OK - GETTING QUOTE",
         "color": 0x00AAFF,
         "pct": 0,
         "updated_text": "startup",
@@ -8009,8 +8090,8 @@ def startup_entries():
         items.append({
             "symbol": PORTFOLIO_SYMBOL,
             "entry_type": "portfolio",
-            "price_line": "PORTFOLIO STARTING",
-            "change_line": "DISCOVERING BRIDGE",
+            "price_line": "PORTFOLIO CONNECTING",
+            "change_line": "SEARCHING FOR RASPBERRY PI",
             "color": 0x00AAFF,
             "pct": 0,
             "updated_text": "startup",
@@ -8034,7 +8115,7 @@ blocks = build_blocks(entries, after_hours)
 last_quote_fetch = time.monotonic()
 smooth_refresh_active = True
 smooth_refresh_index = 0
-add_event("Fast startup display active; live refresh scheduled.")
+add_event("Startup display ready; WiFi connected and live data loading.")
 
 completed_loops = 0
 
