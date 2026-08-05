@@ -5,15 +5,15 @@
     "notes": "Stable customer-ready ticker release."
   }, 
 "beta": {
-    "version": "1.1.27-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1127-auto-bridge-fast-boot-5",
-    "notes": "Fast visible startup, bounded bridge requests, API-v1 compatibility, S3 health endpoint, and automatic bridge discovery.",
+    "version": "1.1.28-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1128-auto-pairing-stable-links-1",
+    "notes": "Automatic S3-to-Pi self-registration, stable local dashboard names, automatic stale-IP replacement, and Pi dashboard link support.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 3,
-    "size": 277596,
-    "sha256": "d8acbd3968bd4b9f9780ac966d3d59d718701ec442f1e78dc97dca15ca910315",
+    "size": 281687,
+    "sha256": "b53c4632a6f70795e85ef2cdfb7bd408752bfd4acb2dfce5710ab11a906c186a",
     "mandatory": false
   }
 }
