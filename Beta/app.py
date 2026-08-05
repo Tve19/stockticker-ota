@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.27-beta"
+APP_VERSION = "1.1.28-beta"
 CONFIG_SCHEMA_VERSION = 4
 # 1.1.27: fast visible startup, bounded bridge requests, API-v1 compatibility,
 # two-way health endpoint, mDNS bridge discovery, and automatic bridge URL updates.
@@ -284,6 +284,9 @@ DEFAULT_CONFIG = {
     "portfolio_capabilities_refresh_minutes": 60,
     "portfolio_auto_discover": True,
     "portfolio_bridge_id": "",
+    "portfolio_bridge_local_hostname": "",
+    "portfolio_bridge_dashboard_url": "",
+    "bridge_self_register_enabled": True,
     "portfolio_request_timeout_seconds": 6,
     "mdns_enabled": True,
     "wifi_customer_manager": True
@@ -1585,6 +1588,8 @@ last_portfolio_capabilities = {}
 last_portfolio_capabilities_check = 0
 last_bridge_discovery_check = 0
 last_bridge_discovery_message = "Bridge discovery has not run yet."
+last_bridge_registration_check = 0
+last_bridge_registration_message = "Ticker has not registered with the bridge yet."
 last_portfolio_api_status = {
     "mode": "not_checked",
     "api_version": "unknown",
@@ -2148,11 +2153,19 @@ def portfolio_bridge_base_url():
 
 
 def portfolio_bridge_dashboard_url():
-    base = portfolio_bridge_base_url()
+    stable = str(config.get("portfolio_bridge_dashboard_url", "")).strip()
+    if stable:
+        return stable
 
+    local_hostname = str(config.get("portfolio_bridge_local_hostname", "")).strip().rstrip(".")
+    if local_hostname:
+        if not local_hostname.endswith(".local"):
+            local_hostname += ".local"
+        return "http://{}:8787/dashboard".format(local_hostname)
+
+    base = portfolio_bridge_base_url()
     if not base:
         return ""
-
     return base + "/dashboard"
 
 
@@ -2255,6 +2268,64 @@ def bridge_request_json(url, key="", use_header=True, timeout_seconds=None):
                 pass
 
 
+def register_ticker_with_bridge(force=False):
+    global last_bridge_registration_check, last_bridge_registration_message
+
+    if not bool_from_form(config.get("bridge_self_register_enabled", True)):
+        last_bridge_registration_message = "Automatic ticker registration is disabled."
+        return False
+    if not wifi.radio.connected:
+        last_bridge_registration_message = "Ticker registration is waiting for WiFi."
+        return False
+
+    base = portfolio_bridge_base_url()
+    key = str(config.get("portfolio_bridge_key", "")).strip()
+    if not base or not key:
+        last_bridge_registration_message = "Ticker registration is waiting for the bridge URL and display key."
+        return False
+
+    now = time.monotonic()
+    if not force and now - last_bridge_registration_check < 60:
+        return False
+    last_bridge_registration_check = now
+
+    details = current_wifi_details()
+    payload = {
+        "device": "stockticker-s3",
+        "device_id": DEVICE_ID,
+        "firmware": APP_VERSION,
+        "wifi_ssid": str(details.get("ssid", "")),
+        "local_hostname": MDNS_HOSTNAME + ".local",
+        "dashboard_url": "http://{}.local/".format(MDNS_HOSTNAME),
+        "port": 80,
+        "bridge_id": str(config.get("portfolio_bridge_id", "")),
+    }
+    response = None
+    try:
+        response = requests.post(
+            base + "/api/v1/pair/register",
+            json=payload,
+            headers={"X-Bridge-Key": key, "Connection": "close"},
+            timeout=4
+        )
+        data = response.json()
+        if response.status_code >= 400 or not isinstance(data, dict) or not data.get("registered"):
+            raise Exception(str(data.get("error", "HTTP {}".format(response.status_code))) if isinstance(data, dict) else "Invalid response")
+        last_bridge_registration_message = "Ticker registered automatically with the bridge."
+        add_event(last_bridge_registration_message)
+        return True
+    except Exception as e:
+        last_bridge_registration_message = "Ticker registration will retry: " + repr(e)
+        add_event(last_bridge_registration_message)
+        return False
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
 def bridge_schema_value(data):
     if not isinstance(data, dict):
         return 0
@@ -2314,9 +2385,16 @@ def discover_portfolio_bridge(force=False):
                 continue
             config["portfolio_bridge_url"] = base
             config["portfolio_bridge_id"] = str(data.get("bridge_id", ""))
+            local_hostname = str(data.get("local_hostname", "")).strip().rstrip(".")
+            if local_hostname:
+                if not local_hostname.endswith(".local"):
+                    local_hostname += ".local"
+                config["portfolio_bridge_local_hostname"] = local_hostname
+                config["portfolio_bridge_dashboard_url"] = "http://{}:{}/dashboard".format(local_hostname, port)
             save_config(config)
             last_bridge_discovery_message = "Bridge discovered automatically at {}.".format(base)
             add_event(last_bridge_discovery_message)
+            register_ticker_with_bridge(True)
             return True
         except Exception:
             continue
@@ -2427,6 +2505,7 @@ def fetch_portfolio_payload(allow_discovery=True):
             else:
                 data = raw
             record_portfolio_api_status(mode, raw)
+            register_ticker_with_bridge(False)
             return data, mode
         except Exception as e:
             errors.append("{}: {}".format(mode, repr(e)))
@@ -4302,6 +4381,8 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <div class="status-line"><span>Processing host</span><b>Raspberry Pi</b></div>
 <div class="status-line"><span>Ticker role</span><b>Read-only display client</b></div>
 <p class="section-note">The Raspberry Pi keeps Schwab credentials local. The ticker receives only sanitized display data.</p>
+<p class="small"><b>Automatic pairing:</b> {bridge_registration_message}</p>
+<p class="small"><b>Stable ticker address:</b> <a href="http://{ticker_local_hostname}/" target="_blank">http://{ticker_local_hostname}/</a></p>
 <div>{portfolio_bridge_links_html}</div>
 <div class="button-row">
 <form method="POST" action="/discover-bridge"><button type="submit">Discover Bridge Automatically</button></form>
@@ -5252,6 +5333,10 @@ def device_health_route(request: Request):
         "bridge_url": portfolio_bridge_base_url(),
         "bridge_id": str(config.get("portfolio_bridge_id", "")),
         "portfolio_mode": str(config.get("portfolio_mode", "off")),
+        "local_hostname": MDNS_HOSTNAME + ".local",
+        "dashboard_url": "http://{}.local/".format(MDNS_HOSTNAME),
+        "port": 80,
+        "bridge_registration": last_bridge_registration_message,
     }
     return Response(request, json.dumps(payload), content_type="application/json")
 
@@ -5377,6 +5462,8 @@ def index(request: Request):
             portfolio_api_status_message=build_portfolio_api_status_html(),
             portfolio_api_mode_short=portfolio_api_mode_short(),
             portfolio_bridge_links_html=build_portfolio_bridge_links_html(),
+            bridge_registration_message=safe_html(last_bridge_registration_message),
+            ticker_local_hostname=safe_html(MDNS_HOSTNAME + ".local"),
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
         ),
