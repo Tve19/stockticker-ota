@@ -5,15 +5,17 @@
     "notes": "Stable customer-ready ticker release."
   }, 
 "beta": {
-    "version": "1.1.29-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1129-customer-polish-1",
-    "notes": "Consistent comma and decimal formatting, clearer LED startup messages, customer-friendly error wording, visible WiFi/Pi/pairing/portfolio connection stages, and dashboard polish.",
+    "version": "1.1.30-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1130-secure-pairing-v1-1",
+    "notes": "Secure temporary pairing requests, Pi dashboard approval, automatic per-device key exchange, trusted-device authentication, revoke/unpair controls, staged post-pair tests, and clear LED pairing guidance. Requires Pi hub 0.8.0-beta or newer for secure pairing.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 4,
-    "size": 285382,
-    "sha256": "56508bb07c8cc938417da7bdfda7b6ccc12ab9c56721387617c798ab56b7334d",
+    "minimum_bridge_version": "0.8.0-beta",
+    "pairing_protocol_version": 1,
+    "size": 317143,
+    "sha256": "cf985e98ec9582b6ba3e9a90ee6c93bc5f0995d83db25f97095cea39498d8473",
     "mandatory": false
   }
 }
