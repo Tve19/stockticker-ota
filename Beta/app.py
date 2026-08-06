@@ -1,7 +1,10 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.29-beta"
+APP_VERSION = "1.1.30-beta"
 CONFIG_SCHEMA_VERSION = 4
+# 1.1.30: secure temporary pairing requests, Pi approval, automatic per-device
+# key exchange, trusted-device authentication, revoke/unpair handling, staged
+# post-pair testing, and non-blocking LED pairing guidance.
 # 1.1.29: customer-facing startup states, consistent money formatting,
 # clearer recovery guidance, and unified connection-status presentation.
 # 1.1.27: fast visible startup, bounded bridge requests, API-v1 compatibility,
@@ -10,6 +13,10 @@ PORTFOLIO_API_SCHEMA_SUPPORTED = 1
 PORTFOLIO_PROCESSING_LOCATION = "Raspberry Pi bridge"
 PORTFOLIO_TICKER_ROLE = "Read-only sanitized API client"
 DEVICE_MODEL = "matrix_portal_s3"
+PAIRING_PROTOCOL_NAME = "stockticker-pairing"
+PAIRING_PROTOCOL_VERSION_SUPPORTED = 1
+PAIRING_REQUEST_POLL_SECONDS = 2.0
+PAIRING_LED_MESSAGE_SECONDS = 9.0
 
 import time
 import ssl
@@ -288,6 +295,10 @@ DEFAULT_CONFIG = {
     "portfolio_bridge_id": "",
     "portfolio_bridge_local_hostname": "",
     "portfolio_bridge_dashboard_url": "",
+    "portfolio_pairing_mode": "legacy-or-unpaired",
+    "portfolio_pairing_protocol": 0,
+    "portfolio_pairing_completed": "",
+    "portfolio_pairing_last_test": "",
     "bridge_self_register_enabled": True,
     "portfolio_request_timeout_seconds": 6,
     "mdns_enabled": True,
@@ -839,6 +850,18 @@ def load_config():
 
 def save_config(cfg):
     save_json_file(CONFIG_FILE, cfg)
+
+
+def save_config_atomic(cfg):
+    atomic_save_json_file(CONFIG_FILE, cfg)
+
+
+def secure_pairing_active():
+    return (
+        str(config.get("portfolio_pairing_mode", "")) == "secure-device-key"
+        and int(config.get("portfolio_pairing_protocol", 0) or 0) == PAIRING_PROTOCOL_VERSION_SUPPORTED
+        and bool(str(config.get("portfolio_bridge_key", "")).strip())
+    )
 
 
 def load_holidays():
@@ -1592,6 +1615,47 @@ last_bridge_discovery_check = 0
 last_bridge_discovery_message = "Bridge discovery has not run yet."
 last_bridge_registration_check = 0
 last_bridge_registration_message = "Ticker has not registered with the bridge yet."
+PAIRING_UNPAIRED = "UNPAIRED"
+PAIRING_DISCOVERING = "DISCOVERING"
+PAIRING_REQUESTING = "REQUESTING"
+PAIRING_WAITING = "WAITING_APPROVAL"
+PAIRING_APPROVED = "APPROVED"
+PAIRING_CLAIMING = "CLAIMING_KEY"
+PAIRING_TESTING = "TESTING"
+PAIRING_PAIRED = "PAIRED"
+PAIRING_REJECTED = "REJECTED"
+PAIRING_EXPIRED = "EXPIRED"
+PAIRING_REVOKED = "REVOKED"
+PAIRING_ERROR = "ERROR"
+
+pairing_state = (
+    PAIRING_PAIRED
+    if str(config.get("portfolio_pairing_mode", "")) == "secure-device-key"
+    and bool(str(config.get("portfolio_bridge_key", "")).strip())
+    else PAIRING_UNPAIRED
+)
+pairing_message = (
+    "Secure pairing is active."
+    if pairing_state == PAIRING_PAIRED
+    else "Secure pairing has not started."
+)
+pairing_detail = ""
+pairing_error_code = ""
+pairing_request_id = ""
+pairing_claim_token = ""
+pairing_request_expires_at = 0.0
+pairing_next_poll_at = 0.0
+pairing_bridge_base = ""
+pairing_test_stage = 0
+pairing_test_payload = None
+pairing_led_top = ""
+pairing_led_bottom = ""
+pairing_led_until = 0.0
+pairing_overlay_group = None
+pairing_overlay_top_label = None
+pairing_overlay_bottom_label = None
+pairing_overlay_visible = False
+last_pairing_test_message = "Secure pairing has not been tested yet."
 last_portfolio_api_status = {
     "mode": "not_checked",
     "api_version": "unknown",
@@ -2254,6 +2318,15 @@ def portfolio_capabilities_url():
     return base + "/api/v1/capabilities"
 
 
+def bridge_auth_headers(key="", include_device=True):
+    headers = {"Connection": "close"}
+    if key:
+        headers["X-Bridge-Key"] = str(key)
+    if include_device and "DEVICE_ID" in globals():
+        headers["X-StockTicker-Device"] = str(DEVICE_ID)
+    return headers
+
+
 def bridge_request_json(url, key="", use_header=True, timeout_seconds=None):
     response = None
 
@@ -2266,9 +2339,8 @@ def bridge_request_json(url, key="", use_header=True, timeout_seconds=None):
     timeout_seconds = max(2, min(20, int(timeout_seconds)))
 
     try:
-        headers = {"Connection": "close"}
-        if use_header and key:
-            headers["X-Bridge-Key"] = key
+        headers = bridge_auth_headers(key if use_header else "", use_header)
+        if use_header:
             response = requests.get(url, headers=headers, timeout=timeout_seconds)
         else:
             response = requests.get(append_bridge_key(url, key), headers=headers, timeout=timeout_seconds)
@@ -2276,8 +2348,10 @@ def bridge_request_json(url, key="", use_header=True, timeout_seconds=None):
         data = response.json()
         if not isinstance(data, dict):
             raise Exception("Bridge returned non-object JSON.")
-        if data.get("error"):
-            raise Exception(str(data.get("error")))
+        if response.status_code >= 400 or data.get("error"):
+            code = str(data.get("error", "http_{}".format(response.status_code)))
+            handle_pairing_auth_error(code)
+            raise Exception(code)
         return data
     finally:
         if response is not None:
@@ -2285,6 +2359,507 @@ def bridge_request_json(url, key="", use_header=True, timeout_seconds=None):
                 response.close()
             except Exception:
                 pass
+
+
+def bridge_post_json(url, payload, key="", include_device=True, timeout_seconds=5):
+    response = None
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            headers=bridge_auth_headers(key, include_device),
+            timeout=max(2, min(20, int(timeout_seconds)))
+        )
+        try:
+            data = response.json()
+        except Exception:
+            data = {"ok": False, "error": "invalid_json", "message": "Bridge returned invalid JSON."}
+        if not isinstance(data, dict):
+            data = {"ok": False, "error": "invalid_json", "message": "Bridge returned invalid JSON."}
+        if response.status_code >= 400:
+            code = str(data.get("error", "http_{}".format(response.status_code)))
+            handle_pairing_auth_error(code)
+            raise Exception(code + ": " + str(data.get("message", "Request failed.")))
+        if data.get("error") and not data.get("ok", False):
+            code = str(data.get("error"))
+            handle_pairing_auth_error(code)
+            raise Exception(code + ": " + str(data.get("message", "Request failed.")))
+        return data
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
+
+def pairing_state_label():
+    labels = {
+        PAIRING_UNPAIRED: "Not paired",
+        PAIRING_DISCOVERING: "Searching for Pi",
+        PAIRING_REQUESTING: "Sending request",
+        PAIRING_WAITING: "Waiting for approval",
+        PAIRING_APPROVED: "Approved",
+        PAIRING_CLAIMING: "Claiming secure key",
+        PAIRING_TESTING: "Testing secure connection",
+        PAIRING_PAIRED: "Securely paired",
+        PAIRING_REJECTED: "Pairing rejected",
+        PAIRING_EXPIRED: "Pairing expired",
+        PAIRING_REVOKED: "Access revoked",
+        PAIRING_ERROR: "Pairing error",
+    }
+    return labels.get(pairing_state, str(pairing_state))
+
+
+def pairing_is_active():
+    return pairing_state in (
+        PAIRING_DISCOVERING,
+        PAIRING_REQUESTING,
+        PAIRING_WAITING,
+        PAIRING_APPROVED,
+        PAIRING_CLAIMING,
+        PAIRING_TESTING,
+    )
+
+
+def set_pairing_led(top, bottom, seconds=PAIRING_LED_MESSAGE_SECONDS):
+    global pairing_led_top, pairing_led_bottom, pairing_led_until
+    pairing_led_top = str(top)[:42]
+    pairing_led_bottom = str(bottom)[:42]
+    pairing_led_until = time.monotonic() + max(2.0, float(seconds))
+
+
+def set_pairing_state(state, message, detail="", led_top="", led_bottom="", led_seconds=PAIRING_LED_MESSAGE_SECONDS):
+    global pairing_state, pairing_message, pairing_detail, pairing_error_code
+    pairing_state = str(state)
+    pairing_message = str(message)[:180]
+    pairing_detail = str(detail)[:240]
+    if state not in (PAIRING_ERROR, PAIRING_REVOKED):
+        pairing_error_code = ""
+    if led_top or led_bottom:
+        set_pairing_led(led_top or pairing_state_label(), led_bottom or message, led_seconds)
+    try:
+        add_event("Pairing: {} - {}".format(pairing_state, pairing_message))
+    except Exception:
+        print("PAIRING:", pairing_state, pairing_message)
+
+
+def handle_pairing_auth_error(code):
+    global pairing_error_code
+    code = str(code or "").strip().lower()
+    if code == "device_revoked":
+        pairing_error_code = code
+        set_pairing_state(
+            PAIRING_REVOKED,
+            "The Raspberry Pi revoked this ticker's portfolio access.",
+            "Start secure pairing again after approving this ticker on the Pi dashboard.",
+            "ACCESS REVOKED",
+            "PAIR AGAIN",
+            14
+        )
+    elif code in ("device_not_trusted", "invalid_device_key") and secure_pairing_active():
+        pairing_error_code = code
+        set_pairing_state(
+            PAIRING_ERROR,
+            "The saved secure pairing is no longer accepted by the Raspberry Pi.",
+            "Start secure pairing again to issue a new device key.",
+            "PAIRING INVALID",
+            "PAIR AGAIN",
+            12
+        )
+
+
+def pairing_clear_runtime():
+    global pairing_request_id, pairing_claim_token, pairing_request_expires_at
+    global pairing_next_poll_at, pairing_bridge_base, pairing_test_stage, pairing_test_payload
+    pairing_request_id = ""
+    pairing_claim_token = ""
+    pairing_request_expires_at = 0.0
+    pairing_next_poll_at = 0.0
+    pairing_bridge_base = ""
+    pairing_test_stage = 0
+    pairing_test_payload = None
+
+
+def pairing_random_bytes(length=32):
+    try:
+        return os.urandom(length)
+    except Exception:
+        hasher, _ = create_sha256_hasher()
+        try:
+            hasher.update(bytes(microcontroller.cpu.uid))
+        except Exception:
+            pass
+        hasher.update(str(time.monotonic()).encode("utf-8"))
+        hasher.update(str(gc.mem_free() if hasattr(gc, "mem_free") else 0).encode("utf-8"))
+        hasher.update(str(SETUP_PASSWORD).encode("utf-8"))
+        seed = hasher.digest()
+        output = bytearray()
+        counter = 0
+        while len(output) < length:
+            h, _ = create_sha256_hasher()
+            h.update(seed)
+            h.update(str(counter).encode("utf-8"))
+            output.extend(h.digest())
+            counter += 1
+        return bytes(output[:length])
+
+
+def pairing_token_text(length=32):
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    raw = pairing_random_bytes(length)
+    chars = []
+    for value in raw:
+        chars.append(alphabet[value % len(alphabet)])
+    return "".join(chars)
+
+
+def sha256_hex_text(value):
+    hasher, _ = create_sha256_hasher()
+    hasher.update(str(value).encode("utf-8"))
+    digest = hasher.digest()
+    return "".join("{:02x}".format(b) for b in digest)
+
+
+def pairing_capabilities_url():
+    base = portfolio_bridge_base_url()
+    return base + "/api/v1/pair/capabilities" if base else ""
+
+
+def pairing_status_url():
+    base = pairing_bridge_base or portfolio_bridge_base_url()
+    return base + "/api/v1/pair/status" if base else ""
+
+
+def pairing_request_url():
+    base = pairing_bridge_base or portfolio_bridge_base_url()
+    return base + "/api/v1/pair/request" if base else ""
+
+
+def pairing_test_url():
+    base = portfolio_bridge_base_url()
+    return base + "/api/v1/pair/test" if base else ""
+
+
+def pairing_unpair_url():
+    base = portfolio_bridge_base_url()
+    return base + "/api/v1/pair/unpair" if base else ""
+
+
+def begin_secure_pairing():
+    global pairing_request_id, pairing_claim_token, pairing_request_expires_at
+    global pairing_next_poll_at, pairing_bridge_base
+
+    if pairing_is_active():
+        return False, "A secure pairing request is already in progress."
+    if "ota_job_active" in globals() and ota_job_active():
+        return False, "Wait for the software update to finish before starting secure pairing."
+    if not wifi.radio.connected:
+        set_pairing_state(PAIRING_ERROR, "WiFi is offline.", "Connect the ticker to WiFi first.", "WIFI OFFLINE", "PAIRING STOPPED")
+        return False, pairing_message
+
+    pairing_clear_runtime()
+    set_pairing_state(PAIRING_DISCOVERING, "Searching for the Raspberry Pi bridge.", "", "SEARCHING FOR PI", "KEEP BOTH ON SAME WIFI")
+
+    if not portfolio_bridge_base_url():
+        discover_portfolio_bridge(True)
+    else:
+        try:
+            health = bridge_request_json(portfolio_bridge_base_url() + "/api/v1/health", "", False, 4)
+            if str(health.get("service", "")) != "stockticker-bridge":
+                raise Exception("wrong service")
+        except Exception:
+            discover_portfolio_bridge(True)
+
+    base = portfolio_bridge_base_url()
+    if not base:
+        set_pairing_state(PAIRING_ERROR, "Raspberry Pi not found.", "Confirm both devices are on the same home WiFi.", "PI NOT FOUND", "CHECK SAME WIFI", 12)
+        return False, pairing_message
+
+    pairing_bridge_base = base
+    try:
+        capabilities = bridge_request_json(base + "/api/v1/pair/capabilities", "", False, 4)
+        if str(capabilities.get("protocol", "")) != PAIRING_PROTOCOL_NAME:
+            raise Exception("secure pairing protocol unavailable")
+        if int(capabilities.get("protocol_version", 0) or 0) > PAIRING_PROTOCOL_VERSION_SUPPORTED:
+            raise Exception("unsupported pairing protocol version")
+
+        set_pairing_state(PAIRING_REQUESTING, "Raspberry Pi found. Sending a temporary pairing request.", "", "PI FOUND", "SENDING PAIR REQUEST")
+        pairing_claim_token = pairing_token_text(40)
+        claim_hash = sha256_hex_text(pairing_claim_token)
+        payload = {
+            "device_id": DEVICE_ID,
+            "friendly_name": str(config.get("device_name", "StockTicker")),
+            "firmware": APP_VERSION,
+            "model": DEVICE_MODEL,
+            "local_hostname": MDNS_HOSTNAME + ".local",
+            "dashboard_url": "http://{}.local/".format(MDNS_HOSTNAME),
+            "bridge_id": str(config.get("portfolio_bridge_id", "")),
+            "claim_token_hash": claim_hash,
+        }
+        result = bridge_post_json(base + "/api/v1/pair/request", payload, "", False, 5)
+        pairing_request_id = str(result.get("request_id", ""))
+        if not pairing_request_id:
+            raise Exception("Pi did not return a pairing request ID")
+        ttl = int(result.get("expires_in_seconds", 300) or 300)
+        pairing_request_expires_at = time.monotonic() + max(1, ttl)
+        pairing_next_poll_at = time.monotonic() + PAIRING_REQUEST_POLL_SECONDS
+        set_pairing_state(
+            PAIRING_WAITING,
+            "Approve this ticker on the Raspberry Pi dashboard.",
+            "The request expires in about {} minute(s).".format(max(1, (ttl + 59) // 60)),
+            "APPROVE ON PI",
+            "PAIR REQUEST EXPIRES SOON",
+            14
+        )
+        return True, pairing_message
+    except Exception as error:
+        pairing_clear_runtime()
+        set_pairing_state(PAIRING_ERROR, friendly_error_text(error), repr(error), "PAIRING FAILED", "CHECK PI DASHBOARD", 12)
+        return False, pairing_message
+
+
+def cancel_secure_pairing():
+    pairing_clear_runtime()
+    set_pairing_state(PAIRING_UNPAIRED, "Local pairing request canceled.", "The Pi request will expire automatically.", "PAIRING CANCELED", "NORMAL DISPLAY RESUMED", 7)
+
+
+def save_secure_pairing_key(device_key, bridge_id):
+    global config
+    config["portfolio_bridge_key"] = str(device_key)
+    config["portfolio_bridge_id"] = str(bridge_id or config.get("portfolio_bridge_id", ""))
+    config["portfolio_pairing_mode"] = "secure-device-key"
+    config["portfolio_pairing_protocol"] = PAIRING_PROTOCOL_VERSION_SUPPORTED
+    config["portfolio_pairing_completed"] = safe_journal_time()
+    config["portfolio_mode"] = "local_bridge"
+    save_config_atomic(config)
+
+
+def clear_secure_pairing_local(disable_portfolio=True):
+    global config, last_portfolio_entry, last_portfolio_capabilities
+    config["portfolio_bridge_key"] = ""
+    config["portfolio_pairing_mode"] = "legacy-or-unpaired"
+    config["portfolio_pairing_protocol"] = 0
+    config["portfolio_pairing_completed"] = ""
+    config["portfolio_pairing_last_test"] = ""
+    if disable_portfolio:
+        config["portfolio_mode"] = "off"
+    save_config_atomic(config)
+    last_portfolio_entry = None
+    last_portfolio_capabilities = {}
+
+
+def start_secure_pairing_post_test():
+    global pairing_test_stage, pairing_test_payload, pairing_next_poll_at
+    pairing_test_stage = 1
+    pairing_test_payload = None
+    pairing_next_poll_at = time.monotonic() + 0.2
+    set_pairing_state(PAIRING_TESTING, "Testing secure authentication and portfolio access.", "Step 1 of 4", "TESTING CONNECTION", "SECURE AUTH CHECK")
+
+
+def secure_pairing_test_step():
+    global pairing_test_stage, pairing_test_payload, pairing_next_poll_at
+    global last_pairing_test_message, last_portfolio_entry, refresh_requested
+
+    if time.monotonic() < pairing_next_poll_at:
+        return
+    base = portfolio_bridge_base_url()
+    key = str(config.get("portfolio_bridge_key", "")).strip()
+    if not base or not key:
+        raise Exception("secure pairing configuration is incomplete")
+
+    if pairing_test_stage == 1:
+        result = bridge_post_json(base + "/api/v1/pair/test", {}, key, True, 5)
+        if not result.get("authenticated") or not result.get("trusted"):
+            raise Exception("device authentication did not pass")
+        pairing_test_stage = 2
+        pairing_next_poll_at = time.monotonic() + 0.2
+        set_pairing_state(PAIRING_TESTING, "Secure device authentication passed.", "Step 2 of 4", "AUTHENTICATION PASSED", "CHECKING BRIDGE API")
+        return
+
+    if pairing_test_stage == 2:
+        capabilities = bridge_request_json(base + "/api/v1/capabilities", key, True, 5)
+        if str(capabilities.get("service", "")) != "stockticker-bridge":
+            raise Exception("bridge capabilities response is invalid")
+        pairing_test_stage = 3
+        pairing_next_poll_at = time.monotonic() + 0.2
+        set_pairing_state(PAIRING_TESTING, "Bridge API compatibility passed.", "Step 3 of 4", "BRIDGE API PASSED", "CHECKING PORTFOLIO")
+        return
+
+    if pairing_test_stage == 3:
+        raw = bridge_request_json(base + "/api/v1/portfolio", key, True, 6)
+        data = normalize_v1_portfolio_payload(raw)
+        pairing_test_payload = data
+        try:
+            last_portfolio_entry = make_portfolio_entry(data)
+        except Exception:
+            last_portfolio_entry = None
+        pairing_test_stage = 4
+        pairing_next_poll_at = time.monotonic() + 0.2
+        set_pairing_state(PAIRING_TESTING, "Portfolio endpoint responded successfully.", "Step 4 of 4", "PORTFOLIO RECEIVED", "REGISTERING TICKER")
+        return
+
+    if pairing_test_stage == 4:
+        if not register_ticker_with_bridge(True):
+            raise Exception("ticker registration did not complete")
+        config["portfolio_pairing_last_test"] = safe_journal_time()
+        save_config_atomic(config)
+        last_pairing_test_message = "Secure pairing test passed at {}.".format(config["portfolio_pairing_last_test"])
+        pairing_test_stage = 0
+        pairing_test_payload = None
+        refresh_requested = True
+        pairing_clear_runtime()
+        set_pairing_state(PAIRING_PAIRED, "Secure pairing completed and portfolio access passed.", "", "PAIRING COMPLETE", "PORTFOLIO CONNECTED", 14)
+
+
+def secure_pairing_poll_step():
+    global pairing_next_poll_at, pairing_request_expires_at
+
+    if pairing_state != PAIRING_WAITING:
+        return
+    now = time.monotonic()
+    if pairing_request_expires_at and now >= pairing_request_expires_at:
+        pairing_clear_runtime()
+        set_pairing_state(PAIRING_EXPIRED, "Pairing request expired.", "Start pairing again.", "PAIRING EXPIRED", "TRY AGAIN", 12)
+        return
+    if now < pairing_next_poll_at:
+        return
+    pairing_next_poll_at = now + PAIRING_REQUEST_POLL_SECONDS
+
+    try:
+        result = bridge_post_json(
+            pairing_status_url(),
+            {"request_id": pairing_request_id, "claim_token": pairing_claim_token},
+            "",
+            False,
+            4
+        )
+        state = str(result.get("state", "pending"))
+        ttl = int(result.get("expires_in_seconds", 0) or 0)
+        if ttl > 0:
+            pairing_request_expires_at = now + ttl
+        if state == "pending":
+            return
+        if state == "approved":
+            device_key = str(result.get("device_key", ""))
+            if not device_key:
+                raise Exception("approved request did not include the secure device key")
+            set_pairing_state(PAIRING_CLAIMING, "Pairing approved. Saving the secure device key.", "", "PAIRING APPROVED", "SAVING SECURE KEY")
+            save_secure_pairing_key(device_key, result.get("bridge_id", ""))
+            pairing_claim_token_local = pairing_claim_token
+            pairing_clear_runtime()
+            # Keep the temporary local assignment referenced until after the atomic save.
+            if not pairing_claim_token_local:
+                raise Exception("pairing claim state was lost")
+            start_secure_pairing_post_test()
+            return
+        if state == "rejected":
+            pairing_clear_runtime()
+            set_pairing_state(PAIRING_REJECTED, "Pairing request was rejected on the Raspberry Pi.", "", "PAIRING REJECTED", "TRY AGAIN WHEN READY", 12)
+            return
+        if state == "expired":
+            pairing_clear_runtime()
+            set_pairing_state(PAIRING_EXPIRED, "Pairing request expired.", "Start pairing again.", "PAIRING EXPIRED", "TRY AGAIN", 12)
+            return
+    except Exception as error:
+        lower = str(error).lower()
+        if "request_not_found" in lower or "expired" in lower:
+            pairing_clear_runtime()
+            set_pairing_state(PAIRING_EXPIRED, "Pairing request expired or was removed.", "Start pairing again.", "PAIRING EXPIRED", "TRY AGAIN", 12)
+        elif "invalid_claim_token" in lower:
+            pairing_clear_runtime()
+            set_pairing_state(PAIRING_ERROR, "The temporary pairing claim could not be verified.", "Start a new pairing request.", "PAIRING FAILED", "START AGAIN", 12)
+        else:
+            pairing_detail_local = repr(error)
+            set_pairing_state(PAIRING_ERROR, friendly_error_text(error), pairing_detail_local, "PAIRING ERROR", "CHECK PI CONNECTION", 10)
+
+
+def pairing_step():
+    if pairing_state == PAIRING_WAITING:
+        secure_pairing_poll_step()
+        return
+    if pairing_state == PAIRING_TESTING and pairing_test_stage:
+        try:
+            secure_pairing_test_step()
+        except Exception as error:
+            global last_pairing_test_message
+            last_pairing_test_message = "Secure pairing test failed: " + friendly_error_text(error)
+            set_pairing_state(PAIRING_ERROR, friendly_error_text(error), repr(error), "PAIRING TEST FAILED", "CHECK PI DASHBOARD", 12)
+
+
+def test_secure_pairing_now():
+    global last_pairing_test_message
+    if not secure_pairing_active():
+        last_pairing_test_message = "Secure pairing is not active. Use Find & Pair Raspberry Pi first."
+        return False, last_pairing_test_message
+    start_secure_pairing_post_test()
+    last_pairing_test_message = "Secure pairing test started."
+    return True, last_pairing_test_message
+
+
+def unpair_secure_bridge():
+    if not secure_pairing_active():
+        clear_secure_pairing_local(True)
+        pairing_clear_runtime()
+        set_pairing_state(PAIRING_UNPAIRED, "Local legacy pairing settings were cleared.", "", "PI UNPAIRED", "PORTFOLIO MODE OFF", 10)
+        return True, pairing_message
+    url = pairing_unpair_url()
+    key = str(config.get("portfolio_bridge_key", "")).strip()
+    if not url:
+        return False, "The saved Raspberry Pi bridge URL is missing."
+    try:
+        result = bridge_post_json(url, {}, key, True, 5)
+        if not result.get("removed"):
+            raise Exception("Pi did not confirm removal")
+        clear_secure_pairing_local(True)
+        pairing_clear_runtime()
+        set_pairing_state(PAIRING_UNPAIRED, "Ticker and Raspberry Pi were securely unpaired.", "", "PI UNPAIRED", "PORTFOLIO MODE OFF", 12)
+        return True, pairing_message
+    except Exception as error:
+        return False, friendly_error_text(error)
+
+
+def build_pairing_status_html():
+    remaining = 0
+    if pairing_state == PAIRING_WAITING and pairing_request_expires_at:
+        remaining = max(0, int(pairing_request_expires_at - time.monotonic()))
+    rows = [
+        "<div class='status-line'><span>Security</span><b>{}</b></div>".format(
+            "Per-device secure key" if secure_pairing_active() else "Legacy or unpaired"
+        ),
+        "<div class='status-line'><span>Pairing state</span><b>{}</b></div>".format(safe_html(pairing_state_label())),
+        "<div class='status-line'><span>Protocol</span><b>{}</b></div>".format(
+            "v{}".format(config.get("portfolio_pairing_protocol", 0)) if secure_pairing_active() else "Not active"
+        ),
+    ]
+    if remaining:
+        rows.append("<div class='status-line'><span>Request expires</span><b>{}:{:02d}</b></div>".format(remaining // 60, remaining % 60))
+    rows.append("<p class='small'><b>{}</b><br>{}</p>".format(safe_html(pairing_message), safe_html(pairing_detail)))
+    return "".join(rows)
+
+
+def build_pairing_controls_html():
+    if pairing_is_active():
+        return (
+            "<form method='POST' action='/cancel-secure-pairing'>"
+            "<button class='orange' type='submit'>Cancel Pairing Request</button></form>"
+        )
+    if secure_pairing_active():
+        return (
+            "<form method='POST' action='/test-secure-pairing'><button type='submit'>Test Secure Pairing</button></form>"
+            "<form method='POST' action='/unpair-secure-bridge'>"
+            "<input name='admin_pin' type='password' placeholder='Admin PIN' required autocomplete='current-password'>"
+            "<button class='red' type='submit'>Unpair Raspberry Pi</button></form>"
+            "<form method='POST' action='/pair-different-pi'>"
+            "<input name='admin_pin' type='password' placeholder='Admin PIN' required autocomplete='current-password'>"
+            "<button class='orange' type='submit'>Pair With Different Pi</button></form>"
+        )
+    label_text = "Upgrade Pairing Security" if str(config.get("portfolio_bridge_key", "")).strip() else "Find & Pair Raspberry Pi"
+    return (
+        "<form method='POST' action='/start-secure-pairing'>"
+        "<button type='submit'>{}</button></form>".format(label_text)
+    )
 
 
 def register_ticker_with_bridge(force=False):
@@ -2324,7 +2899,7 @@ def register_ticker_with_bridge(force=False):
         response = requests.post(
             base + "/api/v1/pair/register",
             json=payload,
-            headers={"X-Bridge-Key": key, "Connection": "close"},
+            headers=bridge_auth_headers(key, True),
             timeout=4
         )
         data = response.json()
@@ -2413,7 +2988,8 @@ def discover_portfolio_bridge(force=False):
             save_config(config)
             last_bridge_discovery_message = "Bridge discovered automatically at {}.".format(base)
             add_event(last_bridge_discovery_message)
-            register_ticker_with_bridge(True)
+            if str(config.get("portfolio_bridge_key", "")).strip():
+                register_ticker_with_bridge(True)
             return True
         except Exception:
             continue
@@ -2499,6 +3075,8 @@ def fetch_bridge_capabilities(force=False):
 
 
 def fetch_portfolio_payload(allow_discovery=True):
+    if pairing_state == PAIRING_REVOKED:
+        raise Exception("device_revoked")
     key = str(config.get("portfolio_bridge_key", "")).strip()
     prefer_v1 = bool_from_form(config.get("portfolio_prefer_api_v1", True))
 
@@ -2749,6 +3327,10 @@ def fetch_portfolio_entry():
 
 
 def portfolio_status_short():
+    if pairing_state == PAIRING_REVOKED:
+        return "Access Revoked"
+    if pairing_is_active():
+        return pairing_state_label()
     if not is_portfolio_enabled():
         return "Off"
 
@@ -2827,6 +3409,7 @@ def connection_setup_steps():
     bridge_url_ok = bool(portfolio_bridge_base_url())
     bridge_found = bridge_url_ok or bool(str(config.get("portfolio_bridge_id", "")).strip())
     bridge_key_ok = bool(str(config.get("portfolio_bridge_key", "")).strip())
+    secure_ok = secure_pairing_active()
     portfolio_ok = bool(
         last_portfolio_entry
         and not last_portfolio_entry.get("error_reason")
@@ -2836,7 +3419,7 @@ def connection_setup_steps():
     return (
         (wifi_ok, "Ticker WiFi", "Connected" if wifi_ok else "Needs setup"),
         (bridge_found, "Raspberry Pi", "Found" if bridge_found else "Searching"),
-        (bridge_key_ok, "Pairing", "Ready" if bridge_key_ok else "Approval/key needed"),
+        (secure_ok or bridge_key_ok, "Pairing", "Secure" if secure_ok else (pairing_state_label() if pairing_is_active() else ("Legacy key" if bridge_key_ok else "Approval needed"))),
         (portfolio_ok, "Portfolio data", "Current" if portfolio_ok else "Waiting")
     )
 
@@ -2982,6 +3565,16 @@ def friendly_error_text(message):
         return "Live stock quotes need a Finnhub API key. Open Customer Setup, save the key, then press Refresh Quotes."
     if "wrong admin pin" in lower or "incorrect admin pin" in lower:
         return "That admin PIN was not accepted. Check the PIN and try again."
+    if "device_revoked" in lower:
+        return "The Raspberry Pi revoked this ticker's portfolio access. Start secure pairing again after approving the ticker on the Pi dashboard."
+    if "device_not_trusted" in lower or "invalid_device_key" in lower:
+        return "The saved secure pairing is no longer accepted. Start secure pairing again to issue a new device key."
+    if "pairing_rate_limited" in lower:
+        return "Too many pairing requests were sent. Wait one minute, then try again."
+    if "request_not_found" in lower or "request_expired" in lower:
+        return "The temporary pairing request expired. Start pairing again."
+    if "invalid_claim_token" in lower:
+        return "The temporary pairing request could not be verified. Start a new pairing request."
     if "bridge key" in lower or "unauthorized" in lower or "http 401" in lower or "http 403" in lower:
         return "The Raspberry Pi was found, but pairing authorization failed. Confirm the display key or approve this ticker on the Pi dashboard."
     if "no compatible stockticker bridge" in lower or "bridge not discovered" in lower:
@@ -3047,7 +3640,7 @@ def setup_completion_counts():
     checks.append((len(SYMBOLS) > 0, "Symbols saved"))
     if is_portfolio_enabled():
         checks.append((bool(str(config.get("portfolio_bridge_url", "")).strip()), "Portfolio bridge URL saved"))
-        checks.append((bool(str(config.get("portfolio_bridge_key", "")).strip()), "Portfolio bridge key saved"))
+        checks.append((bool(str(config.get("portfolio_bridge_key", "")).strip()), "Portfolio pairing key saved"))
     checks.append((str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed"))
     checks.append((file_exists(BACKUP_APP_PATH), "OTA backup available"))
     return checks
@@ -3114,6 +3707,11 @@ def system_health_state():
         return "DEMO", "Demo Mode", "warnbadge"
     if bool_from_form(config.get("panel_sleep", False)):
         return "SLEEP", "Display Sleeping", "infobadge"
+
+    if pairing_state == PAIRING_REVOKED:
+        return "WARNING", "Pairing Revoked", "warnbadge"
+    if pairing_is_active():
+        return "INFO", "Pairing In Progress", "infobadge"
 
     if is_portfolio_enabled():
         if not str(config.get("portfolio_bridge_url", "")).strip():
@@ -3408,6 +4006,11 @@ def build_support_report_text():
     lines.append("Ticker Portfolio Role: " + PORTFOLIO_TICKER_ROLE)
     lines.append("Direct Schwab Processing on Ticker: No")
     lines.append("Bridge Key Saved: " + yes_no(bool(str(config.get("portfolio_bridge_key", "")).strip())))
+    lines.append("Pairing Security: " + ("Per-device secure key" if secure_pairing_active() else "Legacy or unpaired"))
+    lines.append("Pairing State: " + pairing_state_label())
+    lines.append("Pairing Protocol: " + str(config.get("portfolio_pairing_protocol", 0)))
+    lines.append("Pairing Completed: " + str(config.get("portfolio_pairing_completed", "")))
+    lines.append("Pairing Last Test: " + str(config.get("portfolio_pairing_last_test", "")))
     wifi_details = current_wifi_details()
     wifi_state = wifi_state_load()
     lines.append("WiFi Connected: " + yes_no(wifi.radio.connected))
@@ -4357,6 +4960,7 @@ body {{
 .connection-step b {{ text-align:right; }}
 .step-ok .step-icon {{ color:#74ff9e; }}
 .step-wait .step-icon {{ color:#ffd166; }}
+.pairing-panel {{ background:rgba(5,15,27,.72); border:1px solid #2a4166; border-radius:12px; padding:10px; margin:10px 0; }}
 .section-note {{
   border-left:3px solid #3994ff;
   padding:9px 11px;
@@ -4461,12 +5065,14 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <div class="status-line"><span>Ticker role</span><b>Read-only display client</b></div>
 <p class="section-note">The Raspberry Pi keeps Schwab credentials local. The ticker receives only sanitized display data.</p>
 <div class="connection-steps">{connection_steps_html}</div>
-<p class="small"><b>Automatic pairing:</b> {bridge_registration_message}</p>
+<div class="pairing-panel">{pairing_status_html}</div>
+<p class="small"><b>Automatic registration:</b> {bridge_registration_message}</p>
+<p class="small"><b>Secure pairing test:</b> {pairing_test_message}</p>
 <p class="small"><b>Stable ticker address:</b> <a href="http://{ticker_local_hostname}/" target="_blank">http://{ticker_local_hostname}/</a></p>
 <div>{portfolio_bridge_links_html}</div>
 <div class="button-row">
-<form method="POST" action="/discover-bridge"><button type="submit">Find &amp; Pair Raspberry Pi</button></form>
-<form method="POST" action="/test-portfolio"><button type="submit">Test Bridge</button></form>
+{pairing_controls_html}
+<form method="POST" action="/test-portfolio"><button type="submit">Test Portfolio</button></form>
 <form method="POST" action="/refresh-now"><button class="green" type="submit">Refresh Display</button></form>
 </div>
 </div>
@@ -5417,8 +6023,82 @@ def device_health_route(request: Request):
         "dashboard_url": "http://{}.local/".format(MDNS_HOSTNAME),
         "port": 80,
         "bridge_registration": last_bridge_registration_message,
+        "pairing_state": pairing_state,
+        "pairing_state_label": pairing_state_label(),
+        "pairing_mode": str(config.get("portfolio_pairing_mode", "legacy-or-unpaired")),
+        "pairing_protocol": int(config.get("portfolio_pairing_protocol", 0) or 0),
+        "secure_pairing": secure_pairing_active(),
     }
     return Response(request, json.dumps(payload), content_type="application/json")
+
+
+@server.route("/start-secure-pairing", methods=["POST"])
+def start_secure_pairing_route(request: Request):
+    ok, message = begin_secure_pairing()
+    if ok:
+        set_web_message(message)
+    else:
+        set_error_message(message)
+    return Response(request, clean_page("Secure Pairing", safe_html(message)), content_type="text/html")
+
+
+@server.route("/cancel-secure-pairing", methods=["POST"])
+def cancel_secure_pairing_route(request: Request):
+    cancel_secure_pairing()
+    set_web_message(pairing_message)
+    return Response(request, clean_page("Pairing Canceled", safe_html(pairing_message)), content_type="text/html")
+
+
+@server.route("/test-secure-pairing", methods=["POST"])
+def test_secure_pairing_route(request: Request):
+    ok, message = test_secure_pairing_now()
+    if ok:
+        set_web_message(message)
+    else:
+        set_error_message(message)
+    return Response(request, clean_page("Secure Pairing Test", safe_html(message)), content_type="text/html")
+
+
+@server.route("/unpair-secure-bridge", methods=["POST"])
+def unpair_secure_bridge_route(request: Request):
+    entered_pin = str(request.form_data.get("admin_pin", ""))
+    ok_pin, pin_message = verify_wifi_admin_pin(entered_pin)
+    if not ok_pin:
+        set_error_message(pin_message)
+        return Response(request, clean_page("Unpair Blocked", safe_html(pin_message)), content_type="text/html")
+    ok, message = unpair_secure_bridge()
+    if ok:
+        set_web_message(message)
+    else:
+        set_error_message(message)
+    return Response(request, clean_page("Secure Unpair", safe_html(message)), content_type="text/html")
+
+
+@server.route("/pair-different-pi", methods=["POST"])
+def pair_different_pi_route(request: Request):
+    global config
+    entered_pin = str(request.form_data.get("admin_pin", ""))
+    ok_pin, pin_message = verify_wifi_admin_pin(entered_pin)
+    if not ok_pin:
+        set_error_message(pin_message)
+        return Response(request, clean_page("Pairing Blocked", safe_html(pin_message)), content_type="text/html")
+
+    ok, message = unpair_secure_bridge()
+    if not ok:
+        set_error_message(message)
+        return Response(request, clean_page("Could Not Change Pi", safe_html(message)), content_type="text/html")
+
+    config["portfolio_bridge_url"] = ""
+    config["portfolio_bridge_id"] = ""
+    config["portfolio_bridge_local_hostname"] = ""
+    config["portfolio_bridge_dashboard_url"] = ""
+    save_config_atomic(config)
+    ok, message = begin_secure_pairing()
+    if ok:
+        set_web_message(message)
+    else:
+        set_error_message(message)
+    return Response(request, clean_page("Pair With Different Pi", safe_html(message)), content_type="text/html")
 
 
 @server.route("/discover-bridge", methods=["POST"])
@@ -5544,6 +6224,9 @@ def index(request: Request):
             portfolio_bridge_links_html=build_portfolio_bridge_links_html(),
             bridge_registration_message=safe_html(last_bridge_registration_message),
             connection_steps_html=build_connection_steps_html(),
+            pairing_status_html=build_pairing_status_html(),
+            pairing_controls_html=build_pairing_controls_html(),
+            pairing_test_message=safe_html(last_pairing_test_message),
             ticker_local_hostname=safe_html(MDNS_HOSTNAME + ".local"),
             closed_dates="\n".join(holidays["closed"]),
             early_close_dates="\n".join(holidays["early_close"])
@@ -5626,7 +6309,7 @@ def test_portfolio_route(request: Request):
     else:
         portfolio_test_message = (
             "Raspberry Pi connection is not ready. Make sure both devices are on the same WiFi, "
-            "press Find & Pair Raspberry Pi, then confirm the display key or approve the ticker on the Pi dashboard."
+            "use Find & Pair Raspberry Pi, then approve this ticker on the Pi dashboard."
         )
         set_error_message(portfolio_test_message)
 
@@ -7729,6 +8412,53 @@ clock_label.y = 4
 root.append(clock_label)
 
 
+def create_pairing_overlay():
+    global pairing_overlay_group, pairing_overlay_top_label, pairing_overlay_bottom_label
+    group = displayio.Group()
+    background_bitmap = displayio.Bitmap(320, 64, 1)
+    background_palette = displayio.Palette(1)
+    background_palette[0] = 0x000000
+    group.append(displayio.TileGrid(background_bitmap, pixel_shader=background_palette))
+    top = label.Label(terminalio.FONT, text="", color=0xFFFFFF, scale=1)
+    top.x = 4
+    top.y = 25
+    bottom = label.Label(terminalio.FONT, text="", color=0x00AAFF, scale=1)
+    bottom.x = 4
+    bottom.y = 43
+    group.append(top)
+    group.append(bottom)
+    group.x = display.width + 10
+    pairing_overlay_group = group
+    pairing_overlay_top_label = top
+    pairing_overlay_bottom_label = bottom
+    return group
+
+
+def pairing_overlay_step():
+    global pairing_overlay_visible
+    if pairing_overlay_group is None:
+        return
+    show = bool(pairing_led_until and time.monotonic() < pairing_led_until and pairing_led_top)
+    if show:
+        pairing_overlay_top_label.text = pairing_led_top
+        pairing_overlay_bottom_label.text = pairing_led_bottom
+        pairing_overlay_group.x = 0
+        pairing_overlay_visible = True
+    elif pairing_overlay_visible:
+        pairing_overlay_group.x = display.width + 10
+        pairing_overlay_visible = False
+
+
+def ensure_pairing_overlay_on_top():
+    if pairing_overlay_group is None:
+        return
+    try:
+        root.remove(pairing_overlay_group)
+    except Exception:
+        pass
+    root.append(pairing_overlay_group)
+
+
 def load_logos():
     logos = {}
 
@@ -8112,6 +8842,8 @@ after_hours = status != "OPN"
 entries = startup_entries()
 pending_entries = entries[:]
 blocks = build_blocks(entries, after_hours)
+create_pairing_overlay()
+ensure_pairing_overlay_on_top()
 last_quote_fetch = time.monotonic()
 smooth_refresh_active = True
 smooth_refresh_index = 0
@@ -8130,6 +8862,9 @@ while True:
 
     ota_job_step()
     boot_watchdog_step()
+    if not ota_job_active():
+        pairing_step()
+    pairing_overlay_step()
     now = time.monotonic()
 
     if restart_requested and now >= restart_time:
@@ -8209,6 +8944,7 @@ while True:
         smooth_refresh_active = False
         smooth_refresh_index = 0
         blocks = build_blocks(entries, after_hours)
+        ensure_pairing_overlay_on_top()
         last_quote_fetch = now
 
     panel_sleeping_now = bool_from_form(config.get("panel_sleep", False))
