@@ -1,10 +1,10 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.30-beta"
+APP_VERSION = "1.1.31-beta"
 CONFIG_SCHEMA_VERSION = 4
-# 1.1.30: secure temporary pairing requests, Pi approval, automatic per-device
-# key exchange, trusted-device authentication, revoke/unpair handling, staged
-# post-pair testing, and non-blocking LED pairing guidance.
+# 1.1.31: customer-safe pairing recovery, persistent revoked/not-trusted state,
+# local disconnect without factory reset, resilient pair-different-Pi handling,
+# clearer dashboard guidance, and preservation of unrelated customer settings.
 # 1.1.29: customer-facing startup states, consistent money formatting,
 # clearer recovery guidance, and unified connection-status presentation.
 # 1.1.27: fast visible startup, bounded bridge requests, API-v1 compatibility,
@@ -299,6 +299,9 @@ DEFAULT_CONFIG = {
     "portfolio_pairing_protocol": 0,
     "portfolio_pairing_completed": "",
     "portfolio_pairing_last_test": "",
+    "portfolio_pairing_recovery_required": False,
+    "portfolio_pairing_last_error_code": "",
+    "portfolio_pairing_last_error_message": "",
     "bridge_self_register_enabled": True,
     "portfolio_request_timeout_seconds": 6,
     "mdns_enabled": True,
@@ -1628,19 +1631,49 @@ PAIRING_EXPIRED = "EXPIRED"
 PAIRING_REVOKED = "REVOKED"
 PAIRING_ERROR = "ERROR"
 
-pairing_state = (
-    PAIRING_PAIRED
-    if str(config.get("portfolio_pairing_mode", "")) == "secure-device-key"
+_saved_pairing_error_code = str(
+    config.get("portfolio_pairing_last_error_code", "") or ""
+).strip()
+_saved_pairing_error_message = str(
+    config.get("portfolio_pairing_last_error_message", "") or ""
+).strip()
+_saved_pairing_recovery = bool_from_form(
+    config.get("portfolio_pairing_recovery_required", False)
+)
+
+if _saved_pairing_recovery and _saved_pairing_error_code == "device_revoked":
+    pairing_state = PAIRING_REVOKED
+    pairing_message = (
+        _saved_pairing_error_message
+        or "The Raspberry Pi revoked this ticker's portfolio access."
+    )
+    pairing_detail = (
+        "Use Clear Revoked Key & Pair Again, then approve the new request "
+        "on the Raspberry Pi dashboard."
+    )
+elif _saved_pairing_recovery:
+    pairing_state = PAIRING_ERROR
+    pairing_message = (
+        _saved_pairing_error_message
+        or "The saved secure pairing is no longer accepted."
+    )
+    pairing_detail = (
+        "Use Repair Secure Pairing, then approve the new request on the "
+        "Raspberry Pi dashboard."
+    )
+elif (
+    str(config.get("portfolio_pairing_mode", "")) == "secure-device-key"
     and bool(str(config.get("portfolio_bridge_key", "")).strip())
-    else PAIRING_UNPAIRED
-)
-pairing_message = (
-    "Secure pairing is active."
-    if pairing_state == PAIRING_PAIRED
-    else "Secure pairing has not started."
-)
-pairing_detail = ""
-pairing_error_code = ""
+):
+    pairing_state = PAIRING_PAIRED
+    pairing_message = "Secure pairing is active."
+    pairing_detail = ""
+else:
+    pairing_state = PAIRING_UNPAIRED
+    pairing_message = "Secure pairing has not started."
+    pairing_detail = ""
+
+pairing_error_code = _saved_pairing_error_code
 pairing_request_id = ""
 pairing_claim_token = ""
 pairing_request_expires_at = 0.0
@@ -2445,25 +2478,67 @@ def set_pairing_state(state, message, detail="", led_top="", led_bottom="", led_
         print("PAIRING:", pairing_state, pairing_message)
 
 
+def pairing_recovery_active():
+    return (
+        bool_from_form(config.get("portfolio_pairing_recovery_required", False))
+        or pairing_state == PAIRING_REVOKED
+        or pairing_error_code in (
+            "device_revoked",
+            "device_not_trusted",
+            "invalid_device_key",
+        )
+    )
+
+
+def persist_pairing_recovery(code, message):
+    global config
+    code = str(code or "")[:64]
+    message = str(message or "")[:180]
+    changed = (
+        not bool_from_form(config.get("portfolio_pairing_recovery_required", False))
+        or str(config.get("portfolio_pairing_last_error_code", "")) != code
+        or str(config.get("portfolio_pairing_last_error_message", "")) != message
+    )
+    config["portfolio_pairing_recovery_required"] = True
+    config["portfolio_pairing_last_error_code"] = code
+    config["portfolio_pairing_last_error_message"] = message
+    if changed:
+        try:
+            save_config_atomic(config)
+        except Exception as error:
+            print("Pairing recovery state save failed:", repr(error))
+
+
+def clear_pairing_recovery_fields():
+    global config
+    config["portfolio_pairing_recovery_required"] = False
+    config["portfolio_pairing_last_error_code"] = ""
+    config["portfolio_pairing_last_error_message"] = ""
+
+
 def handle_pairing_auth_error(code):
     global pairing_error_code
     code = str(code or "").strip().lower()
     if code == "device_revoked":
         pairing_error_code = code
+        message = "The Raspberry Pi revoked this ticker's portfolio access."
+        persist_pairing_recovery(code, message)
         set_pairing_state(
             PAIRING_REVOKED,
-            "The Raspberry Pi revoked this ticker's portfolio access.",
-            "Start secure pairing again after approving this ticker on the Pi dashboard.",
+            message,
+            "Use Clear Revoked Key & Pair Again, then approve the new request on the Pi dashboard.",
             "ACCESS REVOKED",
             "PAIR AGAIN",
             14
         )
     elif code in ("device_not_trusted", "invalid_device_key") and secure_pairing_active():
         pairing_error_code = code
+        message = "The saved secure pairing is no longer accepted by the Raspberry Pi."
+        persist_pairing_recovery(code, message)
         set_pairing_state(
             PAIRING_ERROR,
-            "The saved secure pairing is no longer accepted by the Raspberry Pi.",
-            "Start secure pairing again to issue a new device key.",
+            message,
+            "Use Repair Secure Pairing, then approve the new request on the Pi dashboard.",
             "PAIRING INVALID",
             "PAIR AGAIN",
             12
@@ -2633,6 +2708,7 @@ def save_secure_pairing_key(device_key, bridge_id):
     config["portfolio_pairing_protocol"] = PAIRING_PROTOCOL_VERSION_SUPPORTED
     config["portfolio_pairing_completed"] = safe_journal_time()
     config["portfolio_mode"] = "local_bridge"
+    clear_pairing_recovery_fields()
     save_config_atomic(config)
 
 
@@ -2643,6 +2719,7 @@ def clear_secure_pairing_local(disable_portfolio=True):
     config["portfolio_pairing_protocol"] = 0
     config["portfolio_pairing_completed"] = ""
     config["portfolio_pairing_last_test"] = ""
+    clear_pairing_recovery_fields()
     if disable_portfolio:
         config["portfolio_mode"] = "off"
     save_config_atomic(config)
@@ -2798,26 +2875,75 @@ def test_secure_pairing_now():
     return True, last_pairing_test_message
 
 
+def local_disconnect_portfolio(message="Portfolio connection was removed from this ticker."):
+    clear_secure_pairing_local(True)
+    pairing_clear_runtime()
+    set_pairing_state(
+        PAIRING_UNPAIRED,
+        message,
+        "WiFi, symbols, Finnhub key, brightness, admin PIN, and OTA settings were preserved.",
+        "PORTFOLIO DISCONNECTED",
+        "STOCK TICKER STILL ACTIVE",
+        12
+    )
+    return True, pairing_message
+
+
+def recover_secure_pairing():
+    if pairing_is_active():
+        return False, "A pairing request is already in progress."
+    clear_secure_pairing_local(True)
+    pairing_clear_runtime()
+    set_pairing_state(
+        PAIRING_UNPAIRED,
+        "Old secure pairing cleared. Starting a new approval request.",
+        "Approve this ticker on the Raspberry Pi dashboard when it appears.",
+        "OLD KEY CLEARED",
+        "STARTING NEW PAIRING",
+        8
+    )
+    return begin_secure_pairing()
+
+
 def unpair_secure_bridge():
     if not secure_pairing_active():
-        clear_secure_pairing_local(True)
-        pairing_clear_runtime()
-        set_pairing_state(PAIRING_UNPAIRED, "Local legacy pairing settings were cleared.", "", "PI UNPAIRED", "PORTFOLIO MODE OFF", 10)
-        return True, pairing_message
+        return local_disconnect_portfolio("Local pairing settings were cleared.")
     url = pairing_unpair_url()
     key = str(config.get("portfolio_bridge_key", "")).strip()
     if not url:
-        return False, "The saved Raspberry Pi bridge URL is missing."
+        return False, (
+            "The saved Raspberry Pi address is missing. Use Disconnect Portfolio "
+            "to clear this ticker locally without changing other settings."
+        )
     try:
         result = bridge_post_json(url, {}, key, True, 5)
         if not result.get("removed"):
             raise Exception("Pi did not confirm removal")
         clear_secure_pairing_local(True)
         pairing_clear_runtime()
-        set_pairing_state(PAIRING_UNPAIRED, "Ticker and Raspberry Pi were securely unpaired.", "", "PI UNPAIRED", "PORTFOLIO MODE OFF", 12)
+        set_pairing_state(
+            PAIRING_UNPAIRED,
+            "Ticker and Raspberry Pi were securely unpaired.",
+            "",
+            "PI UNPAIRED",
+            "PORTFOLIO MODE OFF",
+            12
+        )
         return True, pairing_message
     except Exception as error:
-        return False, friendly_error_text(error)
+        raw = str(error).lower()
+        if (
+            "device_revoked" in raw
+            or "device_not_trusted" in raw
+            or "invalid_device_key" in raw
+        ):
+            return local_disconnect_portfolio(
+                "The Pi had already revoked or removed this ticker; local pairing was cleared safely."
+            )
+        return False, (
+            friendly_error_text(error)
+            + " Use Disconnect Portfolio to remove the local connection without a factory reset."
+        )
 
 
 def build_pairing_status_html():
@@ -2826,7 +2952,13 @@ def build_pairing_status_html():
         remaining = max(0, int(pairing_request_expires_at - time.monotonic()))
     rows = [
         "<div class='status-line'><span>Security</span><b>{}</b></div>".format(
-            "Per-device secure key" if secure_pairing_active() else "Legacy or unpaired"
+            (
+                "Secure key needs replacement"
+                if pairing_recovery_active()
+                else "Per-device secure key"
+                if secure_pairing_active()
+                else "Legacy or unpaired"
+            )
         ),
         "<div class='status-line'><span>Pairing state</span><b>{}</b></div>".format(safe_html(pairing_state_label())),
         "<div class='status-line'><span>Protocol</span><b>{}</b></div>".format(
@@ -2836,7 +2968,26 @@ def build_pairing_status_html():
     if remaining:
         rows.append("<div class='status-line'><span>Request expires</span><b>{}:{:02d}</b></div>".format(remaining // 60, remaining % 60))
     rows.append("<p class='small'><b>{}</b><br>{}</p>".format(safe_html(pairing_message), safe_html(pairing_detail)))
+    if pairing_recovery_active():
+        rows.append(
+            "<div class='onboard warn'><b>Pairing recovery needed</b>"
+            "<div class='small'>The saved device key cannot be reused. Clear only the old pairing key, start a new request, then approve this ticker on the Pi dashboard. No WiFi, symbols, Finnhub, brightness, PIN, or OTA settings will be erased.</div>"
+            "</div>"
+        )
     return "".join(rows)
+
+
+def pairing_pin_form(action, label_text, button_class, confirm_text=""):
+    confirm_attr = ""
+    if confirm_text:
+        confirm_attr = ' onsubmit="return confirm(\'{}\');"'.format(
+            safe_attr(confirm_text)
+        )
+    return (
+        "<form method='POST' action='{}'{}>"
+        "<input name='admin_pin' type='password' placeholder='Admin PIN' required autocomplete='current-password'>"
+        "<button class='{}' type='submit'>{}</button></form>"
+    ).format(action, confirm_attr, button_class, label_text)
 
 
 def build_pairing_controls_html():
@@ -2845,15 +2996,48 @@ def build_pairing_controls_html():
             "<form method='POST' action='/cancel-secure-pairing'>"
             "<button class='orange' type='submit'>Cancel Pairing Request</button></form>"
         )
+    if pairing_recovery_active():
+        recovery_label = (
+            "Clear Revoked Key & Pair Again"
+            if pairing_error_code == "device_revoked" or pairing_state == PAIRING_REVOKED
+            else "Repair Secure Pairing"
+        )
+        return (
+            pairing_pin_form("/recover-secure-pairing", recovery_label, "green")
+            + pairing_pin_form(
+                "/disconnect-portfolio-local",
+                "Disconnect Portfolio",
+                "red",
+                "Disconnect portfolio access from this ticker? Stock quotes and customer settings will remain."
+            )
+            + pairing_pin_form(
+                "/pair-different-pi",
+                "Pair With Different Pi",
+                "orange",
+                "Clear the current pairing and search for another Raspberry Pi?"
+            )
+        )
     if secure_pairing_active():
         return (
             "<form method='POST' action='/test-secure-pairing'><button type='submit'>Test Secure Pairing</button></form>"
-            "<form method='POST' action='/unpair-secure-bridge'>"
-            "<input name='admin_pin' type='password' placeholder='Admin PIN' required autocomplete='current-password'>"
-            "<button class='red' type='submit'>Unpair Raspberry Pi</button></form>"
-            "<form method='POST' action='/pair-different-pi'>"
-            "<input name='admin_pin' type='password' placeholder='Admin PIN' required autocomplete='current-password'>"
-            "<button class='orange' type='submit'>Pair With Different Pi</button></form>"
+            + pairing_pin_form(
+                "/unpair-secure-bridge",
+                "Unpair Raspberry Pi",
+                "red",
+                "Unpair this ticker from the Raspberry Pi and turn portfolio mode off?"
+            )
+            + pairing_pin_form(
+                "/pair-different-pi",
+                "Pair With Different Pi",
+                "orange",
+                "Clear the current pairing and search for another Raspberry Pi?"
+            )
+            + pairing_pin_form(
+                "/disconnect-portfolio-local",
+                "Disconnect Portfolio Locally",
+                "red",
+                "Clear the local portfolio connection? The Pi trusted record may remain until removed from the Pi dashboard."
+            )
         )
     label_text = "Upgrade Pairing Security" if str(config.get("portfolio_bridge_key", "")).strip() else "Find & Pair Raspberry Pi"
     return (
@@ -3566,9 +3750,9 @@ def friendly_error_text(message):
     if "wrong admin pin" in lower or "incorrect admin pin" in lower:
         return "That admin PIN was not accepted. Check the PIN and try again."
     if "device_revoked" in lower:
-        return "The Raspberry Pi revoked this ticker's portfolio access. Start secure pairing again after approving the ticker on the Pi dashboard."
+        return "The Raspberry Pi revoked this ticker's portfolio access. Use Clear Revoked Key & Pair Again, then approve the new request on the Pi dashboard."
     if "device_not_trusted" in lower or "invalid_device_key" in lower:
-        return "The saved secure pairing is no longer accepted. Start secure pairing again to issue a new device key."
+        return "The saved secure pairing is no longer accepted. Use Repair Secure Pairing, then approve the new request on the Pi dashboard."
     if "pairing_rate_limited" in lower:
         return "Too many pairing requests were sent. Wait one minute, then try again."
     if "request_not_found" in lower or "request_expired" in lower:
@@ -4009,6 +4193,8 @@ def build_support_report_text():
     lines.append("Pairing Security: " + ("Per-device secure key" if secure_pairing_active() else "Legacy or unpaired"))
     lines.append("Pairing State: " + pairing_state_label())
     lines.append("Pairing Protocol: " + str(config.get("portfolio_pairing_protocol", 0)))
+    lines.append("Pairing Recovery Required: " + yes_no(pairing_recovery_active()))
+    lines.append("Pairing Last Error Code: " + str(config.get("portfolio_pairing_last_error_code", "")))
     lines.append("Pairing Completed: " + str(config.get("portfolio_pairing_completed", "")))
     lines.append("Pairing Last Test: " + str(config.get("portfolio_pairing_last_test", "")))
     wifi_details = current_wifi_details()
@@ -4160,7 +4346,8 @@ h1 { margin-top:0; }
 <div class="card"><h2>API key</h2><p>Stock quotes require a Finnhub API key unless Demo Mode is enabled. The saved key is hidden for security.</p></div>
 <div class="card"><h2>Demo Mode</h2><p>Demo Mode shows sample prices for display/testing. It is not real market data and should be turned off for normal use.</p></div>
 <div class="card"><h2>Colors and labels</h2><p>Green means up, red means down, purple can indicate pre-market/after-hours. OLD means cached or stale data.</p></div>
-<div class="card"><h2>Portfolio bridge</h2><p>Portfolio mode is optional. Enter the local Raspberry Pi bridge URL and display key, then use Test Portfolio Bridge. API v1 is preferred automatically and the legacy endpoint remains available as a fallback.</p></div>
+<div class="card"><h2>Portfolio bridge</h2><p>Portfolio mode is optional. Secure pairing discovers the Raspberry Pi, asks for approval on the Pi dashboard, and saves a unique key automatically. Manual bridge settings remain available for legacy recovery.</p></div>
+<div class="card"><h2>Pairing recovery</h2><p>If the Pi revokes or removes this ticker, open Portfolio &amp; Bridge and use Clear Revoked Key &amp; Pair Again or Repair Secure Pairing. The ticker clears only the unusable pairing credential. WiFi, symbols, Finnhub, brightness, PIN, OTA settings, device ID, and setup code remain unchanged.</p></div>
 <div class="card"><h2>Privacy mode</h2><p>Portfolio Privacy Mode hides portfolio value, daily money change, cash, buying power, and mover amounts from the LED display. It does not disconnect Schwab or delete data from the local bridge.</p></div>
 <div class="card"><h2>Software updates</h2><p>Read Release Notes, then use Check for Update and Install Update. Rollback restores the previous app if an update has problems. WiFi, API keys, symbols, portfolio settings, and bridge keys remain in their separate settings files.</p></div>
 <div class="card"><h2>Sleep Display</h2><p>Sleep Display blanks the LED panels without unplugging the device. The dashboard, WiFi, OTA, and settings continue to work.</p></div>
@@ -6028,6 +6215,8 @@ def device_health_route(request: Request):
         "pairing_mode": str(config.get("portfolio_pairing_mode", "legacy-or-unpaired")),
         "pairing_protocol": int(config.get("portfolio_pairing_protocol", 0) or 0),
         "secure_pairing": secure_pairing_active(),
+        "pairing_recovery_required": pairing_recovery_active(),
+        "pairing_error_code": str(pairing_error_code or config.get("portfolio_pairing_last_error_code", "")),
     }
     return Response(request, json.dumps(payload), content_type="application/json")
 
@@ -6059,6 +6248,33 @@ def test_secure_pairing_route(request: Request):
     return Response(request, clean_page("Secure Pairing Test", safe_html(message)), content_type="text/html")
 
 
+@server.route("/recover-secure-pairing", methods=["POST"])
+def recover_secure_pairing_route(request: Request):
+    entered_pin = str(request.form_data.get("admin_pin", ""))
+    ok_pin, pin_message = verify_wifi_admin_pin(entered_pin)
+    if not ok_pin:
+        set_error_message(pin_message)
+        return Response(request, clean_page("Recovery Blocked", safe_html(pin_message)), content_type="text/html")
+    ok, message = recover_secure_pairing()
+    if ok:
+        set_web_message(message)
+    else:
+        set_error_message(message)
+    return Response(request, clean_page("Secure Pairing Recovery", safe_html(message)), content_type="text/html")
+
+
+@server.route("/disconnect-portfolio-local", methods=["POST"])
+def disconnect_portfolio_local_route(request: Request):
+    entered_pin = str(request.form_data.get("admin_pin", ""))
+    ok_pin, pin_message = verify_wifi_admin_pin(entered_pin)
+    if not ok_pin:
+        set_error_message(pin_message)
+        return Response(request, clean_page("Disconnect Blocked", safe_html(pin_message)), content_type="text/html")
+    ok, message = local_disconnect_portfolio()
+    set_web_message(message)
+    return Response(request, clean_page("Portfolio Disconnected", safe_html(message)), content_type="text/html")
+
+
 @server.route("/unpair-secure-bridge", methods=["POST"])
 def unpair_secure_bridge_route(request: Request):
     entered_pin = str(request.form_data.get("admin_pin", ""))
@@ -6083,7 +6299,12 @@ def pair_different_pi_route(request: Request):
         set_error_message(pin_message)
         return Response(request, clean_page("Pairing Blocked", safe_html(pin_message)), content_type="text/html")
 
-    ok, message = unpair_secure_bridge()
+    if pairing_recovery_active():
+        clear_secure_pairing_local(True)
+        pairing_clear_runtime()
+        ok, message = True, "Old pairing credentials were cleared locally."
+    else:
+        ok, message = unpair_secure_bridge()
     if not ok:
         set_error_message(message)
         return Response(request, clean_page("Could Not Change Pi", safe_html(message)), content_type="text/html")
