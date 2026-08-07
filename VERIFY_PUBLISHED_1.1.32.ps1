@@ -1,13 +1,13 @@
 $ErrorActionPreference = "Stop"
 
-$expectedVersion = "1.1.31-beta"
-$expectedSize = 325993
-$expectedHash = "73cfe64e642b8e3bfd7c8da018c1702bb894a27f103b39abe99a9c7135bc79d9"
-$expectedAppUrl = "https://stockticker-ota.pages.dev/Beta/app.py?v=1131-pairing-recovery-polish-1"
+$expectedVersion = "1.1.32-beta"
+$expectedSize = 337737
+$expectedHash = "7b2d0346c861b6caa54f5804e253e15c86f054ffad73ed5b406c6d447f7b6b05"
+$expectedAppUrl = "https://stockticker-ota.pages.dev/Beta/app.py?v=1132-maintenance-state-sync-1"
 $timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $manifestUrl = "https://stockticker-ota.pages.dev/manifest.json?cb=$timestamp"
-$tempManifest = Join-Path $env:TEMP "stockticker-manifest-1.1.31.json"
-$tempApp = Join-Path $env:TEMP "stockticker-app-1.1.31.py"
+$tempManifest = Join-Path $env:TEMP "stockticker-manifest-1.1.32.json"
+$tempApp = Join-Path $env:TEMP "stockticker-app-1.1.32.py"
 
 Write-Host "Downloading live manifest..."
 Invoke-WebRequest -Uri $manifestUrl -OutFile $tempManifest -UseBasicParsing
@@ -40,4 +40,4 @@ if ($beta.sha256.ToLower() -ne $expectedHash) { throw "Manifest SHA256 mismatch.
 if ($embeddedVersion -ne $expectedVersion) { throw "Downloaded app.py contains the wrong APP_VERSION." }
 if ($actualSize -ne $expectedSize) { throw "Published app.py size mismatch." }
 if ($actualHash -ne $expectedHash) { throw "Published app.py SHA256 mismatch." }
-Write-Host "PASS: live 1.1.31 firmware and manifest match exactly." -ForegroundColor Green
+Write-Host "PASS: live 1.1.32 firmware and manifest match exactly." -ForegroundColor Green
