@@ -4,18 +4,18 @@
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable customer-ready ticker release."
   }, 
-"beta": {
-    "version": "1.1.30-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1130-secure-pairing-v1-1",
-    "notes": "Secure temporary pairing requests, Pi dashboard approval, automatic per-device key exchange, trusted-device authentication, revoke/unpair controls, staged post-pair tests, and clear LED pairing guidance. Requires Pi hub 0.8.0-beta or newer for secure pairing.",
+ "beta": {
+    "version": "1.1.31-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1131-pairing-recovery-polish-1",
+    "notes": "End-user pairing recovery after revoke/remove/key rotation, persistent recovery status across restart, safe local portfolio disconnect, resilient Pair With Different Pi, clearer dashboard instructions, and preservation of WiFi, symbols, Finnhub, brightness, PIN, and OTA settings. Requires Pi hub 0.8.0-beta or newer.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 4,
     "minimum_bridge_version": "0.8.0-beta",
     "pairing_protocol_version": 1,
-    "size": 317143,
-    "sha256": "cf985e98ec9582b6ba3e9a90ee6c93bc5f0995d83db25f97095cea39498d8473",
+    "size": 325993,
+    "sha256": "73cfe64e642b8e3bfd7c8da018c1702bb894a27f103b39abe99a9c7135bc79d9",
     "mandatory": false
   }
 }
