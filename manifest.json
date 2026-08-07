@@ -4,18 +4,18 @@
     "app_url": "https://stockticker-ota.pages.dev/Stable/app.py",
     "notes": "Stable customer-ready ticker release."
   }, 
- "beta": {
-    "version": "1.1.31-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1131-pairing-recovery-polish-1",
-    "notes": "End-user pairing recovery after revoke/remove/key rotation, persistent recovery status across restart, safe local portfolio disconnect, resilient Pair With Different Pi, clearer dashboard instructions, and preservation of WiFi, symbols, Finnhub, brightness, PIN, and OTA settings. Requires Pi hub 0.8.0-beta or newer.",
+  "beta": {
+    "version": "1.1.32-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1132-maintenance-state-sync-1",
+    "notes": "Maintenance and customer-polish release: deterministic portfolio LED rebuild after pair/unpair, pairing dashboard auto-refresh, Portfolio on LED status, safe S3 temporary-file cleanup, optional oldest rollback cleanup, stronger OTA storage checks, and live OTA KB/s plus ETA. Secure pairing protocol v1 remains compatible with Pi hub 0.8.0-beta or newer.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 4,
     "minimum_bridge_version": "0.8.0-beta",
     "pairing_protocol_version": 1,
-    "size": 325993,
-    "sha256": "73cfe64e642b8e3bfd7c8da018c1702bb894a27f103b39abe99a9c7135bc79d9",
+    "size": 337737,
+    "sha256": "7b2d0346c861b6caa54f5804e253e15c86f054ffad73ed5b406c6d447f7b6b05",
     "mandatory": false
   }
 }
