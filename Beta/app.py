@@ -1,6 +1,6 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.31-beta"
+APP_VERSION = "1.1.32-beta"
 CONFIG_SCHEMA_VERSION = 4
 # 1.1.31: customer-safe pairing recovery, persistent revoked/not-trusted state,
 # local disconnect without factory reset, resilient pair-different-Pi handling,
@@ -1491,6 +1491,13 @@ def boot_watchdog_confirm_healthy():
     except Exception as e:
         print("Managed launcher upgrade skipped:", repr(e))
 
+    try:
+        ok_cleanup, cleanup_message = maintenance_cleanup_temporary_files()
+        if ok_cleanup and "Removed 0 " not in cleanup_message:
+            add_event("Maintenance: " + cleanup_message)
+    except Exception as e:
+        print("Post-boot temporary cleanup skipped:", repr(e))
+
 
 def boot_watchdog_step():
     if boot_health_confirmed:
@@ -1598,7 +1605,10 @@ ota_job = {
     "download_max_attempts": OTA_DOWNLOAD_MAX_ATTEMPTS,
     "retry_at": 0,
     "network_error": "",
-    "hash_done": 0
+    "hash_done": 0,
+    "download_started": 0,
+    "download_speed_bps": 0,
+    "download_eta_seconds": 0
 }
 last_web_message = "System ready."
 last_error_message = "None yet."
@@ -2044,6 +2054,153 @@ def file_size_text(path):
         return "missing"
 
 
+def human_bytes(value):
+    try:
+        value = int(value)
+    except Exception:
+        return "unknown"
+    if value < 1024:
+        return "{} B".format(value)
+    if value < 1024 * 1024:
+        return "{:.1f} KB".format(value / 1024)
+    return "{:.2f} MB".format(value / (1024 * 1024))
+
+
+def maintenance_temp_paths():
+    return (
+        OTA_TEMP_PATH,
+        OTA_BACKUP_TEMP_PATH,
+        OTA_JOURNAL_TEMP_FILE,
+        OTA_WRITE_TEST_FILE,
+    )
+
+
+def maintenance_snapshot():
+    snapshot = {
+        "total": -1,
+        "free": -1,
+        "used": -1,
+        "used_percent": -1,
+        "temp_bytes": 0,
+        "temp_files": 0,
+        "app_bytes": 0,
+        "backup_bytes": 0,
+        "previous_backup_bytes": 0,
+    }
+    try:
+        stat = os.statvfs("/")
+        block_size = int(stat[0])
+        total = block_size * int(stat[2])
+        free = block_size * int(stat[3])
+        used = max(0, total - free)
+        snapshot["total"] = total
+        snapshot["free"] = free
+        snapshot["used"] = used
+        snapshot["used_percent"] = int((used * 100) / total) if total > 0 else -1
+    except Exception:
+        pass
+
+    for key, path in (
+        ("app_bytes", APP_PATH),
+        ("backup_bytes", BACKUP_APP_PATH),
+        ("previous_backup_bytes", OTA_BACKUP_PREVIOUS_PATH),
+    ):
+        try:
+            snapshot[key] = int(os.stat(path)[6])
+        except Exception:
+            snapshot[key] = 0
+
+    for path in maintenance_temp_paths():
+        try:
+            snapshot["temp_bytes"] += int(os.stat(path)[6])
+            snapshot["temp_files"] += 1
+        except Exception:
+            pass
+
+    # OTA needs space for the incoming image plus a rollback copy and working margin.
+    snapshot["recommended_free"] = max(1572864, snapshot["app_bytes"] * 4)
+    return snapshot
+
+
+def maintenance_cleanup_temporary_files():
+    if ota_job_active() if "ota_job_active" in globals() else False:
+        return False, "Temporary cleanup is blocked while a software update is running."
+    try:
+        if bool(ota_journal.get("boot", {}).get("pending", False)):
+            return False, "Temporary cleanup is blocked until firmware boot validation finishes."
+    except Exception:
+        pass
+
+    removed = 0
+    bytes_removed = 0
+    for path in maintenance_temp_paths():
+        try:
+            size = int(os.stat(path)[6])
+        except Exception:
+            size = 0
+        try:
+            os.remove(path)
+            removed += 1
+            bytes_removed += size
+        except Exception:
+            pass
+    return True, "Removed {} temporary file(s), freeing {}.".format(removed, human_bytes(bytes_removed))
+
+
+def maintenance_remove_oldest_rollback():
+    if ota_job_active() if "ota_job_active" in globals() else False:
+        return False, "Rollback cleanup is blocked while a software update is running."
+    try:
+        if bool(ota_journal.get("boot", {}).get("pending", False)):
+            return False, "Keep both rollback copies until firmware boot validation finishes."
+    except Exception:
+        pass
+    if not file_exists(BACKUP_APP_PATH):
+        return False, "The primary rollback backup is missing, so the older copy was preserved."
+    if not file_exists(OTA_BACKUP_PREVIOUS_PATH):
+        return True, "No older rollback copy is stored."
+    try:
+        size = int(os.stat(OTA_BACKUP_PREVIOUS_PATH)[6])
+    except Exception:
+        size = 0
+    try:
+        os.remove(OTA_BACKUP_PREVIOUS_PATH)
+        return True, "Removed the oldest rollback copy and freed {}. app_backup.py was preserved.".format(human_bytes(size))
+    except Exception as error:
+        return False, "Could not remove the oldest rollback copy: {}".format(repr(error))
+
+
+def build_storage_maintenance_html():
+    s = maintenance_snapshot()
+    if s["free"] >= 0:
+        free_text = human_bytes(s["free"])
+        total_text = human_bytes(s["total"])
+        used_text = "{}%".format(s["used_percent"])
+        headroom_ok = s["free"] >= s["recommended_free"]
+        headroom_text = "Ready for OTA" if headroom_ok else "Low storage for OTA"
+        headroom_class = "good" if headroom_ok else "warning"
+    else:
+        free_text = total_text = used_text = "Unavailable"
+        headroom_text = "Storage could not be measured"
+        headroom_class = "warning"
+    return (
+        "<div class='status-line'><span>Flash storage</span><b>{} free / {}</b></div>"
+        "<div class='status-line'><span>Used</span><b>{}</b></div>"
+        "<div class='status-line'><span>Current firmware</span><b>{}</b></div>"
+        "<div class='status-line'><span>Rollback backup</span><b>{}</b></div>"
+        "<div class='status-line'><span>Older rollback copy</span><b>{}</b></div>"
+        "<div class='status-line'><span>Safe temporary cleanup</span><b>{} file(s) · {}</b></div>"
+        "<p class='{}'><b>{}</b></p>"
+    ).format(
+        free_text, total_text, used_text,
+        human_bytes(s["app_bytes"]),
+        human_bytes(s["backup_bytes"]) if s["backup_bytes"] else "Missing",
+        human_bytes(s["previous_backup_bytes"]) if s["previous_backup_bytes"] else "Not stored",
+        s["temp_files"], human_bytes(s["temp_bytes"]),
+        headroom_class, headroom_text
+    )
+
+
 def build_system_health_html():
     try:
         gc.collect()
@@ -2081,6 +2238,8 @@ def build_system_health_html():
         "Disk: {}<br>"
         "app.py Size: {}<br>"
         "Backup Size: {}<br>"
+        "Older Backup Size: {}<br>"
+        "Temporary OTA Files: {}<br>"
         "Auto-Recovery Launcher: {}"
     ).format(
         hours,
@@ -2091,6 +2250,8 @@ def build_system_health_html():
         disk_text,
         file_size_text(APP_PATH),
         file_size_text(BACKUP_APP_PATH),
+        file_size_text(OTA_BACKUP_PREVIOUS_PATH),
+        "{} / {}".format(maintenance_snapshot()["temp_files"], human_bytes(maintenance_snapshot()["temp_bytes"])),
         launcher_status_text()
     )
 
@@ -2714,6 +2875,7 @@ def save_secure_pairing_key(device_key, bridge_id):
 
 def clear_secure_pairing_local(disable_portfolio=True):
     global config, last_portfolio_entry, last_portfolio_capabilities
+    global need_reload, refresh_requested
     config["portfolio_bridge_key"] = ""
     config["portfolio_pairing_mode"] = "legacy-or-unpaired"
     config["portfolio_pairing_protocol"] = 0
@@ -2725,6 +2887,8 @@ def clear_secure_pairing_local(disable_portfolio=True):
     save_config_atomic(config)
     last_portfolio_entry = None
     last_portfolio_capabilities = {}
+    refresh_requested = False
+    need_reload = True
 
 
 def start_secure_pairing_post_test():
@@ -2738,6 +2902,7 @@ def start_secure_pairing_post_test():
 def secure_pairing_test_step():
     global pairing_test_stage, pairing_test_payload, pairing_next_poll_at
     global last_pairing_test_message, last_portfolio_entry, refresh_requested
+    global need_reload
 
     if time.monotonic() < pairing_next_poll_at:
         return
@@ -2785,7 +2950,8 @@ def secure_pairing_test_step():
         last_pairing_test_message = "Secure pairing test passed at {}.".format(config["portfolio_pairing_last_test"])
         pairing_test_stage = 0
         pairing_test_payload = None
-        refresh_requested = True
+        refresh_requested = False
+        need_reload = True
         pairing_clear_runtime()
         set_pairing_state(PAIRING_PAIRED, "Secure pairing completed and portfolio access passed.", "", "PAIRING COMPLETE", "PORTFOLIO CONNECTED", 14)
 
@@ -4221,6 +4387,11 @@ def build_support_report_text():
     lines.append("Manifest URL: " + strip_url_query(config.get("update_manifest_url", "")))
     lines.append("Backup App Found: " + yes_no(file_exists(BACKUP_APP_PATH)))
     lines.append("Auto-Recovery Launcher: " + launcher_status_text())
+    storage = maintenance_snapshot()
+    lines.append("Flash Free: " + human_bytes(storage.get("free", -1)))
+    lines.append("Flash Used Percent: " + str(storage.get("used_percent", "unknown")))
+    lines.append("Oldest Rollback Copy: " + (human_bytes(storage.get("previous_backup_bytes", 0)) if storage.get("previous_backup_bytes", 0) else "Not stored"))
+    lines.append("Temporary OTA Files: {} / {}".format(storage.get("temp_files", 0), human_bytes(storage.get("temp_bytes", 0))))
     lines.append("Boot Validation: " + str(ota_journal.get("boot", {}).get("health", "unknown")))
     lines.append("Startup Stage: " + str(ota_journal.get("boot", {}).get("startup_stage", "unknown")))
     lines.append("Startup Detail: " + str(ota_journal.get("boot", {}).get("startup_detail", "")))
@@ -4350,6 +4521,7 @@ h1 { margin-top:0; }
 <div class="card"><h2>Pairing recovery</h2><p>If the Pi revokes or removes this ticker, open Portfolio &amp; Bridge and use Clear Revoked Key &amp; Pair Again or Repair Secure Pairing. The ticker clears only the unusable pairing credential. WiFi, symbols, Finnhub, brightness, PIN, OTA settings, device ID, and setup code remain unchanged.</p></div>
 <div class="card"><h2>Privacy mode</h2><p>Portfolio Privacy Mode hides portfolio value, daily money change, cash, buying power, and mover amounts from the LED display. It does not disconnect Schwab or delete data from the local bridge.</p></div>
 <div class="card"><h2>Software updates</h2><p>Read Release Notes, then use Check for Update and Install Update. Rollback restores the previous app if an update has problems. WiFi, API keys, symbols, portfolio settings, and bridge keys remain in their separate settings files.</p></div>
+<div class="card"><h2>Storage cleanup</h2><p>Diagnostics &amp; Maintenance can remove abandoned OTA temporary files. The optional oldest-rollback cleanup removes only app_backup_previous.py and keeps app_backup.py. Customer settings are never part of these cleanup actions.</p></div>
 <div class="card"><h2>Sleep Display</h2><p>Sleep Display blanks the LED panels without unplugging the device. The dashboard, WiFi, OTA, and settings continue to work.</p></div>
 <div class="card"><h2>Logos</h2><p>BMP logos go in /logos/SYMBOL.bmp. Missing logos are harmless; the ticker automatically uses a clean text fallback.</p></div>
 <p><a href="/">Back to Dashboard</a></p>
@@ -5246,6 +5418,7 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <div class="card feature-card" id="portfolio">
 <div class="card-kicker">Private Local Integration</div>
 <h2>Portfolio & Bridge</h2>
+<div class="status-line"><span>Portfolio on LED</span><b>{portfolio_led_state}</b></div>
 <div class="status-line"><span>Portfolio status</span><b>{portfolio_status_short}</b></div>
 <div class="status-line"><span>Bridge API</span><b>{portfolio_api_mode_short}</b></div>
 <div class="status-line"><span>Processing host</span><b>Raspberry Pi</b></div>
@@ -5256,6 +5429,7 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <p class="small"><b>Automatic registration:</b> {bridge_registration_message}</p>
 <p class="small"><b>Secure pairing test:</b> {pairing_test_message}</p>
 <p class="small"><b>Stable ticker address:</b> <a href="http://{ticker_local_hostname}/" target="_blank">http://{ticker_local_hostname}/</a></p>
+<p class="small">Pairing status auto-refreshes while a request or secure connection test is running.</p>
 <div>{portfolio_bridge_links_html}</div>
 <div class="button-row">
 {pairing_controls_html}
@@ -5465,6 +5639,19 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <form method="POST" action="/check-system-health"><button type="submit">Check System Health</button></form>
 </div>
 <div class="card">
+<h2>Storage & Cleanup</h2>
+<p class="small">Safe cleanup never deletes app.py, app_backup.py, WiFi, symbols, API keys, pairing keys, logos, or customer settings.</p>
+{storage_maintenance_html}
+<form method="POST" action="/cleanup-temporary-files">
+<input name="admin_pin" type="password" placeholder="Admin PIN" required autocomplete="current-password">
+<button class="orange" type="submit">Clean Temporary Files</button>
+</form>
+<form method="POST" action="/remove-oldest-rollback" onsubmit="return confirm('Remove only app_backup_previous.py? The primary app_backup.py rollback will be kept.');">
+<input name="admin_pin" type="password" placeholder="Admin PIN" required autocomplete="current-password">
+<button class="red" type="submit">Remove Oldest Rollback Copy</button>
+</form>
+</div>
+<div class="card">
 <h2>Backup / Export</h2>
 <p class="small">Safe exports hide API keys, WiFi passwords, bridge keys, admin PINs, tokens, and portfolio values.</p>
 <form method="GET" action="/support-report"><button type="submit">View Safe Support Report</button></form>
@@ -5621,6 +5808,17 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 </div>
 </details>
 </div>
+<script>
+(function() {{
+  const pairingActive = {pairing_auto_refresh_js};
+  if (!pairingActive) return;
+  setTimeout(function() {{
+    const tag = (document.activeElement && document.activeElement.tagName || '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    window.location.reload();
+  }}, 5000);
+}})();
+</script>
 </body>
 </html>
 """
@@ -6353,6 +6551,7 @@ def index(request: Request):
             setup_checklist_message=build_setup_checklist_html(),
             quote_status_short=quote_status_short(),
             portfolio_status_short=portfolio_status_short(),
+            portfolio_led_state=("ON" if is_portfolio_enabled() else "OFF"),
             panel_state=panel_state_text(),
             logo_summary_short=logo_summary_text(),
             last_error_panel=last_error_panel_html(),
@@ -6377,6 +6576,7 @@ def index(request: Request):
             quote_freshness_message=build_quote_freshness_html(),
             portfolio_status_message=build_portfolio_status_html(),
             system_health_message=build_system_health_html(),
+            storage_maintenance_html=build_storage_maintenance_html(),
             preflight_message=preflight_message,
             update_recovery_message=build_update_recovery_html(),
             event_log_message=build_event_log_html(),
@@ -6447,6 +6647,7 @@ def index(request: Request):
             connection_steps_html=build_connection_steps_html(),
             pairing_status_html=build_pairing_status_html(),
             pairing_controls_html=build_pairing_controls_html(),
+            pairing_auto_refresh_js=("true" if pairing_is_active() else "false"),
             pairing_test_message=safe_html(last_pairing_test_message),
             ticker_local_hostname=safe_html(MDNS_HOSTNAME + ".local"),
             closed_dates="\n".join(holidays["closed"]),
@@ -6801,6 +7002,36 @@ def check_system_health(request: Request):
     set_web_message("System health checked.")
 
     return Response(request, clean_page("System Health Checked", "Memory and disk health updated."), content_type="text/html")
+
+
+@server.route("/cleanup-temporary-files", methods=["POST"])
+def cleanup_temporary_files_route(request: Request):
+    entered_pin = str(request.form_data.get("admin_pin", ""))
+    ok_pin, pin_message = verify_wifi_admin_pin(entered_pin)
+    if not ok_pin:
+        set_error_message(pin_message)
+        return Response(request, clean_page("Cleanup Blocked", safe_html(pin_message)), content_type="text/html")
+    ok, message = maintenance_cleanup_temporary_files()
+    if ok:
+        set_web_message(message)
+    else:
+        set_error_message(message)
+    return Response(request, clean_page("Storage Cleanup", safe_html(message)), content_type="text/html")
+
+
+@server.route("/remove-oldest-rollback", methods=["POST"])
+def remove_oldest_rollback_route(request: Request):
+    entered_pin = str(request.form_data.get("admin_pin", ""))
+    ok_pin, pin_message = verify_wifi_admin_pin(entered_pin)
+    if not ok_pin:
+        set_error_message(pin_message)
+        return Response(request, clean_page("Cleanup Blocked", safe_html(pin_message)), content_type="text/html")
+    ok, message = maintenance_remove_oldest_rollback()
+    if ok:
+        set_web_message(message)
+    else:
+        set_error_message(message)
+    return Response(request, clean_page("Rollback Cleanup", safe_html(message)), content_type="text/html")
 
 
 @server.route("/clear-event-log", methods=["POST"])
@@ -7270,6 +7501,13 @@ def ota_sha_self_test():
 def ota_preflight_checks(info=None):
     checks = []
 
+    # Failed/abandoned OTA attempts can leave temporary files. They are safe to
+    # remove before a new preflight as long as no update or boot validation is active.
+    try:
+        maintenance_cleanup_temporary_files()
+    except Exception:
+        pass
+
     def add(ok, label_text, detail):
         checks.append({
             "ok": bool(ok),
@@ -7313,7 +7551,7 @@ def ota_preflight_checks(info=None):
     if expected_size <= 0:
         expected_size = max(current_size, 1000)
 
-    required_disk = expected_size + current_size + 32768
+    required_disk = expected_size + current_size + 131072
     free_disk = ota_free_disk_bytes()
     disk_ok = free_disk < 0 or free_disk >= required_disk
     add(
@@ -7460,6 +7698,18 @@ def ota_job_elapsed():
 
 
 def ota_job_public_status():
+    done = int(ota_job.get("bytes_done", 0) or 0)
+    total = int(ota_job.get("bytes_total", 0) or 0)
+    started = float(ota_job.get("download_started", 0) or 0)
+    speed = 0
+    eta = 0
+    if started > 0 and done > 0:
+        elapsed = max(0.01, time.monotonic() - started)
+        speed = int(done / elapsed)
+        if total > done and speed > 0:
+            eta = int((total - done) / speed)
+    ota_job["download_speed_bps"] = speed
+    ota_job["download_eta_seconds"] = eta
     return {
         "active": ota_job_active(),
         "stage": str(ota_job.get("stage", "idle")),
@@ -7467,8 +7717,10 @@ def ota_job_public_status():
         "message": str(ota_job.get("message", "")),
         "detail": str(ota_job.get("detail", "")),
         "latest": str(ota_job.get("latest", "")),
-        "bytes_done": int(ota_job.get("bytes_done", 0) or 0),
-        "bytes_total": int(ota_job.get("bytes_total", 0) or 0),
+        "bytes_done": done,
+        "bytes_total": total,
+        "download_speed_bps": speed,
+        "download_eta_seconds": eta,
         "elapsed_seconds": ota_job_elapsed(),
         "restart_seconds": int(ota_job.get("restart_seconds", 0) or 0),
         "error": str(ota_job.get("error", "")),
@@ -7587,6 +7839,9 @@ def ota_schedule_download_retry(error):
     ota_job["bytes_done"] = 0
     ota_job["bytes_total"] = 0
     ota_job["hash_done"] = 0
+    ota_job["download_started"] = 0
+    ota_job["download_speed_bps"] = 0
+    ota_job["download_eta_seconds"] = 0
     ota_job["retry_at"] = (
         time.monotonic() + OTA_DOWNLOAD_RETRY_DELAY_SECONDS
     )
@@ -7680,7 +7935,10 @@ def start_ota_job():
         "protected_before": None,
         "payload_message": "",
         "error": "",
-        "restart_seconds": 0
+        "restart_seconds": 0,
+        "download_started": 0,
+        "download_speed_bps": 0,
+        "download_eta_seconds": 0
     })
 
     ota_journal_start()
@@ -7733,7 +7991,11 @@ async function pollStatus(){
     document.getElementById('message').textContent=String(data.message||'');
     document.getElementById('detail').textContent=String(data.detail||'');
     const done=Number(data.bytes_done||0), total=Number(data.bytes_total||0);
-    document.getElementById('bytes').textContent=total>0 ? done.toLocaleString()+' / '+total.toLocaleString()+' bytes' : '';
+    const speed=Number(data.download_speed_bps||0), eta=Number(data.download_eta_seconds||0);
+    let byteText=total>0 ? done.toLocaleString()+' / '+total.toLocaleString()+' bytes' : '';
+    if(speed>0) byteText += ' · '+(speed/1024).toFixed(1)+' KB/s';
+    if(eta>0) byteText += ' · about '+eta+'s remaining';
+    document.getElementById('bytes').textContent=byteText;
     if(data.stage==='error'){
       document.getElementById('message').classList.add('error');
       return;
@@ -7767,12 +8029,22 @@ def build_ota_job_panel_html():
     message = safe_html(ota_job.get("message", ""))
     detail = safe_html(ota_job.get("detail", ""))
     css_class = "ota-error" if stage == "error" else "ota-active"
+    speed_text = ""
+    if stage == "downloading":
+        status = ota_job_public_status()
+        speed = int(status.get("download_speed_bps", 0) or 0)
+        eta = int(status.get("download_eta_seconds", 0) or 0)
+        if speed > 0:
+            speed_text = "<br>{:.1f} KB/s{}".format(
+                speed / 1024,
+                " · about {}s remaining".format(eta) if eta > 0 else ""
+            )
 
     return (
         "<div class='ota-progress'>"
         "<b class='{}'>{}</b>"
         "<div class='ota-track'><div class='ota-fill' style='width:{}%'></div></div>"
-        "<div class='small'>{}% · {}<br>{}</div>"
+        "<div class='small'>{}% · {}<br>{}{}</div>"
         "<a href='/update-progress'>Open Live Update Progress</a>"
         "</div>"
     ).format(
@@ -7781,7 +8053,8 @@ def build_ota_job_panel_html():
         percent,
         percent,
         safe_html(stage),
-        detail
+        detail,
+        speed_text
     )
 
 
@@ -8079,6 +8352,9 @@ def ota_job_step():
             ota_job["bytes_done"] = 0
             ota_job["hash_done"] = 0
             ota_job["hasher"] = None
+            ota_job["download_started"] = time.monotonic()
+            ota_job["download_speed_bps"] = 0
+            ota_job["download_eta_seconds"] = 0
 
             total = 0
             try:
