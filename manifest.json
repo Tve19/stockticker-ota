@@ -5,17 +5,19 @@
     "notes": "Stable customer-ready ticker release."
   }, 
   "beta": {
-    "version": "1.1.32-beta",
-    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1132-maintenance-state-sync-1",
-    "notes": "Maintenance and customer-polish release: deterministic portfolio LED rebuild after pair/unpair, pairing dashboard auto-refresh, Portfolio on LED status, safe S3 temporary-file cleanup, optional oldest rollback cleanup, stronger OTA storage checks, and live OTA KB/s plus ETA. Secure pairing protocol v1 remains compatible with Pi hub 0.8.0-beta or newer.",
+    "version": "1.1.33-beta",
+    "app_url": "https://stockticker-ota.pages.dev/Beta/app.py?v=1133-onboarding-audit-1",
+    "notes": "Product-readiness release: guided Getting Started onboarding, safe setup-readiness reporting to the Pi, unified rate-limited admin PIN protection for privileged maintenance actions, NYSE calendar defaults through 2028 with merge-safe customer overrides, and full regression preservation of secure pairing/recovery, deterministic portfolio display refresh, storage cleanup, and OTA progress.",
     "hardware": [
       "matrix_portal_s3"
     ],
     "minimum_config_schema": 4,
     "minimum_bridge_version": "0.8.0-beta",
+    "recommended_bridge_version": "0.8.2-beta",
     "pairing_protocol_version": 1,
-    "size": 337737,
-    "sha256": "7b2d0346c861b6caa54f5804e253e15c86f054ffad73ed5b406c6d447f7b6b05",
+    "market_calendar_through": 2028,
+    "size": 350325,
+    "sha256": "dece48e81988567bebb8bef2552e7f27a64b5df8184bcdb7a04361c02d4f36d3",
     "mandatory": false
   }
 }
