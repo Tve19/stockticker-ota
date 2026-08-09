@@ -1,7 +1,9 @@
 print("APP.PY STARTED")
 
-APP_VERSION = "1.1.32-beta"
+APP_VERSION = "1.1.33-beta"
 CONFIG_SCHEMA_VERSION = 4
+# 1.1.33: customer setup assistant, end-to-end readiness reporting,
+# dashboard/product polish, and compatibility/security audit fixes.
 # 1.1.31: customer-safe pairing recovery, persistent revoked/not-trusted state,
 # local disconnect without factory reset, resilient pair-different-Pi handling,
 # clearer dashboard guidance, and preservation of unrelated customer settings.
@@ -313,22 +315,28 @@ DEFAULT_SYMBOLS = [
     "AMZN", "SPY", "OPEN", "EOSE"
 ]
 
+MARKET_CALENDAR_BUILT_IN_THROUGH = 2028
+
+
 DEFAULT_HOLIDAYS = {
+    # NYSE published calendar through 2028. load_holidays() merges these
+    # standard dates into an existing customer file instead of replacing
+    # customer-added closures or early-close dates.
     "closed": [
-        "2026-01-01",
-        "2026-01-19",
-        "2026-02-16",
-        "2026-04-03",
-        "2026-05-25",
-        "2026-06-19",
-        "2026-07-03",
-        "2026-09-07",
-        "2026-11-26",
-        "2026-12-25"
+        "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+        "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+        "2026-11-26", "2026-12-25",
+        "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26",
+        "2027-05-31", "2027-06-18", "2027-07-05", "2027-09-06",
+        "2027-11-25", "2027-12-24",
+        "2028-01-17", "2028-02-21", "2028-04-14", "2028-05-29",
+        "2028-06-19", "2028-07-04", "2028-09-04", "2028-11-23",
+        "2028-12-25"
     ],
     "early_close": [
-        "2026-11-27",
-        "2026-12-24"
+        "2026-11-27", "2026-12-24",
+        "2027-11-26",
+        "2028-07-03", "2028-11-24"
     ]
 }
 
@@ -868,13 +876,31 @@ def secure_pairing_active():
 
 
 def load_holidays():
-    h = load_json_file(HOLIDAYS_FILE, DEFAULT_HOLIDAYS)
+    h = load_json_file(HOLIDAYS_FILE, {})
+    if not isinstance(h, dict):
+        h = {}
 
-    if "closed" not in h:
-        h["closed"] = DEFAULT_HOLIDAYS["closed"]
+    changed = False
+    for key in ("closed", "early_close"):
+        existing = h.get(key, [])
+        if not isinstance(existing, list):
+            existing = []
+        merged = []
+        for value in existing + DEFAULT_HOLIDAYS[key]:
+            value = str(value).strip()
+            if value and value not in merged:
+                merged.append(value)
+        merged.sort()
+        if merged != existing:
+            changed = True
+        h[key] = merged
 
-    if "early_close" not in h:
-        h["early_close"] = DEFAULT_HOLIDAYS["early_close"]
+    if changed:
+        try:
+            save_json_file(HOLIDAYS_FILE, h)
+            print("Market calendar updated through 2028.")
+        except Exception as error:
+            print("Market calendar merge could not save:", repr(error))
 
     return h
 
@@ -1860,7 +1886,7 @@ def verify_wifi_admin_pin(entered_pin):
 
     if now < wifi_pin_lock_until:
         remaining = int(wifi_pin_lock_until - now)
-        return False, "WiFi controls are temporarily locked. Try again in {} seconds.".format(remaining)
+        return False, "Admin controls are temporarily locked. Try again in {} seconds.".format(remaining)
 
     if str(entered_pin) == str(config.get("admin_pin", "1234")):
         wifi_pin_failures = 0
@@ -1872,10 +1898,15 @@ def verify_wifi_admin_pin(entered_pin):
     if wifi_pin_failures >= WIFI_PIN_MAX_ATTEMPTS:
         wifi_pin_failures = 0
         wifi_pin_lock_until = now + WIFI_PIN_LOCK_SECONDS
-        return False, "Too many incorrect PIN attempts. WiFi controls are locked for 10 minutes."
+        return False, "Too many incorrect PIN attempts. Admin controls are locked for 10 minutes."
 
     remaining = WIFI_PIN_MAX_ATTEMPTS - wifi_pin_failures
     return False, "Incorrect admin PIN. {} attempt(s) remain.".format(remaining)
+
+
+# Backward-compatible name: all privileged dashboard actions share one
+# rate-limited PIN guard, including WiFi, pairing, OTA, and reset controls.
+verify_admin_pin = verify_wifi_admin_pin
 
 
 def build_wifi_manager_html():
@@ -2240,6 +2271,7 @@ def build_system_health_html():
         "Backup Size: {}<br>"
         "Older Backup Size: {}<br>"
         "Temporary OTA Files: {}<br>"
+        "Market Calendar: {}<br>"
         "Auto-Recovery Launcher: {}"
     ).format(
         hours,
@@ -2252,6 +2284,7 @@ def build_system_health_html():
         file_size_text(BACKUP_APP_PATH),
         file_size_text(OTA_BACKUP_PREVIOUS_PATH),
         "{} / {}".format(maintenance_snapshot()["temp_files"], human_bytes(maintenance_snapshot()["temp_bytes"])),
+        market_calendar_support_text(),
         launcher_status_text()
     )
 
@@ -3982,75 +4015,332 @@ def logo_summary_text():
     return "{} text fallback".format(missing)
 
 
+def setup_required_checks():
+    return [
+        (bool(wifi.radio.connected), "WiFi connected"),
+        (bool(api_ready_for_quotes()), "Market data ready"),
+        (len(SYMBOLS) > 0, "Stock symbols saved"),
+        (str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed"),
+    ]
+
+
 def setup_completion_counts():
-    checks = []
-    checks.append((True, "Device booted"))
-    checks.append((wifi.radio.connected, "WiFi connected"))
-    checks.append((api_ready_for_quotes(), "API key or demo mode ready"))
-    checks.append((len(SYMBOLS) > 0, "Symbols saved"))
-    if is_portfolio_enabled():
-        checks.append((bool(str(config.get("portfolio_bridge_url", "")).strip()), "Portfolio bridge URL saved"))
-        checks.append((bool(str(config.get("portfolio_bridge_key", "")).strip()), "Portfolio pairing key saved"))
-    checks.append((str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed"))
-    checks.append((file_exists(BACKUP_APP_PATH), "OTA backup available"))
-    return checks
+    # Backward-compatible alias used by support reporting. Only customer-
+    # required first-use items count toward completion; rollback/logos and the
+    # optional Raspberry Pi portfolio module are recommendations, not blockers.
+    return setup_required_checks()
 
 
 def setup_progress_text():
-    checks = setup_completion_counts()
+    checks = setup_required_checks()
     done = 0
 
     for ok, label in checks:
         if ok:
             done += 1
 
-    return "{}/{} complete".format(done, len(checks))
+    return "{}/{} required".format(done, len(checks))
 
 
-def setup_checklist_item(ok, label, hint=""):
-    if ok:
-        return "<div class='check ok'>OK - {}</div>".format(safe_html(label))
+def setup_status_payload():
+    required = setup_required_checks()
+    required_done = 0
+    for ok, _ in required:
+        if ok:
+            required_done += 1
+
+    portfolio_enabled = is_portfolio_enabled()
+    portfolio_key_saved = bool(str(config.get("portfolio_bridge_key", "")).strip())
+    portfolio_bridge_saved = bool(str(config.get("portfolio_bridge_url", "")).strip())
+    portfolio_connected = bool(
+        last_portfolio_entry
+        and not last_portfolio_entry.get("error_reason")
+    )
+
+    return {
+        "setup_ready": required_done == len(required),
+        "required_complete": required_done,
+        "required_total": len(required),
+        "wifi_connected": bool(wifi.radio.connected),
+        "market_data_ready": bool(api_ready_for_quotes()),
+        "demo_mode": bool(is_demo_mode()),
+        "api_key_saved": bool(get_saved_customer_api_key()),
+        "symbol_count": len(SYMBOLS),
+        "admin_pin_changed": str(config.get("admin_pin", "1234")) != "1234",
+        "portfolio_optional": True,
+        "portfolio_mode": str(config.get("portfolio_mode", "off")),
+        "portfolio_bridge_saved": portfolio_bridge_saved,
+        "portfolio_key_saved": portfolio_key_saved,
+        "portfolio_connected": portfolio_connected,
+        "secure_pairing": bool(secure_pairing_active()),
+        "pairing_state": str(pairing_state),
+        "pairing_recovery_required": bool(pairing_recovery_active()),
+        "rollback_backup_available": bool(file_exists(BACKUP_APP_PATH)),
+        "auto_recovery_launcher": bool(launcher_status_text().startswith("Installed")),
+    }
+
+
+def setup_checklist_item(ok, label, hint="", required=True):
+    prefix = "OK" if ok else ("ACTION" if required else "OPTIONAL")
+    class_name = "ok" if ok else "todo"
     if hint:
-        return "<div class='check todo'>ACTION - {}<br><span>{}</span></div>".format(safe_html(label), safe_html(hint))
-    return "<div class='check todo'>ACTION - {}</div>".format(safe_html(label))
+        return "<div class='check {}'>{} - {}<br><span>{}</span></div>".format(
+            class_name,
+            prefix,
+            safe_html(label),
+            safe_html(hint)
+        )
+    return "<div class='check {}'>{} - {}</div>".format(
+        class_name,
+        prefix,
+        safe_html(label)
+    )
 
 
 def build_setup_checklist_html():
     items = []
-    items.append(setup_checklist_item(wifi.radio.connected, "WiFi connected", "Use first-time setup mode or reset WiFi."))
+    items.append(setup_checklist_item(
+        wifi.radio.connected,
+        "WiFi connected",
+        "Use WiFi & Network if the device needs to move to another network."
+    ))
 
     if is_demo_mode():
-        items.append(setup_checklist_item(True, "Demo mode enabled", "Device is using sample prices."))
+        items.append(setup_checklist_item(
+            True,
+            "Market data ready in Demo Mode",
+            "Demo prices are for setup/testing only."
+        ))
     else:
-        items.append(setup_checklist_item(bool(get_saved_customer_api_key()), "Finnhub API key saved", "Open Setup Wizard and paste a Finnhub API key."))
+        items.append(setup_checklist_item(
+            bool(get_saved_customer_api_key()),
+            "Finnhub API key saved",
+            "Open Setup Wizard and paste a Finnhub API key."
+        ))
 
-    items.append(setup_checklist_item(len(SYMBOLS) > 0, "Stock symbols saved", "Add symbols in the Tickers section."))
+    items.append(setup_checklist_item(
+        len(SYMBOLS) > 0,
+        "Stock symbols saved",
+        "Add at least one symbol to the ticker."
+    ))
+    items.append(setup_checklist_item(
+        str(config.get("admin_pin", "1234")) != "1234",
+        "Admin PIN changed",
+        "Use a private 4-12 digit PIN before customer use; 6 or more digits are recommended."
+    ))
 
-    if is_portfolio_enabled():
-        items.append(setup_checklist_item(bool(str(config.get("portfolio_bridge_url", "")).strip()), "Portfolio bridge URL saved", "Enter the Raspberry Pi bridge URL in Portfolio Module."))
-        items.append(setup_checklist_item(bool(str(config.get("portfolio_bridge_key", "")).strip()), "Portfolio bridge key saved", "Enter the display key from the local bridge."))
-        bridge_ready = bool(last_portfolio_entry and not last_portfolio_entry.get("error_reason"))
-        items.append(setup_checklist_item(bridge_ready, "Portfolio bridge reachable", "Use Test Portfolio Bridge after saving the URL and key."))
+    # Portfolio is optional for customers who want a stock-only ticker.
+    if secure_pairing_active():
+        items.append(setup_checklist_item(
+            True,
+            "Raspberry Pi securely paired",
+            "Portfolio integration is optional and can remain paired while hidden from the LED.",
+            required=False
+        ))
+    elif pairing_recovery_active():
+        items.append(setup_checklist_item(
+            False,
+            "Portfolio pairing needs repair",
+            "Use the Portfolio & Bridge recovery controls if portfolio integration is desired.",
+            required=False
+        ))
+    else:
+        items.append(setup_checklist_item(
+            False,
+            "Raspberry Pi portfolio integration",
+            "Optional — use Find & Pair Raspberry Pi if you want portfolio data.",
+            required=False
+        ))
 
-    items.append(setup_checklist_item(str(config.get("admin_pin", "1234")) != "1234", "Admin PIN changed", "For sold units, change the default 1234 PIN."))
-    items.append(setup_checklist_item(file_exists(BACKUP_APP_PATH), "Rollback backup available", "Install an OTA update once to create app_backup.py."))
-    items.append(setup_checklist_item(launcher_status_text().startswith("Installed"), "Auto-recovery launcher installed", "Install it from Software Update."))
+    items.append(setup_checklist_item(
+        file_exists(BACKUP_APP_PATH),
+        "OTA rollback backup available",
+        "Recommended after the first known-good OTA update.",
+        required=False
+    ))
+    items.append(setup_checklist_item(
+        launcher_status_text().startswith("Installed"),
+        "Auto-recovery launcher installed",
+        "Recommended for unattended customer recovery.",
+        required=False
+    ))
 
     found, missing = count_missing_logos()
     if config.get("show_logos", True):
         if missing:
-            items.append(setup_checklist_item(True, "Logo fallback active", "{} missing logo(s) will use text fallback.".format(missing)))
+            items.append(setup_checklist_item(
+                True,
+                "Logo fallback active",
+                "{} missing logo(s) will use text automatically.".format(missing),
+                required=False
+            ))
         else:
-            items.append(setup_checklist_item(True, "Logo status checked", "All saved symbol logos found."))
+            items.append(setup_checklist_item(
+                True,
+                "Logo status checked",
+                "All saved symbol logos were found.",
+                required=False
+            ))
     else:
-        items.append(setup_checklist_item(True, "Text-only logo mode", "Logo display is turned off."))
+        items.append(setup_checklist_item(
+            True,
+            "Text-only logo mode",
+            "Logo display is turned off.",
+            required=False
+        ))
 
-    return "<p class='small'><b>Setup:</b> {}</p>".format(setup_progress_text()) + "".join(items)
+    return "<p class='small'><b>Required setup:</b> {}</p>".format(
+        setup_progress_text()
+    ) + "".join(items)
+
+
+def getting_started_page():
+    status = setup_status_payload()
+    required_ready = bool(status.get("setup_ready"))
+    portfolio_state = "Not configured — stock-only mode is ready to use."
+    portfolio_class = "good"
+
+    if status.get("pairing_recovery_required"):
+        portfolio_state = "Pairing recovery is needed before portfolio data can reconnect."
+        portfolio_class = "warning"
+    elif status.get("secure_pairing"):
+        if status.get("portfolio_mode") == "local_bridge":
+            portfolio_state = (
+                "Securely paired and portfolio display is enabled."
+                if status.get("portfolio_connected")
+                else "Securely paired; waiting for current portfolio data."
+            )
+        else:
+            portfolio_state = "Securely paired; portfolio display is currently off."
+    elif status.get("portfolio_mode") == "local_bridge":
+        portfolio_state = "Portfolio display is enabled, but secure pairing is not complete."
+        portfolio_class = "warning"
+
+    readiness_class = "good" if required_ready else "warning"
+    readiness_text = "READY FOR STOCK DISPLAY" if required_ready else "SETUP ACTION NEEDED"
+    auto_refresh = ""
+    if pairing_is_active():
+        auto_refresh = "<script>setTimeout(function(){location.reload();},5000);</script>"
+
+    def step(number, title, ok, detail, action_html):
+        css = "good" if ok else "warning"
+        state = "Complete" if ok else "Action needed"
+        return (
+            "<div class='card'><div class='card-kicker'>Step {}</div><h2>{}</h2>"
+            "<p class='{}'><b>{}</b></p><p>{}</p>{}</div>"
+        ).format(
+            number,
+            safe_html(title),
+            css,
+            state,
+            safe_html(detail),
+            action_html
+        )
+
+    market_ok = bool(status.get("market_data_ready"))
+    market_detail = (
+        "Demo Mode is ready for product testing."
+        if status.get("demo_mode") else
+        "Finnhub market data is configured."
+        if market_ok else
+        "A Finnhub API key is required for live stock quotes."
+    )
+
+    body = """\
+<!DOCTYPE html>
+<html><head><title>StockTicker Getting Started</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:18px; margin:0; }}
+.wrap {{ max-width:900px; margin:0 auto; }}
+.card {{ background:#101b2e; border:1px solid #243657; border-radius:18px; padding:18px; margin-bottom:14px; }}
+.card-kicker {{ color:#79c7ff; font-size:11px; font-weight:bold; letter-spacing:1.1px; text-transform:uppercase; }}
+.good {{ color:#55ff88; }} .warning {{ color:#ffd166; }} .small {{ color:#a9bddb; font-size:13px; line-height:1.5; }}
+a, .btn {{ color:#79c7ff; }}
+.btn, button {{ display:inline-block; padding:11px 14px; border:0; border-radius:10px; background:#1f8cff; color:white; text-decoration:none; font-weight:bold; margin:6px 8px 0 0; }}
+.green {{ background:#22aa66; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px; }}
+</style></head><body><div class="wrap">
+<div class="card"><div class="card-kicker">Customer Onboarding</div><h1>Getting Started</h1>
+<p class="{readiness_class}"><b>{readiness_text}</b></p>
+<p class="small">Required setup covers WiFi, market data, symbols, and a private admin PIN. Raspberry Pi portfolio integration is optional.</p>
+<a class="btn" href="/">Dashboard</a><a class="btn green" href="/setup-wizard">Setup Wizard</a><a class="btn" href="/#wifi-network">WiFi & Network</a><a class="btn" href="/#portfolio">Portfolio</a></div>
+<div class="grid">
+{step1}
+{step2}
+{step3}
+{step4}
+</div>
+<div class="card"><div class="card-kicker">Optional</div><h2>Raspberry Pi Portfolio</h2><p class="{portfolio_class}"><b>{portfolio_state}</b></p>
+<p class="small">You can use the ticker as a stock-only display, or securely pair the Pi to add portfolio information. Pairing and “show portfolio on LED” are separate choices.</p>
+<a class="btn green" href="/#portfolio">Open Portfolio & Bridge</a></div>
+<div class="card"><div class="card-kicker">Recommended</div><h2>Recovery & Updates</h2>
+<p><b>Rollback backup:</b> {backup}<br><b>Auto-recovery launcher:</b> {launcher}</p>
+<a class="btn" href="/#software-updates">Software Update & Recovery</a></div>
+<div class="card"><h2>Setup Summary</h2><p><b>{progress}</b></p><p class="small">Device: {device_id} · Firmware {version} · Local address http://{hostname}/</p></div>
+{auto_refresh}
+</div></body></html>
+""".format(
+        readiness_class=readiness_class,
+        readiness_text=readiness_text,
+        step1=step(
+            1, "Connect WiFi", status.get("wifi_connected"),
+            "Ticker is connected to the home network." if status.get("wifi_connected") else "Connect the ticker to a 2.4 GHz home WiFi network.",
+            '<a class="btn" href="/#wifi-network">Open WiFi Manager</a>'
+        ),
+        step2=step(
+            2, "Configure Market Data", market_ok, market_detail,
+            '<a class="btn" href="/setup-wizard">Open Setup Wizard</a>'
+        ),
+        step3=step(
+            3, "Choose Tickers", status.get("symbol_count", 0) > 0,
+            "{} symbol(s) are saved.".format(status.get("symbol_count", 0)) if status.get("symbol_count", 0) > 0 else "Add at least one stock symbol.",
+            '<a class="btn" href="/#display-settings">Edit Symbols</a>'
+        ),
+        step4=step(
+            4, "Protect Settings", status.get("admin_pin_changed"),
+            "A private admin PIN is configured." if status.get("admin_pin_changed") else "Change the default 1234 admin PIN before customer use.",
+            '<a class="btn" href="/setup-wizard">Change Admin PIN</a>'
+        ),
+        portfolio_class=portfolio_class,
+        portfolio_state=safe_html(portfolio_state),
+        backup="Available" if status.get("rollback_backup_available") else "Not created yet",
+        launcher="Installed" if status.get("auto_recovery_launcher") else "Not installed",
+        progress=setup_progress_text(),
+        device_id=safe_html(DEVICE_ID),
+        version=safe_html(APP_VERSION),
+        hostname=safe_html(MDNS_HOSTNAME),
+        auto_refresh=auto_refresh
+    )
+    return body
+
+def market_calendar_support_text():
+    try:
+        year = int(eastern_time_now().tm_year)
+    except Exception:
+        try:
+            year = int(time.localtime().tm_year)
+        except Exception:
+            year = 0
+
+    if year and year > MARKET_CALENDAR_BUILT_IN_THROUGH:
+        return "Update market calendar - built-in dates currently run through {}.".format(
+            MARKET_CALENDAR_BUILT_IN_THROUGH
+        )
+
+    return "Built-in NYSE dates through {}.".format(
+        MARKET_CALENDAR_BUILT_IN_THROUGH
+    )
 
 
 def system_health_state():
     if not wifi.radio.connected:
         return "ERROR", "WiFi Offline", "badbadge"
+    try:
+        if int(eastern_time_now().tm_year) > MARKET_CALENDAR_BUILT_IN_THROUGH:
+            return "WARNING", "Calendar Update Needed", "warnbadge"
+    except Exception:
+        pass
     if not api_ready_for_quotes():
         return "SETUP", "Setup Needed", "warnbadge"
     if is_demo_mode():
@@ -4150,6 +4440,9 @@ def setup_blocking_issues():
     if len(SYMBOLS) <= 0:
         issues.append("Add at least one stock symbol.")
 
+    if str(config.get("admin_pin", "1234")) == "1234":
+        issues.append("Change the default admin PIN.")
+
     return issues
 
 
@@ -4176,7 +4469,7 @@ def build_onboarding_message_html():
             "<div class='onboard warn'><b>Setup Needed</b>"
             "<div class='small'>Finish these items before using live stock quotes:</div>"
             "<ul>{}</ul>"
-            "<form method='GET' action='/setup-wizard'><button type='submit'>Open Setup Wizard</button></form>"
+            "<form method='GET' action='/getting-started'><button type='submit'>Open Getting Started</button></form>"
             "</div>"
         ).format(lis)
 
@@ -4344,6 +4637,7 @@ def build_support_report_text():
     lines.append("System Health: " + system_health_state()[1])
     lines.append("Panel Display: " + panel_state_text())
     lines.append("Market Status: " + get_market_status(eastern_time_now()))
+    lines.append("Market Calendar: " + market_calendar_support_text())
     lines.append("Quote Status: " + quote_status_short())
     lines.append("Portfolio Status: " + portfolio_status_short())
     lines.append("Portfolio Mode: " + str(config.get("portfolio_mode", "off")))
@@ -4510,7 +4804,7 @@ h1 { margin-top:0; }
 <body>
 <div class="wrap">
 <div class="card"><h1>StockTicker Help</h1><p class="small">Quick customer guide.</p></div>
-<div class="card"><h2>First-time setup</h2><p>Connect to the unique StockTicker setup WiFi using the code printed on the device setup card. Open http://192.168.4.1, choose the home network, enter the password, and save. The ticker tests the new network after restart.</p></div>
+<div class="card"><h2>First-time setup</h2><p>Connect to the unique StockTicker setup WiFi using the code printed on the device setup card. Open http://192.168.4.1, choose the home network, enter the password, and save. The ticker tests the new network after restart, then the Getting Started page guides the remaining setup.</p></div>
 <div class="card"><h2>Changing WiFi</h2><p>Open Dashboard &rarr; WiFi &amp; Network. The ticker preserves the working network while it tests the new credentials. A failed change restores the previous network automatically. If neither network is reachable, the setup hotspot opens.</p></div>
 <div class="card"><h2>Portfolio bridge network</h2><p>The Matrix Portal ticker and Raspberry Pi are separate network devices. Changing ticker WiFi does not change the Pi. Portfolio mode requires both devices to remain reachable on the same local network.</p></div>
 <div class="card"><h2>Adding stocks</h2><p>Use the Tickers section. Enter one symbol per line, such as SOFI, RKLB, HIMS, SPY, or AAPL.</p></div>
@@ -4816,7 +5110,7 @@ SPY</textarea>
         if not new_pin and str(setup_cfg.get("admin_pin", "1234")) == "1234":
             return Response(
                 request,
-                setup_page("Create a new 4-12 digit admin PIN for this ticker.", True),
+                setup_page("Create a new 4-12 digit admin PIN for this ticker (6 or more digits recommended).", True),
                 content_type="text/html"
             )
 
@@ -4826,7 +5120,7 @@ SPY</textarea>
         ):
             return Response(
                 request,
-                setup_page("Admin PIN must contain 4-12 digits.", True),
+                setup_page("Admin PIN must contain 4-12 digits; 6 or more digits are recommended.", True),
                 content_type="text/html"
             )
 
@@ -4915,7 +5209,7 @@ body {{ background:#07111f; color:#eef6ff; font-family:Arial; padding:24px; }}
 <h1>WiFi Saved</h1>
 <p>The ticker will restart and test <b>{ssid}</b>.</p>
 <p>Your phone will disconnect from the StockTicker setup hotspot. Reconnect the phone to the home network afterward.</p>
-<p>Then open <b>http://{hostname}.local/</b> or locate the new ticker IP in the router.</p>
+<p>Then open <b>http://{hostname}.local/getting-started</b> to finish the guided setup, or use the ticker dashboard root.</p>
 <p>If the new credentials fail, the ticker restores the previous network or reopens setup mode.</p>
 </div></body></html>
 """.format(
@@ -5377,6 +5671,7 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 
 <div class="quicknav">
 <a href="#overview">Overview</a>
+<a href="/getting-started">Setup</a>
 <a href="#wifi-network">WiFi</a>
 <a href="#portfolio">Portfolio</a>
 <a href="#display-settings">Display</a>
@@ -5391,7 +5686,8 @@ button:hover, .linkbtn:hover, .quicknav a:hover {{
 <h2>Customer Setup</h2>
 <p class="small">Configure the device name, stock list, market-data key, display preferences, PIN, and update channel.</p>
 <div class="button-row">
-<form method="GET" action="/setup-wizard"><button type="submit">Open Setup Wizard</button></form>
+<form method="GET" action="/getting-started"><button class="green" type="submit">Getting Started</button></form>
+<form method="GET" action="/setup-wizard"><button type="submit">Setup Wizard</button></form>
 <form method="GET" action="/help"><button type="submit">Help / Quick Guide</button></form>
 </div>
 <p class="small">API Key Status: {api_key_status}</p>
@@ -5880,6 +6176,11 @@ def clear_last_error_route(request: Request):
     return Response(request, clean_page("Error Cleared", "Last error message cleared."), content_type="text/html")
 
 
+@server.route("/getting-started")
+def getting_started_route(request: Request):
+    return Response(request, getting_started_page(), content_type="text/html")
+
+
 @server.route("/setup-wizard")
 def setup_wizard_route(request: Request):
     return Response(request, setup_wizard_page(), content_type="text/html")
@@ -6330,7 +6631,7 @@ def save_customer_setup(request: Request):
                     request,
                     clean_page(
                         "Setup Blocked",
-                        "Admin PIN must contain 4-12 digits."
+                        "Admin PIN must contain 4-12 digits; 6 or more digits are recommended."
                     ),
                     content_type="text/html"
                 )
@@ -6416,6 +6717,12 @@ def device_health_route(request: Request):
         "pairing_recovery_required": pairing_recovery_active(),
         "pairing_error_code": str(pairing_error_code or config.get("portfolio_pairing_last_error_code", "")),
     }
+    setup_status = setup_status_payload()
+    payload["setup_ready"] = bool(setup_status.get("setup_ready"))
+    payload["market_data_ready"] = bool(setup_status.get("market_data_ready"))
+    payload["admin_pin_changed"] = bool(setup_status.get("admin_pin_changed"))
+    payload["symbol_count"] = int(setup_status.get("symbol_count", 0) or 0)
+    payload["market_calendar_through"] = MARKET_CALENDAR_BUILT_IN_THROUGH
     return Response(request, json.dumps(payload), content_type="application/json")
 
 
@@ -7424,11 +7731,12 @@ def install_auto_recovery(request: Request):
     global auto_recovery_message
 
     entered_pin = url_decode(str(request.form_data.get("admin_pin", "")))
+    ok_pin, pin_message = verify_admin_pin(entered_pin)
 
-    if entered_pin != str(config["admin_pin"]):
-        auto_recovery_message = "Auto-recovery install blocked: wrong admin PIN."
+    if not ok_pin:
+        auto_recovery_message = "Auto-recovery install blocked: " + pin_message
         set_error_message(auto_recovery_message)
-        return Response(request, clean_page("Install Blocked", auto_recovery_message), content_type="text/html")
+        return Response(request, clean_page("Install Blocked", safe_html(auto_recovery_message)), content_type="text/html")
 
     try:
         with open("/code.py", "w") as f:
@@ -8700,13 +9008,14 @@ def install_update(request: Request):
         )
 
     entered_pin = url_decode(str(request.form_data.get("admin_pin", "")))
+    ok_pin, pin_message = verify_admin_pin(entered_pin)
 
-    if entered_pin != str(config["admin_pin"]):
-        ota_message = "Wrong admin PIN."
+    if not ok_pin:
+        ota_message = pin_message
         set_error_message(ota_message)
         return Response(
             request,
-            clean_page("Update Blocked", ota_message),
+            clean_page("Update Blocked", safe_html(ota_message)),
             content_type="text/html"
         )
 
@@ -8732,11 +9041,12 @@ def rollback_route(request: Request):
 
     form = request.form_data
     entered_pin = url_decode(str(form.get("admin_pin", "")))
+    ok_pin, pin_message = verify_admin_pin(entered_pin)
 
-    if entered_pin != str(config["admin_pin"]):
-        ota_message = "Rollback blocked: wrong admin PIN."
+    if not ok_pin:
+        ota_message = "Rollback blocked: " + pin_message
         set_error_message(ota_message)
-        return Response(request, clean_page("Rollback Blocked", ota_message), content_type="text/html")
+        return Response(request, clean_page("Rollback Blocked", safe_html(ota_message)), content_type="text/html")
 
     ok, msg = rollback_to_backup()
 
@@ -8778,9 +9088,10 @@ def factory_reset(request: Request):
         entered_pin = url_decode(str(form.get("admin_pin", "")))
         reset_type = url_decode(str(form.get("reset_type", "wifi")))
 
-        if entered_pin != str(config["admin_pin"]):
-            set_error_message("Factory reset blocked: wrong admin PIN.")
-            return Response(request, clean_page("Reset Blocked", "Wrong admin PIN."), content_type="text/html")
+        ok_pin, pin_message = verify_admin_pin(entered_pin)
+        if not ok_pin:
+            set_error_message("Factory reset blocked: " + pin_message)
+            return Response(request, clean_page("Reset Blocked", safe_html(pin_message)), content_type="text/html")
 
         files_to_remove = []
 
